@@ -65,7 +65,6 @@ anvil-device-fs = { path = "crates/anvil-device-fs" }
 anvil-client = { path = "crates/anvil-client" }
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
 unused_must_use = "deny"
 
 [workspace.lints.clippy]

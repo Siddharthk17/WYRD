@@ -80,8 +80,20 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
         Commands::Bench => {
-            eprintln!("ERROR: `xtask bench` is not yet wired. Failing loudly per charter Rule 5.");
-            ExitCode::FAILURE
+            let status = std::process::Command::new("cargo")
+                .args([
+                    "run",
+                    "--release",
+                    "-p",
+                    "anvil-bench",
+                    "--",
+                    "--verify-budgets",
+                ])
+                .status();
+            match status {
+                Ok(s) if s.success() => ExitCode::SUCCESS,
+                _ => ExitCode::FAILURE,
+            }
         }
         Commands::Fuzz { .. } => {
             eprintln!("ERROR: `xtask fuzz` is not yet wired. Failing loudly per charter Rule 5.");
