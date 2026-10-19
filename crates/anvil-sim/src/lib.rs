@@ -14,7 +14,7 @@ pub use buggify::{
     BuggifyPoint, BuggifyRegistry, list_registered_points, reset_buggify_registry,
     set_buggify_enabled, set_buggify_seed,
 };
-pub use kernel::{Actor, SimError, SimKernel, SimReport};
+pub use kernel::{Actor, ActorContext, SimError, SimKernel, SimReport};
 pub use queue::{BinaryHeapEventQueue, EventQueue, HierarchicalTimingWheel, ScheduledEvent};
 pub use rng::{DetRng, SplitMix64, derive_component_seed};
 pub use time::SimTime;

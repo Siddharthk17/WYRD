@@ -34,12 +34,52 @@ pub struct SimReport {
     pub buggify_points: Vec<BuggifyPoint>,
 }
 
+/// Context passed to actors during event dispatch.
+pub struct ActorContext<'a> {
+    now: SimTime,
+    out: &'a mut Vec<(SimTime, u64, u64)>,
+    progress: &'a mut bool,
+}
+
+impl<'a> ActorContext<'a> {
+    /// Creates a new actor context.
+    pub fn new(
+        now: SimTime,
+        out: &'a mut Vec<(SimTime, u64, u64)>,
+        progress: &'a mut bool,
+    ) -> Self {
+        Self { now, out, progress }
+    }
+
+    /// Returns the current simulation virtual time.
+    #[inline]
+    pub fn now(&self) -> SimTime {
+        self.now
+    }
+
+    /// Schedules an outbound event for an actor at the given simulation time.
+    #[inline]
+    pub fn schedule(&mut self, time: SimTime, target_actor: u64, payload: u64) {
+        self.out.push((time, target_actor, payload));
+    }
+
+    /// Signals forward protocol progress to the watchdog, resetting the stagnation counter.
+    #[inline]
+    pub fn record_progress(&mut self) {
+        *self.progress = true;
+    }
+}
+
 /// Abstract contract for actors participating in the deterministic simulation.
-pub trait Actor {
+pub trait Actor: 'static {
     /// Dispatches an event arrival to the actor.
-    ///
-    /// Scheduled outbound events can be appended to `out` as `(arrival_time, target_actor, payload)`.
-    fn on_event(&mut self, now: SimTime, payload: u64, out: &mut Vec<(SimTime, u64, u64)>);
+    fn on_event(&mut self, ctx: &mut ActorContext<'_>, payload: u64);
+
+    /// Downcasting support for inspection.
+    fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Mutable downcasting support for inspection.
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }
 
 /// Deterministic simulation kernel orchestrating actor execution, time advancement, and trace logging.
@@ -95,6 +135,20 @@ impl SimKernel {
     /// Registers an actor in the kernel registry.
     pub fn register_actor(&mut self, actor_id: u64, actor: Box<dyn Actor>) {
         self.actors.insert(actor_id, actor);
+    }
+
+    /// Returns an immutable reference to an actor downcasted to concrete type `T`.
+    pub fn actor<T: 'static>(&self, id: u64) -> Option<&T> {
+        self.actors
+            .get(&id)
+            .and_then(|a| a.as_any().downcast_ref::<T>())
+    }
+
+    /// Returns a mutable reference to an actor downcasted to concrete type `T`.
+    pub fn actor_mut<T: 'static>(&mut self, id: u64) -> Option<&mut T> {
+        self.actors
+            .get_mut(&id)
+            .and_then(|a| a.as_any_mut().downcast_mut::<T>())
     }
 
     /// Schedules an event in the simulation event queue.
@@ -168,10 +222,16 @@ impl SimKernel {
 
         // Dispatch to actor
         let mut out_events = Vec::new();
+        let mut progress_made = false;
         if let Some(actor) = self.actors.get_mut(&event.actor_id) {
-            actor.on_event(self.now, event.payload, &mut out_events);
+            let mut ctx = ActorContext::new(self.now, &mut out_events, &mut progress_made);
+            actor.on_event(&mut ctx, event.payload);
         } else {
             return Err(SimError::UnknownActor(event.actor_id));
+        }
+
+        if progress_made {
+            self.watchdog.record_progress();
         }
 
         for (target_time, target_actor, payload) in out_events {

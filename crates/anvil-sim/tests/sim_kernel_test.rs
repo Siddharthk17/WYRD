@@ -210,10 +210,18 @@ fn test_buggify_registry_and_macro() {
 struct EchoActor;
 
 impl Actor for EchoActor {
-    fn on_event(&mut self, now: SimTime, payload: u64, out: &mut Vec<(SimTime, u64, u64)>) {
+    fn on_event(&mut self, ctx: &mut anvil_sim::ActorContext<'_>, payload: u64) {
         if payload < 3 {
-            out.push((now.saturating_add_nanos(10), 1, payload + 1));
+            ctx.schedule(ctx.now().saturating_add_nanos(10), 1, payload + 1);
         }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }
 
