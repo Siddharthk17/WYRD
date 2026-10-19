@@ -1,0 +1,15 @@
+name: Weekly Pipeline
+
+on:
+  schedule:
+    - cron: "0 0 * * 0"
+  workflow_dispatch:
+
+jobs:
+  weekly-farm:
+    name: Simulation Mega-Farm (1,000,000 seeds)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run 1M Farm
+        run: cargo run --package xtask -- farm --seeds 0

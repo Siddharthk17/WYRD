@@ -1,0 +1,85 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/anvil-types",
+    "crates/anvil-raft",
+    "crates/anvil-kv",
+    "crates/anvil-storage",
+    "crates/anvil-node",
+    "crates/anvil-check",
+    "crates/anvil-sim",
+    "crates/anvil-device-fs",
+    "crates/anvil-server",
+    "crates/anvil-client",
+    "crates/anvilctl",
+    "crates/anvil-viz",
+    "crates/anvil-bench",
+    "crates/xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["ANVIL Contributors"]
+license = "Apache-2.0"
+repository = "https://github.com/example/anvil"
+rust-version = "1.99.0"
+
+[workspace.dependencies]
+# Pinned libraries per ANVIL charter
+tokio = { version = "1.53", default-features = false }
+tonic = "0.14"
+prost = "0.14"
+rustls = "0.23"
+tokio-rustls = "0.26"
+bytes = "1.12"
+crc32c = "0.6"
+blake3 = "1.8"
+rand_chacha = "=0.10.0"
+thiserror = "2"
+clap = { version = "4.6", features = ["derive"] }
+tracing = "0.1"
+imbl = "7"
+crossbeam-channel = "0.5"
+arc-swap = "1.9"
+zeroize = "1.9"
+chacha20poly1305 = "0.11"
+rustix = "1.1"
+hdrhistogram = "7.6"
+proptest = "1.12"
+criterion = "0.8"
+arbitrary = { version = "1.5", features = ["derive"] }
+libfuzzer-sys = "0.4"
+rcgen = "0.14"
+
+# Internal workspace crates
+anvil-types = { path = "crates/anvil-types" }
+anvil-raft = { path = "crates/anvil-raft" }
+anvil-kv = { path = "crates/anvil-kv" }
+anvil-storage = { path = "crates/anvil-storage" }
+anvil-node = { path = "crates/anvil-node" }
+anvil-check = { path = "crates/anvil-check" }
+anvil-sim = { path = "crates/anvil-sim" }
+anvil-device-fs = { path = "crates/anvil-device-fs" }
+anvil-client = { path = "crates/anvil-client" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+doc_markdown = "warn"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+panic = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+print_stdout = "allow"
+print_stderr = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

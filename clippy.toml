@@ -1,0 +1,17 @@
+# Clippy configuration for ANVIL
+# Enforces determinism restrictions in designated crates
+
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "Physical time is non-deterministic. Use SimTime or logical ticks." },
+    { path = "std::time::SystemTime::now", reason = "Physical wall-clock time is non-deterministic. Use SimTime or logical ticks." },
+    { path = "std::thread::spawn", reason = "Threads cannot be spawned in deterministic sans-IO crates." },
+]
+
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "std::collections::HashMap uses non-deterministic SipHash RandomState. Use BTreeMap or imbl::OrdMap." },
+    { path = "std::collections::HashSet", reason = "std::collections::HashSet uses non-deterministic SipHash RandomState. Use BTreeSet or imbl::OrdSet." },
+    { path = "std::collections::hash_map::RandomState", reason = "RandomState introduces OS-entropy and non-deterministic iteration order." },
+    { path = "std::time::Instant", reason = "Physical time is non-deterministic. Use SimTime or logical ticks." },
+    { path = "std::time::SystemTime", reason = "Physical wall-clock time is non-deterministic. Use SimTime or logical ticks." },
+    { path = "std::thread::Thread", reason = "Thread primitives violate sans-IO determinism." },
+]

@@ -1,0 +1,19 @@
+[package]
+name = "anvil-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anvil-types = { workspace = true }
+bytes = { workspace = true }
+blake3 = { workspace = true }
+rand_chacha = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true
