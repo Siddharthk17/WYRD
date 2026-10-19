@@ -1,0 +1,34 @@
+[package]
+name = "anvil-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[workspace]
+
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+anvil-types = { path = "../crates/anvil-types" }
+bytes = "1.12"
+
+[[bin]]
+name = "fuzz_varint"
+path = "fuzz_targets/fuzz_varint.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_frame_header"
+path = "fuzz_targets/fuzz_frame_header.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_entry"
+path = "fuzz_targets/fuzz_entry.rs"
+test = false
+doc = false

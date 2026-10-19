@@ -161,6 +161,7 @@ version = "0.1.0"
 dependencies = [
  "arbitrary",
  "bytes",
+ "crc32c",
  "proptest",
  "thiserror",
 ]

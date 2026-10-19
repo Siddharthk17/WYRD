@@ -16,6 +16,7 @@ members = [
     "crates/anvil-bench",
     "crates/xtask",
 ]
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

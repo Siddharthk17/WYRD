@@ -1,4 +1,34 @@
+# Rust build outputs
 /target/
-**/*.rs.bk
+**/target/
+fuzz/target/
+
+# Cargo fuzz artifacts (crashes, timeouts, leaks found by fuzzer)
+fuzz/artifacts/
+fuzz/corpus/**/crash-*
+fuzz/corpus/**/oom-*
+fuzz/corpus/**/timeout-*
+fuzz/corpus/**/leak-*
+
+# LLVM code coverage & profiling
+*.profraw
+*.profdata
+coverage/
+lcov.info
+*.lcov
+
+# Temporary files, logs, and backups
 *.log
+*.tmp
+**/*.rs.bk
+*~
+
+# Operating system artifacts
 .DS_Store
+Thumbs.db
+
+# Editor and IDE configurations
+.idea/
+.vscode/
+*.swp
+*.swo
