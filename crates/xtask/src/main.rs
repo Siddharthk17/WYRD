@@ -2,6 +2,8 @@
 
 //! `xtask`: Developer automation and quality gates for ANVIL.
 
+use xtask::determinism;
+
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 
@@ -18,8 +20,15 @@ enum Commands {
     Ci,
     /// Run determinism verification gate against golden seeds
     Determinism {
+        /// Run in negative test mode using non-deterministic `HashMap` iteration fixture
         #[arg(long, default_value_t = false)]
         negative_test: bool,
+        /// Internal worker mode for fresh process evaluation
+        #[arg(long)]
+        worker_seed: Option<u64>,
+        /// Update golden seeds file with current hashes
+        #[arg(long, default_value_t = false)]
+        update_golden: bool,
     },
     /// Run simulator seed farm
     Farm {
@@ -48,11 +57,23 @@ fn main() -> ExitCode {
             );
             ExitCode::FAILURE
         }
-        Commands::Determinism { .. } => {
-            eprintln!(
-                "ERROR: `xtask determinism` is not yet wired. Failing loudly per charter Rule 5."
-            );
-            ExitCode::FAILURE
+        Commands::Determinism {
+            negative_test,
+            worker_seed,
+            update_golden,
+        } => {
+            if let Some(seed) = worker_seed {
+                determinism::run_worker(seed, negative_test);
+                ExitCode::SUCCESS
+            } else {
+                match determinism::run_determinism_gate(negative_test, update_golden) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(err) => {
+                        eprintln!("Gate error: {err}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
         }
         Commands::Farm { .. } => {
             eprintln!("ERROR: `xtask farm` is not yet wired. Failing loudly per charter Rule 5.");
