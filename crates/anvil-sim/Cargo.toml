@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = ["sim"]
+sim = []
+
 [dependencies]
 anvil-types = { workspace = true }
 bytes = { workspace = true }
