@@ -158,6 +158,18 @@ impl RaftCore {
         &self.progress
     }
 
+    /// Testing helper to set consensus role directly.
+    #[doc(hidden)]
+    pub fn testing_set_role(&mut self, role: Role) {
+        self.role = role;
+    }
+
+    /// Testing helper to set consensus term directly.
+    #[doc(hidden)]
+    pub fn testing_set_term(&mut self, term: Term) {
+        self.term = term;
+    }
+
     // ------------------------------------------------------------------------
     // Tick Handling
     // ------------------------------------------------------------------------
@@ -470,14 +482,10 @@ impl RaftCore {
         self.broadcast_append_entries(output);
     }
 
-    fn broadcast_append_entries(&mut self, output: &mut Output) {
-        if self.role != Role::Leader {
-            return;
-        }
-
-        for (&peer, progress) in &mut self.progress {
+    fn send_append_entries(&mut self, peer: NodeId, output: &mut Output) {
+        if let Some(progress) = self.progress.get_mut(&peer) {
             if !progress.can_send() {
-                continue;
+                return;
             }
 
             let prev_index = progress.next_index.prev().unwrap_or(LogIndex::from_raw(0));
@@ -505,6 +513,17 @@ impl RaftCore {
                     leader_commit: self.commit_index,
                 },
             });
+        }
+    }
+
+    fn broadcast_append_entries(&mut self, output: &mut Output) {
+        if self.role != Role::Leader {
+            return;
+        }
+
+        let peers: Vec<NodeId> = self.progress.keys().copied().collect();
+        for peer in peers {
+            self.send_append_entries(peer, output);
         }
     }
 
@@ -804,7 +823,7 @@ impl RaftCore {
             }
             if commit_index > self.commit_index {
                 let target = std::cmp::min(commit_index, self.log.last_index());
-                if target > self.commit_index {
+                if target > self.commit_index && self.log.term_at(target) == Some(term) {
                     self.commit_to(target, output);
                 }
             }
@@ -837,6 +856,19 @@ impl RaftCore {
         }
 
         self.heartbeat_acks.insert(from);
+
+        let should_send_append = if let Some(progress) = self.progress.get_mut(&from) {
+            if progress.state == crate::progress::ProgressState::Probe {
+                progress.inflight_count = 0;
+            }
+            progress.match_index < self.log.last_index()
+        } else {
+            false
+        };
+
+        if should_send_append {
+            self.send_append_entries(from, output);
+        }
 
         if let Some(ctx) = read_context {
             let mut satisfied_indices = Vec::new();
