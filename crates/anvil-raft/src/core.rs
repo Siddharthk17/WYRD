@@ -53,7 +53,7 @@ pub struct RaftCore {
     lead_transferee: Option<NodeId>,
     pending_reads: Vec<PendingRead>,
     next_persist_token: u64,
-    pending_persists: BTreeMap<PersistToken, Vec<PendingAction>>,
+    pending_persists: Vec<(PersistToken, PendingAction)>,
     leader_persisted_index: LogIndex,
 }
 
@@ -97,7 +97,7 @@ impl RaftCore {
             lead_transferee: None,
             pending_reads: Vec::new(),
             next_persist_token: 1,
-            pending_persists: BTreeMap::new(),
+            pending_persists: Vec::with_capacity(64),
             leader_persisted_index: last_log_idx,
         }
     }
@@ -527,8 +527,16 @@ impl RaftCore {
             return;
         }
 
-        let peers: Vec<NodeId> = self.progress.keys().copied().collect();
-        for peer in peers {
+        let mut peers = [NodeId::from_nonzero(core::num::NonZeroU64::MIN); 16];
+        let mut count = 0usize;
+        for &peer in &self.config.peers {
+            if count < peers.len() {
+                peers[count] = peer;
+                count += 1;
+            }
+        }
+
+        for &peer in &peers[..count] {
             self.send_append_entries(peer, output);
         }
     }
@@ -763,19 +771,34 @@ impl RaftCore {
             return;
         }
 
-        let mut matches: Vec<LogIndex> = self.progress.values().map(|p| p.match_index).collect();
-        // Include leader's own persisted match index
-        matches.push(self.leader_persisted_index);
-        matches.sort_unstable();
+        // Fixed-size stack buffer avoiding heap allocation for cluster sizes <= 16
+        let mut matches = [LogIndex::from_raw(0); 16];
+        let mut count = 0usize;
 
-        // Majority index in sorted array (cluster_size / 2 from top)
-        let median_pos = matches.len() - self.config.quorum_size();
-        let median_commit = matches[median_pos];
+        for p in self.progress.values() {
+            if count < matches.len() {
+                matches[count] = p.match_index;
+                count += 1;
+            }
+        }
+        if count < matches.len() {
+            matches[count] = self.leader_persisted_index;
+            count += 1;
+        }
 
-        if median_commit > self.commit_index {
-            // Raft Section 5.4.2 rule: leader only commits entries from its CURRENT term
-            if self.log.term_at(median_commit) == Some(self.term) {
-                self.commit_to(median_commit, output);
+        let active_matches = &mut matches[..count];
+        active_matches.sort_unstable();
+
+        let quorum = self.config.quorum_size();
+        if count >= quorum {
+            let median_pos = count - quorum;
+            let median_commit = active_matches[median_pos];
+
+            if median_commit > self.commit_index {
+                // Raft Section 5.4.2 rule: leader only commits entries from its CURRENT term
+                if self.log.term_at(median_commit) == Some(self.term) {
+                    self.commit_to(median_commit, output);
+                }
             }
         }
     }
@@ -975,17 +998,16 @@ impl RaftCore {
     // ------------------------------------------------------------------------
 
     fn handle_persisted(&mut self, token: PersistToken, output: &mut Output) {
-        if let Some(actions) = self.pending_persists.remove(&token) {
-            for action in actions {
-                match action {
-                    PendingAction::SendMessage(msg) => {
-                        output.messages.push(msg);
-                    }
-                    PendingAction::LeaderPersisted { entry_index } => {
-                        if entry_index > self.leader_persisted_index {
-                            self.leader_persisted_index = entry_index;
-                            self.maybe_advance_commit(output);
-                        }
+        if let Some(pos) = self.pending_persists.iter().position(|(t, _)| *t == token) {
+            let (_, action) = self.pending_persists.swap_remove(pos);
+            match action {
+                PendingAction::SendMessage(msg) => {
+                    output.messages.push(msg);
+                }
+                PendingAction::LeaderPersisted { entry_index } => {
+                    if entry_index > self.leader_persisted_index {
+                        self.leader_persisted_index = entry_index;
+                        self.maybe_advance_commit(output);
                     }
                 }
             }
@@ -1130,7 +1152,7 @@ impl RaftCore {
     }
 
     fn queue_pending_action(&mut self, token: PersistToken, action: PendingAction) {
-        self.pending_persists.entry(token).or_default().push(action);
+        self.pending_persists.push((token, action));
     }
 
     fn emit_spec_projection(&self, output: &mut Output) {

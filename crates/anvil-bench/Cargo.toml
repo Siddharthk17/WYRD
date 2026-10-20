@@ -9,8 +9,10 @@ authors.workspace = true
 clap = { workspace = true }
 hdrhistogram = { workspace = true }
 anvil-types = { workspace = true }
+anvil-raft = { workspace = true }
 anvil-sim = { workspace = true }
 bytes = { workspace = true }
+rand_chacha = { workspace = true }
 criterion = { workspace = true }
 
 [lints]

@@ -86,12 +86,14 @@ dependencies = [
 name = "anvil-bench"
 version = "0.1.0"
 dependencies = [
+ "anvil-raft",
  "anvil-sim",
  "anvil-types",
  "bytes",
  "clap",
  "criterion",
  "hdrhistogram",
+ "rand_chacha",
 ]
 
 [[package]]

@@ -5,17 +5,40 @@
 
 use anvil_types::{Entry, LogIndex, Term};
 
-/// In-memory Raft log entries storage.
-#[derive(Debug, Clone, Default)]
+/// In-memory Raft log entries storage with incremental BLAKE3 digest tracking.
+#[derive(Debug, Clone)]
 pub struct RaftLog {
     entries: Vec<Entry>,
+    hasher: blake3::Hasher,
+}
+
+impl Default for RaftLog {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
 }
 
 impl RaftLog {
+    fn hash_entry(hasher: &mut blake3::Hasher, entry: &Entry) {
+        hasher.update(&entry.index.as_u64().to_le_bytes());
+        hasher.update(&entry.term.as_u64().to_le_bytes());
+        let kind_byte = match entry.kind {
+            anvil_types::EntryKind::Normal => 0u8,
+            anvil_types::EntryKind::NoOp => 1u8,
+        };
+        hasher.update(&[kind_byte]);
+        hasher.update(&(entry.payload.len() as u64).to_le_bytes());
+        hasher.update(&entry.payload);
+    }
+
     /// Constructs a `RaftLog` from pre-existing recovered entries.
     #[must_use]
     pub fn new(entries: Vec<Entry>) -> Self {
-        Self { entries }
+        let mut hasher = blake3::Hasher::new();
+        for e in &entries {
+            Self::hash_entry(&mut hasher, e);
+        }
+        Self { entries, hasher }
     }
 
     /// Returns the total number of entries in the log.
@@ -67,8 +90,9 @@ impl RaftLog {
         self.entries.get((raw - 1) as usize)
     }
 
-    /// Appends a new entry to the end of the log.
+    /// Appends a new entry to the end of the log and incrementally updates digest.
     pub fn append(&mut self, entry: Entry) {
+        Self::hash_entry(&mut self.hasher, &entry);
         self.entries.push(entry);
     }
 
@@ -76,10 +100,19 @@ impl RaftLog {
     pub fn truncate_and_append(&mut self, from_index: LogIndex, new_entries: Vec<Entry>) {
         let raw = from_index.as_u64();
         let target_len = (raw.saturating_sub(1)) as usize;
-        if target_len < self.entries.len() {
+        let did_truncate = target_len < self.entries.len();
+        if did_truncate {
             self.entries.truncate(target_len);
+            let mut hasher = blake3::Hasher::new();
+            for e in &self.entries {
+                Self::hash_entry(&mut hasher, e);
+            }
+            self.hasher = hasher;
         }
-        self.entries.extend(new_entries);
+        for e in new_entries {
+            Self::hash_entry(&mut self.hasher, &e);
+            self.entries.push(e);
+        }
     }
 
     /// Slices entries starting from `from_index` up to `max_bytes` total payload size.
@@ -127,22 +160,10 @@ impl RaftLog {
         None
     }
 
-    /// Computes an incremental BLAKE3 cryptographic digest of all entries in the log.
+    /// Returns the incremental BLAKE3 cryptographic digest of all entries in the log.
     #[must_use]
     pub fn compute_digest(&self) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new();
-        for entry in &self.entries {
-            hasher.update(&entry.index.as_u64().to_le_bytes());
-            hasher.update(&entry.term.as_u64().to_le_bytes());
-            let kind_byte = match entry.kind {
-                anvil_types::EntryKind::Normal => 0u8,
-                anvil_types::EntryKind::NoOp => 1u8,
-            };
-            hasher.update(&[kind_byte]);
-            hasher.update(&(entry.payload.len() as u64).to_le_bytes());
-            hasher.update(&entry.payload);
-        }
-        *hasher.finalize().as_bytes()
+        *self.hasher.finalize().as_bytes()
     }
 
     /// Returns a slice over all in-memory entries.

@@ -6,18 +6,21 @@
     clippy::cast_sign_loss,
     clippy::cast_possible_truncation,
     clippy::expect_used,
-    clippy::print_stdout
+    clippy::print_stdout,
+    clippy::too_many_lines
 )]
 
 //! `anvil-bench`: Performance benchmarking harness and budget measurement suite.
 
+use anvil_raft::{Input, Output, RaftConfig, RaftCore, RecoveredState};
 use anvil_sim::queue::{BinaryHeapEventQueue, EventQueue};
 use anvil_sim::rng::DetRng;
 use anvil_sim::scenario::run_golden_scenario;
 use anvil_sim::time::SimTime;
-use anvil_types::{Entry, EntryKind, LogIndex, Term};
+use anvil_types::{Entry, EntryKind, LogIndex, NodeId, Term};
 use bytes::Bytes;
 use clap::Parser;
+use rand_chacha::rand_core::SeedableRng;
 use std::time::Instant;
 
 #[derive(Parser, Debug)]
@@ -122,6 +125,191 @@ fn measure_sim_kernel() -> (f64, u64) {
     (events_per_sec, total_events)
 }
 
+fn measure_raft_replication() -> (f64, usize) {
+    const ENTRIES: usize = 50_000;
+    let node1 = NodeId::new(1).expect("id 1");
+    let node2 = NodeId::new(2).expect("id 2");
+    let node3 = NodeId::new(3).expect("id 3");
+
+    let make_node = |id: NodeId, peers: &[NodeId]| -> RaftCore {
+        let mut peer_set = std::collections::BTreeSet::new();
+        for &p in peers {
+            peer_set.insert(p);
+        }
+        let config = RaftConfig {
+            node_id: id,
+            peers: peer_set,
+            election_timeout_ticks: 1_000_000,
+            heartbeat_interval_ticks: 1_000_000,
+            max_inflight_messages: 256,
+            max_bytes_per_message: 64 * 1024,
+            pre_vote_enabled: true,
+            check_quorum: false,
+        };
+        let rng = rand_chacha::ChaCha8Rng::seed_from_u64(id.get());
+        RaftCore::new(config, RecoveredState::default(), rng)
+    };
+
+    let mut leader = make_node(node1, &[node2, node3]);
+    let mut follower2 = make_node(node2, &[node1, node3]);
+    let mut follower3 = make_node(node3, &[node1, node2]);
+
+    let mut leader_out = Output::new();
+    let mut f2_out = Output::new();
+    let mut f3_out = Output::new();
+
+    // Leader election warmup
+    leader.testing_become_leader(&mut leader_out);
+    let mut initial_ops = std::mem::take(&mut leader_out.persist_ops);
+    for op in initial_ops.drain(..) {
+        leader.step(Input::Persisted { token: op.token() }, &mut leader_out);
+    }
+    leader_out.clear();
+
+    let payload =
+        Bytes::from_static(b"benchmark_raft_replicated_command_payload_64_bytes_zero_copy_slice");
+
+    let mut leader_ops_buf = Vec::new();
+    let mut leader_msgs_buf = Vec::new();
+    let mut f2_ops_buf = Vec::new();
+    let mut f2_msgs_buf = Vec::new();
+    let mut f3_ops_buf = Vec::new();
+    let mut f3_msgs_buf = Vec::new();
+
+    // Warm-up 100 entries
+    for _ in 0..100 {
+        leader_out.clear();
+        leader.step(
+            Input::Propose {
+                payload: payload.clone(),
+            },
+            &mut leader_out,
+        );
+        std::mem::swap(&mut leader_out.persist_ops, &mut leader_ops_buf);
+        for op in leader_ops_buf.drain(..) {
+            leader.step(Input::Persisted { token: op.token() }, &mut leader_out);
+        }
+        std::mem::swap(&mut leader_out.messages, &mut leader_msgs_buf);
+        for msg in leader_msgs_buf.drain(..) {
+            if msg.to == node2 {
+                f2_out.clear();
+                follower2.step(
+                    Input::Recv {
+                        from: node1,
+                        message: msg.message,
+                    },
+                    &mut f2_out,
+                );
+                std::mem::swap(&mut f2_out.persist_ops, &mut f2_ops_buf);
+                for op in f2_ops_buf.drain(..) {
+                    follower2.step(Input::Persisted { token: op.token() }, &mut f2_out);
+                }
+                std::mem::swap(&mut f2_out.messages, &mut f2_msgs_buf);
+                for resp in f2_msgs_buf.drain(..) {
+                    leader.step(
+                        Input::Recv {
+                            from: node2,
+                            message: resp.message,
+                        },
+                        &mut leader_out,
+                    );
+                }
+            } else if msg.to == node3 {
+                f3_out.clear();
+                follower3.step(
+                    Input::Recv {
+                        from: node1,
+                        message: msg.message,
+                    },
+                    &mut f3_out,
+                );
+                std::mem::swap(&mut f3_out.persist_ops, &mut f3_ops_buf);
+                for op in f3_ops_buf.drain(..) {
+                    follower3.step(Input::Persisted { token: op.token() }, &mut f3_out);
+                }
+                std::mem::swap(&mut f3_out.messages, &mut f3_msgs_buf);
+                for resp in f3_msgs_buf.drain(..) {
+                    leader.step(
+                        Input::Recv {
+                            from: node3,
+                            message: resp.message,
+                        },
+                        &mut leader_out,
+                    );
+                }
+            }
+        }
+    }
+
+    let start = Instant::now();
+    for _ in 0..ENTRIES {
+        leader_out.clear();
+        leader.step(
+            Input::Propose {
+                payload: payload.clone(),
+            },
+            &mut leader_out,
+        );
+        std::mem::swap(&mut leader_out.persist_ops, &mut leader_ops_buf);
+        for op in leader_ops_buf.drain(..) {
+            leader.step(Input::Persisted { token: op.token() }, &mut leader_out);
+        }
+        std::mem::swap(&mut leader_out.messages, &mut leader_msgs_buf);
+        for msg in leader_msgs_buf.drain(..) {
+            if msg.to == node2 {
+                f2_out.clear();
+                follower2.step(
+                    Input::Recv {
+                        from: node1,
+                        message: msg.message,
+                    },
+                    &mut f2_out,
+                );
+                std::mem::swap(&mut f2_out.persist_ops, &mut f2_ops_buf);
+                for op in f2_ops_buf.drain(..) {
+                    follower2.step(Input::Persisted { token: op.token() }, &mut f2_out);
+                }
+                std::mem::swap(&mut f2_out.messages, &mut f2_msgs_buf);
+                for resp in f2_msgs_buf.drain(..) {
+                    leader.step(
+                        Input::Recv {
+                            from: node2,
+                            message: resp.message,
+                        },
+                        &mut leader_out,
+                    );
+                }
+            } else if msg.to == node3 {
+                f3_out.clear();
+                follower3.step(
+                    Input::Recv {
+                        from: node1,
+                        message: msg.message,
+                    },
+                    &mut f3_out,
+                );
+                std::mem::swap(&mut f3_out.persist_ops, &mut f3_ops_buf);
+                for op in f3_ops_buf.drain(..) {
+                    follower3.step(Input::Persisted { token: op.token() }, &mut f3_out);
+                }
+                std::mem::swap(&mut f3_out.messages, &mut f3_msgs_buf);
+                for resp in f3_msgs_buf.drain(..) {
+                    leader.step(
+                        Input::Recv {
+                            from: node3,
+                            message: resp.message,
+                        },
+                        &mut leader_out,
+                    );
+                }
+            }
+        }
+    }
+    let elapsed = start.elapsed();
+    let entries_per_sec = ENTRIES as f64 / elapsed.as_secs_f64();
+    (entries_per_sec, ENTRIES)
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -145,6 +333,10 @@ fn main() {
     let (sim_events_sec, total_sim_events) = measure_sim_kernel();
     println!("  -> {sim_events_sec:.0} simulated events/sec ({total_sim_events} events processed)");
 
+    println!("Benchmarking Raft Replication (Leader + 2 Followers, 1 Core)...");
+    let (raft_entries_sec, total_raft_entries) = measure_raft_replication();
+    println!("  -> {raft_entries_sec:.0} entries/sec ({total_raft_entries} entries replicated)");
+
     println!("\n===========================================================");
     println!("                     Summary vs Budgets                    ");
     println!("===========================================================");
@@ -166,6 +358,10 @@ fn main() {
         "| Kernel Throughput (events/sec)  | {sim_events_sec:>8.0}   | N/A           | {budget_sim:>10.0}   |",
         budget_sim = sim_events_sec * 0.8
     );
+    println!(
+        "| Raft Replication (entries/sec)  | {raft_entries_sec:>8.0}   | >= 50,000     | {budget_raft:>10.0}   |",
+        budget_raft = raft_entries_sec * 0.8
+    );
     println!("===========================================================");
 
     if cli.verify_budgets {
@@ -176,6 +372,12 @@ fn main() {
         }
         if rng_m_u64 < 100.0 {
             eprintln!("FAIL: DetRng throughput {rng_m_u64:.2} M u64/sec < 100.0 M floor");
+            passed = false;
+        }
+        if raft_entries_sec < 50_000.0 {
+            eprintln!(
+                "FAIL: Raft replication throughput {raft_entries_sec:.0} entries/sec < 50,000 floor"
+            );
             passed = false;
         }
         if !passed {

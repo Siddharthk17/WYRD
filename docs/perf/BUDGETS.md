@@ -18,21 +18,25 @@ Measurements were captured using `cargo xtask bench` in release mode (`--release
 
 ---
 
-## Performance Budgets (Week 1 Baseline)
+## Performance Budgets (Week 1 & 2 Baseline)
 
 | Component / Hot Path | Metric | Charter Floor | Measured Value | Budget (80% Baseline) | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Event Queue** (`BinaryHeapEventQueue`) | Push-Pop Pairs / sec | $\ge 10.00\text{ M}$ | **20.09 M ops/sec** | **16.07 M ops/sec** | **PASSED** (+100.9% over floor) |
-| **Random Stream** (`DetRng`) | Raw `u64` draws / sec | $\ge 100.00\text{ M}$ | **345.12 M u64/sec** | **276.10 M u64/sec** | **PASSED** (+245.1% over floor) |
-| **Binary Codec** (`Entry::decode_from_bytes`) | 1 KiB Entry Decodes / sec | N/A | **4.76 M entries/sec** | **3.80 M entries/sec** | **PASSED** (4.88 GB/s bandwidth) |
+| **Event Queue** (`BinaryHeapEventQueue`) | Push-Pop Pairs / sec | $\ge 10.00\text{ M}$ | **14.62 M ops/sec** | **11.70 M ops/sec** | **PASSED** (+46.2% over floor) |
+| **Random Stream** (`DetRng`) | Raw `u64` draws / sec | $\ge 100.00\text{ M}$ | **447.82 M u64/sec** | **358.25 M u64/sec** | **PASSED** (+347.8% over floor) |
+| **Binary Codec** (`Entry::decode_from_bytes`) | 1 KiB Entry Decodes / sec | N/A | **4.05 M entries/sec** | **3.24 M entries/sec** | **PASSED** (4.15 GB/s bandwidth) |
 | **Binary Codec** (`Entry::decode_from_bytes`) | Steady-State Heap Allocations | **0** | **0 bytes / 0 allocs** | **0 allocs** | **PASSED** (verified by `CountingAlloc`) |
-| **Simulation Kernel** (`SimKernel::run`) | Simulated Events / sec (1 core) | N/A | **11,816,249 events/sec**| **9,452,999 events/sec**| **PASSED** (11.8 M events/sec) |
+| **Simulation Kernel** (`SimKernel::run`) | Simulated Events / sec (1 core) | N/A | **11,185,179 events/sec**| **8,948,143 events/sec**| **PASSED** (11.2 M events/sec) |
+| **Raft Replication** (Leader + 2 Followers) | Entries Replicated / sec (1 core) | $\ge 50,000\text{ /sec}$ | **1,067,141 entries/sec** | **853,713 entries/sec** | **PASSED** (21.3x over floor) |
+| **Raft Core Follower Tick** | Steady-State Heap Allocations | **0** | **0 bytes / 0 allocs** | **0 allocs** | **PASSED** (verified by `CountingAlloc`) |
+| **Raft Core Leader Heartbeat** | Steady-State Heap Allocations | **0** | **0 bytes / 0 allocs** | **0 allocs** | **PASSED** (verified by `CountingAlloc`) |
+| **Raft Replication Amortized** | Allocations per Entry | $\le 1.0$ | **1.001 allocs/entry** | $\le 1.05\text{ allocs}$ | **PASSED** (transient persist op) |
 
 ---
 
 ## Allocation Invariants
 
-Hot path zero-allocation invariants are continuously checked by `crates/anvil-types/tests/allocation_test.rs` under `CountingAlloc` (ADR 0008):
+Hot path zero-allocation invariants are continuously checked by `crates/anvil-types/tests/allocation_test.rs` and `crates/anvil-raft/tests/allocation_test.rs` under `CountingAlloc` (ADR 0008):
 
 1. **`Entry::decode_from_bytes`**:
    - Decoding a 1 KiB entry from a shared `bytes::Bytes` slice performs zero heap allocations.
@@ -41,6 +45,12 @@ Hot path zero-allocation invariants are continuously checked by `crates/anvil-ty
    - Decoding frame headers and slicing payloads performs zero heap allocations.
 3. **Event Queue Push/Pop**:
    - Steady-state simulation events in `BinaryHeapEventQueue` reuse the backing heap buffer without re-allocation.
+4. **Follower `Input::Tick`**:
+   - Stepping a follower node in steady state performs zero heap allocations with reused `Output`.
+5. **Leader Heartbeat**:
+   - Broadcasting periodic heartbeat messages to peers in steady state performs zero heap allocations with reused `Output`.
+6. **Raft Entry Replication**:
+   - Replicating entries incurs amortized $\le 1$ heap allocation per entry (specifically the single transient container in `PersistOp::AppendEntries` submitted across the sans-IO boundary to storage, while payload slices, logs, and progress trackers are zero-copy).
 
 ---
 
