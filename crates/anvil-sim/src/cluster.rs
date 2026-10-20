@@ -277,6 +277,52 @@ impl SimCluster {
         }
     }
 
+    /// Delivers the in-flight packet at `index % in_flight.len()`, removing it from the queue.
+    /// Returns `true` if a packet was delivered, `false` if `in_flight` was empty or partition applied.
+    pub fn deliver_packet_at(&mut self, index: usize) -> bool {
+        if self.in_flight.is_empty() {
+            return false;
+        }
+        let actual_idx = index % self.in_flight.len();
+        let pkt = self.in_flight.remove(actual_idx);
+        if self.partitions.contains(&(pkt.from, pkt.to))
+            || self.partitions.contains(&(pkt.to, pkt.from))
+        {
+            return false;
+        }
+        self.step_node_internal(
+            pkt.to,
+            Input::Recv {
+                from: pkt.from,
+                message: pkt.message,
+            },
+        );
+        true
+    }
+
+    /// Drops the in-flight packet at `index % in_flight.len()`, removing it without delivery.
+    /// Returns `true` if a packet was dropped, `false` if `in_flight` was empty.
+    pub fn drop_packet_at(&mut self, index: usize) -> bool {
+        if self.in_flight.is_empty() {
+            return false;
+        }
+        let actual_idx = index % self.in_flight.len();
+        self.in_flight.remove(actual_idx);
+        true
+    }
+
+    /// Duplicates the in-flight packet at `index % in_flight.len()`, queuing an extra copy.
+    /// Returns `true` if a packet was duplicated, `false` if `in_flight` was empty or exceeded bounds.
+    pub fn duplicate_packet_at(&mut self, index: usize) -> bool {
+        if self.in_flight.is_empty() || self.in_flight.len() >= 512 {
+            return false;
+        }
+        let actual_idx = index % self.in_flight.len();
+        let pkt = self.in_flight[actual_idx].clone();
+        self.in_flight.push(pkt);
+        true
+    }
+
     /// Drains all in-flight messages by advancing logical time until the network is quiescent.
     pub fn drain_network(&mut self, max_ticks: usize) {
         for _ in 0..max_ticks {

@@ -170,6 +170,12 @@ impl RaftCore {
         self.term = term;
     }
 
+    /// Testing helper to trigger leader election transitions directly.
+    #[doc(hidden)]
+    pub fn testing_become_leader(&mut self, output: &mut Output) {
+        self.become_leader(output);
+    }
+
     // ------------------------------------------------------------------------
     // Tick Handling
     // ------------------------------------------------------------------------
@@ -612,9 +618,11 @@ impl RaftCore {
         let mut truncate_from = None;
 
         for entry in entries {
-            if let Some(existing_term) = self.log.term_at(entry.index) {
+            if truncate_from.is_some() {
+                entries_to_append.push(entry);
+            } else if let Some(existing_term) = self.log.term_at(entry.index) {
                 if existing_term != entry.term {
-                    // Divergence: truncate from this entry
+                    // First point of divergence: truncate from this entry onward
                     truncate_from = Some(entry.index);
                     entries_to_append.push(entry);
                 }
