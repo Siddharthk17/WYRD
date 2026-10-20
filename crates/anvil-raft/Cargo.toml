@@ -9,6 +9,11 @@ authors.workspace = true
 anvil-types = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
+rand_chacha = { workspace = true }
+blake3 = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
 
 [lints]
 workspace = true

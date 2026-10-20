@@ -147,7 +147,10 @@ name = "anvil-raft"
 version = "0.1.0"
 dependencies = [
  "anvil-types",
+ "blake3",
  "bytes",
+ "proptest",
+ "rand_chacha",
  "thiserror",
 ]
 
