@@ -32,3 +32,21 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+# AI coding assistant & local workspace state
+.serena/
+.agents/
+.gemini/
+
+# Local tools & jars
+tools/*.jar
+specs/*.jar
+
+# TLC model checker artifacts & generated states
+states/
+specs/states/
+MC.out
+MC.tla
+MC.cfg
+*.class
+*.dot

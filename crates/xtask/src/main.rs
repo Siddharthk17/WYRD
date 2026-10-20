@@ -43,6 +43,8 @@ enum Commands {
         #[arg(long, default_value_t = 60)]
         duration_secs: u64,
     },
+    /// Run TLC model checker on formal specifications
+    Tlc,
     /// Build and verify documentation
     Docs,
     /// Validate release readiness, packaging, and reproducibility
@@ -77,6 +79,13 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Commands::Tlc => match xtask::tlc::run_tlc_check() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("TLC gate error: {err}");
+                ExitCode::FAILURE
+            }
+        },
         Commands::Farm { .. } => {
             eprintln!("ERROR: `xtask farm` is not yet wired. Failing loudly per charter Rule 5.");
             ExitCode::FAILURE

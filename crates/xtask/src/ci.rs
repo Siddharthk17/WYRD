@@ -16,6 +16,7 @@
 //! 6. Zero-unsafe audit (verifies `#![forbid(unsafe_code)]` in all crates and 0 `unsafe` in production source)
 //! 7. Determinism gate (`cargo xtask determinism`)
 //! 8. Performance budgets gate (`cargo xtask bench` / `--verify-budgets`)
+//! 9. TLC formal specification verification (`cargo xtask tlc`)
 
 use crate::determinism::{self, find_workspace_root};
 use std::path::Path;
@@ -218,6 +219,15 @@ pub fn run_ci() -> Result<(), String> {
         "--verify-budgets",
     ]);
     run_step("Performance Budgets (`cargo xtask bench`)", &mut bench_cmd)?;
+
+    // 9. TLC Spec Verification gate
+    println!("\n>>> Running Gate: TLC Spec Verification (`cargo xtask tlc`)...");
+    let start_tlc = Instant::now();
+    crate::tlc::run_tlc_check()?;
+    println!(
+        ">>> [PASS] TLC Spec Verification ({:.2?})",
+        start_tlc.elapsed()
+    );
 
     println!("\n===========================================================");
     println!("              ALL CI QUALITY GATES PASSED!                ");
