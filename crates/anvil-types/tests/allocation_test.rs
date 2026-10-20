@@ -8,25 +8,28 @@
 use anvil_types::{Entry, EntryKind, Frame, FrameType, LogIndex, Term};
 use bytes::Bytes;
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 
 struct CountingAlloc;
 
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-static DEALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static TRACKING_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static THREAD_ALLOC_COUNT: Cell<usize> = const { Cell::new(0) };
+    static THREAD_ALLOC_BYTES: Cell<usize> = const { Cell::new(0) };
+}
 
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::SeqCst);
-        ALLOCATED_BYTES.fetch_add(layout.size(), Ordering::SeqCst);
-        // SAFETY: Delegating directly to the platform System allocator with identical layout.
+        let _ = TRACKING_ACTIVE.try_with(|active| {
+            if active.get() {
+                let _ = THREAD_ALLOC_COUNT.try_with(|c| c.set(c.get() + 1));
+                let _ = THREAD_ALLOC_BYTES.try_with(|b| b.set(b.get() + layout.size()));
+            }
+        });
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        DEALLOCATIONS.fetch_add(1, Ordering::SeqCst);
-        // SAFETY: Delegating directly to the platform System allocator with caller-supplied pointer and layout.
         unsafe { System.dealloc(ptr, layout) }
     }
 }
@@ -36,24 +39,31 @@ static ALLOCATOR: CountingAlloc = CountingAlloc;
 
 static ALLOC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn reset_alloc_counts() {
-    ALLOCATIONS.store(0, Ordering::SeqCst);
-    DEALLOCATIONS.store(0, Ordering::SeqCst);
-    ALLOCATED_BYTES.store(0, Ordering::SeqCst);
+fn enable_tracking() {
+    let _ = THREAD_ALLOC_COUNT.try_with(|c| c.set(0));
+    let _ = THREAD_ALLOC_BYTES.try_with(|b| b.set(0));
+    let _ = TRACKING_ACTIVE.try_with(|a| a.set(true));
+}
+
+fn disable_tracking() -> usize {
+    let _ = TRACKING_ACTIVE.try_with(|a| a.set(false));
+    THREAD_ALLOC_COUNT.try_with(Cell::get).unwrap_or(0)
+}
+
+fn current_alloc_count() -> usize {
+    THREAD_ALLOC_COUNT.try_with(Cell::get).unwrap_or(0)
 }
 
 #[test]
 fn test_allocator_tracks_allocations() {
     let _guard = ALLOC_TEST_LOCK.lock().unwrap();
-    reset_alloc_counts();
-    assert_eq!(ALLOCATIONS.load(Ordering::SeqCst), 0);
+    enable_tracking();
+    assert_eq!(current_alloc_count(), 0);
 
     let boxed = Box::new(42u64);
     assert_eq!(*boxed, 42);
-    assert!(
-        ALLOCATIONS.load(Ordering::SeqCst) > 0,
-        "CountingAlloc must record heap allocations"
-    );
+    let count = disable_tracking();
+    assert!(count > 0, "CountingAlloc must record heap allocations");
 }
 
 #[test]
@@ -81,12 +91,12 @@ fn test_codec_decode_1kib_entry_zero_allocations() {
     let _warmup = Entry::decode_from_bytes(&mut stream_bytes).expect("warmup decode");
 
     // Reset allocation counter before testing hot path steady-state
-    reset_alloc_counts();
+    enable_tracking();
 
     // Hot path steady-state: zero-copy decode of 1 KiB entry
     let decoded = Entry::decode_from_bytes(&mut stream_bytes).expect("hot path decode");
 
-    let allocs = ALLOCATIONS.load(Ordering::SeqCst);
+    let allocs = disable_tracking();
     assert_eq!(
         allocs, 0,
         "codec decode of 1 KiB entry in steady state must incur exactly ZERO allocations! Observed: {allocs}"
@@ -123,7 +133,7 @@ fn test_codec_decode_batch_1000_entries_zero_allocations() {
     // Warmup: first decode transitions buffer to steady-state shared reference
     let _warmup = Entry::decode_from_bytes(&mut stream_bytes).expect("warmup decode");
 
-    reset_alloc_counts();
+    enable_tracking();
 
     // Decode 1,000 entries sequentially from the wire buffer in steady state
     let mut decoded_count = 0;
@@ -133,8 +143,8 @@ fn test_codec_decode_batch_1000_entries_zero_allocations() {
         decoded_count += 1;
     }
 
+    let allocs = disable_tracking();
     assert_eq!(decoded_count, 1000);
-    let allocs = ALLOCATIONS.load(Ordering::SeqCst);
     assert_eq!(
         allocs, 0,
         "batch decode of 1,000 1-KiB entries in steady state must incur ZERO allocations! Observed: {allocs}"
@@ -158,11 +168,11 @@ fn test_frame_decode_zero_allocations() {
     // Warmup decode promotes buffer to steady-state shared reference
     let _warmup = Frame::decode_from_bytes(&mut frame_bytes).expect("warmup frame decode");
 
-    reset_alloc_counts();
+    enable_tracking();
 
     // Steady state hot path decode
     let decoded_frame = Frame::decode_from_bytes(&mut frame_bytes).expect("decode frame");
-    let allocs = ALLOCATIONS.load(Ordering::SeqCst);
+    let allocs = disable_tracking();
 
     assert_eq!(
         allocs, 0,

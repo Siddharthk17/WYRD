@@ -18,24 +18,29 @@ use bytes::Bytes;
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct CountingAlloc;
 
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-static DEALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static TRACKING_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static THREAD_ALLOC_COUNT: Cell<usize> = const { Cell::new(0) };
+    static THREAD_ALLOC_BYTES: Cell<usize> = const { Cell::new(0) };
+}
 
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::SeqCst);
-        ALLOCATED_BYTES.fetch_add(layout.size(), Ordering::SeqCst);
+        let _ = TRACKING_ACTIVE.try_with(|active| {
+            if active.get() {
+                let _ = THREAD_ALLOC_COUNT.try_with(|c| c.set(c.get() + 1));
+                let _ = THREAD_ALLOC_BYTES.try_with(|b| b.set(b.get() + layout.size()));
+            }
+        });
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        DEALLOCATIONS.fetch_add(1, Ordering::SeqCst);
         unsafe { System.dealloc(ptr, layout) }
     }
 }
@@ -45,10 +50,19 @@ static ALLOCATOR: CountingAlloc = CountingAlloc;
 
 static ALLOC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn reset_alloc_counts() {
-    ALLOCATIONS.store(0, Ordering::SeqCst);
-    DEALLOCATIONS.store(0, Ordering::SeqCst);
-    ALLOCATED_BYTES.store(0, Ordering::SeqCst);
+fn enable_tracking() {
+    let _ = THREAD_ALLOC_COUNT.try_with(|c| c.set(0));
+    let _ = THREAD_ALLOC_BYTES.try_with(|b| b.set(0));
+    let _ = TRACKING_ACTIVE.try_with(|a| a.set(true));
+}
+
+fn disable_tracking() -> usize {
+    let _ = TRACKING_ACTIVE.try_with(|a| a.set(false));
+    THREAD_ALLOC_COUNT.try_with(Cell::get).unwrap_or(0)
+}
+
+fn current_alloc_count() -> usize {
+    THREAD_ALLOC_COUNT.try_with(Cell::get).unwrap_or(0)
 }
 
 fn create_test_node(
@@ -78,12 +92,13 @@ fn create_test_node(
 #[test]
 fn test_allocator_tracks_allocations() {
     let _guard = ALLOC_TEST_LOCK.lock().unwrap();
-    reset_alloc_counts();
-    assert_eq!(ALLOCATIONS.load(Ordering::SeqCst), 0);
+    enable_tracking();
+    assert_eq!(current_alloc_count(), 0);
 
     let b = Box::new(12345u64);
     assert_eq!(*b, 12345);
-    assert!(ALLOCATIONS.load(Ordering::SeqCst) > 0);
+    let count = disable_tracking();
+    assert!(count > 0);
 }
 
 #[test]
@@ -97,7 +112,7 @@ fn test_follower_tick_zero_allocations() {
     output.clear();
     follower.step(Input::Tick, &mut output);
 
-    reset_alloc_counts();
+    enable_tracking();
 
     // Hot path steady-state: 10,000 consecutive follower ticks
     for _ in 0..10_000 {
@@ -105,7 +120,7 @@ fn test_follower_tick_zero_allocations() {
         follower.step(Input::Tick, &mut output);
     }
 
-    let allocs = ALLOCATIONS.load(Ordering::SeqCst);
+    let allocs = disable_tracking();
     assert_eq!(
         allocs, 0,
         "follower Tick in steady-state must incur exactly 0 allocations! Observed: {allocs}"
@@ -134,7 +149,7 @@ fn test_leader_heartbeat_zero_allocations() {
         }
     }
 
-    reset_alloc_counts();
+    enable_tracking();
 
     // Hot path steady-state: 1,000 heartbeat broadcasts (5,000 ticks)
     for _ in 0..1_000 {
@@ -144,7 +159,7 @@ fn test_leader_heartbeat_zero_allocations() {
         }
     }
 
-    let allocs = ALLOCATIONS.load(Ordering::SeqCst);
+    let allocs = disable_tracking();
     assert_eq!(
         allocs, 0,
         "leader Heartbeat in steady-state must incur exactly 0 allocations! Observed: {allocs}"
@@ -186,7 +201,7 @@ fn test_replication_amortized_allocations_per_entry() {
         }
     }
 
-    reset_alloc_counts();
+    enable_tracking();
 
     for _ in 0..ENTRIES_COUNT {
         output.clear();
@@ -203,7 +218,7 @@ fn test_replication_amortized_allocations_per_entry() {
         }
     }
 
-    let total_allocs = ALLOCATIONS.load(Ordering::SeqCst);
+    let total_allocs = disable_tracking();
     let allocs_per_entry = (total_allocs as f64) / (ENTRIES_COUNT as f64);
 
     println!(

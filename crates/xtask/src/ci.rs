@@ -17,6 +17,7 @@
 //! 7. Determinism gate (`cargo xtask determinism`)
 //! 8. Performance budgets gate (`cargo xtask bench` / `--verify-budgets`)
 //! 9. TLC formal specification verification (`cargo xtask tlc`)
+//! 10. Simulator smoke farm gate (`cargo xtask farm --seeds 2000`)
 
 use crate::determinism::{self, find_workspace_root};
 use std::path::Path;
@@ -227,6 +228,23 @@ pub fn run_ci() -> Result<(), String> {
     println!(
         ">>> [PASS] TLC Spec Verification ({:.2?})",
         start_tlc.elapsed()
+    );
+
+    // 10. Simulator smoke farm gate (2,000 seeds)
+    println!("\n>>> Running Gate: Simulator Smoke Farm (2,000 seeds)...");
+    let start_farm = Instant::now();
+    let num_cpus = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    let farm_result = anvil_sim::run_seed_farm(2000, num_cpus);
+    if !farm_result.is_clean() {
+        return Err(format!(
+            "Simulator smoke farm failed! Failed seed: {:?}, passed: {}/{}",
+            farm_result.failed_seed, farm_result.passed_seeds, farm_result.total_seeds
+        ));
+    }
+    println!(
+        ">>> [PASS] Simulator Smoke Farm (2000 seeds in {:.2?}, {:.0} seeds/sec)",
+        start_farm.elapsed(),
+        farm_result.seeds_per_second()
     );
 
     println!("\n===========================================================");

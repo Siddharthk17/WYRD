@@ -4,6 +4,7 @@
 
 pub mod buggify;
 pub mod cluster;
+pub mod farm;
 pub mod kernel;
 pub mod queue;
 pub mod raft_invariants;
@@ -18,6 +19,7 @@ pub use buggify::{
     set_buggify_enabled, set_buggify_seed,
 };
 pub use cluster::{InFlightPacket, SimCluster};
+pub use farm::{FarmResult, run_farm_seed, run_seed_farm};
 pub use kernel::{Actor, ActorContext, SimError, SimKernel, SimReport};
 pub use queue::{BinaryHeapEventQueue, EventQueue, HierarchicalTimingWheel, ScheduledEvent};
 pub use raft_invariants::{InvariantViolation, RaftInvariantChecker};

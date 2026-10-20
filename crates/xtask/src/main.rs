@@ -86,9 +86,28 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Commands::Farm { .. } => {
-            eprintln!("ERROR: `xtask farm` is not yet wired. Failing loudly per charter Rule 5.");
-            ExitCode::FAILURE
+        Commands::Farm { seeds } => {
+            println!("=== ANVIL Simulator Seed Farm ===");
+            let threads =
+                std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+            println!("Evaluating {seeds} seeds across {threads} parallel worker threads...");
+            let res = anvil_sim::run_seed_farm(seeds, threads);
+            println!(
+                "Farm Result: {}/{} passed in {:.2?} ({:.1} seeds/sec)",
+                res.passed_seeds,
+                res.total_seeds,
+                res.duration,
+                res.seeds_per_second()
+            );
+            if let Some(f_seed) = res.failed_seed {
+                eprintln!("FARM FAILURE: Seed {f_seed} produced an invariant violation!");
+                ExitCode::FAILURE
+            } else {
+                println!(
+                    "FARM PASSED: All {seeds} seeds completed with zero invariant violations."
+                );
+                ExitCode::SUCCESS
+            }
         }
         Commands::Bench => {
             let status = std::process::Command::new("cargo")
