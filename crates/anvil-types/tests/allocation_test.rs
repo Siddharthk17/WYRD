@@ -145,19 +145,28 @@ fn test_codec_decode_batch_1000_entries_zero_allocations() {
 fn test_frame_decode_zero_allocations() {
     let _guard = ALLOC_TEST_LOCK.lock().unwrap();
     let payload = vec![0x42u8; 1024];
-    let mut frame_buf = Vec::new();
-    Frame::encode(FrameType::Entry, &payload, &mut frame_buf);
+    let mut single_frame = Vec::new();
+    Frame::encode(FrameType::Entry, &payload, &mut single_frame);
 
-    let mut frame_bytes = Bytes::from(frame_buf);
+    // Stream containing two frames
+    let mut stream_buf = Vec::new();
+    stream_buf.extend_from_slice(&single_frame);
+    stream_buf.extend_from_slice(&single_frame);
+
+    let mut frame_bytes = Bytes::from(stream_buf);
+
+    // Warmup decode promotes buffer to steady-state shared reference
+    let _warmup = Frame::decode_from_bytes(&mut frame_bytes).expect("warmup frame decode");
 
     reset_alloc_counts();
 
+    // Steady state hot path decode
     let decoded_frame = Frame::decode_from_bytes(&mut frame_bytes).expect("decode frame");
     let allocs = ALLOCATIONS.load(Ordering::SeqCst);
 
     assert_eq!(
         allocs, 0,
-        "frame decode of 1 KiB payload must incur ZERO allocations! Observed: {allocs}"
+        "frame decode of 1 KiB payload in steady state must incur ZERO allocations! Observed: {allocs}"
     );
     assert_eq!(decoded_frame.payload.len(), 1024);
     assert_eq!(decoded_frame.header.payload_len, 1024);

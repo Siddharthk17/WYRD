@@ -17,17 +17,8 @@ jobs:
         run: |
           rustup show
 
-      - name: Format Check
-        run: cargo fmt --all -- --check
-
-      - name: Clippy (-D warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Test Workspace
-        run: cargo test --workspace
-
-      - name: Determinism Check
-        run: cargo run --package xtask -- determinism
+      - name: ANVIL Quality Gates (xtask ci)
+        run: cargo xtask ci
 
   ci-aarch64:
     name: CI (aarch64 Linux)
@@ -39,8 +30,5 @@ jobs:
         run: |
           rustup show
 
-      - name: Test Workspace
-        run: cargo test --workspace
-
-      - name: Determinism Check
-        run: cargo run --package xtask -- determinism
+      - name: ANVIL Quality Gates (xtask ci)
+        run: cargo xtask ci

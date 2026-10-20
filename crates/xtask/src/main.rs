@@ -2,6 +2,7 @@
 
 //! `xtask`: Developer automation and quality gates for ANVIL.
 
+use xtask::ci;
 use xtask::determinism;
 
 use clap::{Parser, Subcommand};
@@ -51,12 +52,13 @@ enum Commands {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Ci => {
-            eprintln!(
-                "ERROR: `xtask ci` is not yet fully wired. Failing loudly per charter Rule 5."
-            );
-            ExitCode::FAILURE
-        }
+        Commands::Ci => match ci::run_ci() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("\nCI FAILED: {err}");
+                ExitCode::FAILURE
+            }
+        },
         Commands::Determinism {
             negative_test,
             worker_seed,

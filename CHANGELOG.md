@@ -21,4 +21,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Performance budgets specification and measurement baseline in `docs/perf/BUDGETS.md` ratcheting 80% budgets against real hardware.
 - Benchmark command `cargo xtask bench` wired to run release benchmarks and verify performance against charter floors.
 - Architecture Decision Record 0008 documenting the test-only counting allocator.
-- Baseline `xtask` quality gate runner.
+- Unified quality gate runner `cargo xtask ci` executing format check, strict clippy, workspace tests, doc tests, doc generation, zero-unsafe code audit, determinism verification, and performance budgets.
+- PR CI GitHub Actions workflow (`.github/workflows/pr.yml`) running `cargo xtask ci` across x86_64 and aarch64 Linux matrices.
+- Week 1 milestone progress report in `docs/progress/week1.md` documenting deliverables, real exit-gate outputs, and ratcheted performance budgets.
