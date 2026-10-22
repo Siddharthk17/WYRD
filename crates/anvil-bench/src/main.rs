@@ -310,6 +310,76 @@ fn measure_raft_replication() -> (f64, usize) {
     (entries_per_sec, ENTRIES)
 }
 
+fn measure_wal_recovery_scan() -> (f64, usize) {
+    use anvil_storage::{
+        HardStateSlot, LogRecoveryClassification, SectorSize, StorageEngine, WalRecordFrame,
+        WalSegmentHeader,
+    };
+
+    const RECORDS: usize = 10_000;
+    const ITERATIONS: usize = 10;
+
+    let sector_size = SectorSize::Sector512;
+    let sector_len = sector_size.as_usize();
+
+    // Prepare HardState buffer
+    let mut hs_buf = vec![0u8; sector_len * 2];
+    let hs_slot = HardStateSlot::new(
+        0,
+        1,
+        Term::from_raw(1),
+        Some(NodeId::new(1).expect("node 1")),
+    );
+    hs_slot
+        .encode(sector_size, &mut hs_buf[..sector_len])
+        .expect("encode hs");
+
+    // Prepare WAL segment buffer: 10,000 records of 1 KiB each
+    let header = WalSegmentHeader::new(sector_size, 1, LogIndex::from_raw(1), Term::from_raw(1));
+    let mut wal_buf = Vec::with_capacity(sector_len + RECORDS * 1536);
+    let mut hdr_bytes = vec![0u8; sector_len];
+    header.encode(&mut hdr_bytes).expect("encode wal header");
+    wal_buf.extend_from_slice(&hdr_bytes);
+
+    let payload = Bytes::from(vec![0x42u8; 1024]);
+    let mut prev_crc = header.header_crc;
+    for i in 1..=RECORDS {
+        let entry = Entry {
+            index: LogIndex::from_raw(i as u64),
+            term: Term::from_raw(1),
+            kind: EntryKind::Normal,
+            payload: payload.clone(),
+        };
+        let frame = WalRecordFrame::from_entry(&entry, prev_crc, 1, wal_buf.len() as u64);
+        frame.encode_frame(sector_size, &mut wal_buf);
+        prev_crc = frame.crc32c;
+    }
+
+    let wal_bytes = Bytes::from(wal_buf);
+
+    // Warm-up
+    let recovered =
+        StorageEngine::scan_recovery(&hs_buf, &[(header.clone(), &wal_bytes)], sector_size)
+            .expect("warmup scan recovery");
+    assert!(matches!(
+        recovered.log.classification,
+        LogRecoveryClassification::Clean
+    ));
+
+    let start = Instant::now();
+    for _ in 0..ITERATIONS {
+        let rec =
+            StorageEngine::scan_recovery(&hs_buf, &[(header.clone(), &wal_bytes)], sector_size)
+                .expect("scan recovery iteration");
+        std::hint::black_box(&rec);
+    }
+    let elapsed = start.elapsed();
+
+    let total_scanned_bytes = wal_bytes.len() * ITERATIONS;
+    let gb_per_sec = (total_scanned_bytes as f64) / elapsed.as_secs_f64() / 1_000_000_000.0;
+    (gb_per_sec, total_scanned_bytes)
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -337,6 +407,10 @@ fn main() {
     let (raft_entries_sec, total_raft_entries) = measure_raft_replication();
     println!("  -> {raft_entries_sec:.0} entries/sec ({total_raft_entries} entries replicated)");
 
+    println!("Benchmarking Storage WAL Recovery Scan (Real Codec + Chained CRC32C)...");
+    let (wal_gb_sec, total_wal_bytes) = measure_wal_recovery_scan();
+    println!("  -> {wal_gb_sec:.2} GB/sec ({total_wal_bytes} bytes scanned across 10 iterations)");
+
     println!("\n===========================================================");
     println!("                     Summary vs Budgets                    ");
     println!("===========================================================");
@@ -362,6 +436,10 @@ fn main() {
         "| Raft Replication (entries/sec)  | {raft_entries_sec:>8.0}   | >= 50,000     | {budget_raft:>10.0}   |",
         budget_raft = raft_entries_sec * 0.8
     );
+    println!(
+        "| WAL Recovery Scan (GB/sec)      | {wal_gb_sec:>8.2} GB | >= 1.00 GB/s  | {budget_wal:>10.2} GB |",
+        budget_wal = wal_gb_sec * 0.8
+    );
     println!("===========================================================");
 
     if cli.verify_budgets {
@@ -378,6 +456,10 @@ fn main() {
             eprintln!(
                 "FAIL: Raft replication throughput {raft_entries_sec:.0} entries/sec < 50,000 floor"
             );
+            passed = false;
+        }
+        if wal_gb_sec < 1.0 {
+            eprintln!("FAIL: WAL recovery scan throughput {wal_gb_sec:.2} GB/s < 1.0 GB/s floor");
             passed = false;
         }
         if !passed {

@@ -3,12 +3,16 @@
 
 //! `anvil-storage`: WAL, hard state, and snapshot formats with sans-IO recovery logic.
 
+pub mod config;
 pub mod device;
+pub mod engine;
 pub mod error;
 pub mod format;
 pub mod recovery;
 
+pub use config::StorageConfig;
 pub use device::{CompletionPayload, Device, DeviceCompletion, DeviceOp, FileId, SectorSize};
+pub use engine::{EngineInput, EngineOutput, StorageEngine};
 pub use error::StorageError;
 pub use format::{
     HARD_STATE_MAGIC, HARD_STATE_SLOT_FIXED_LEN, HARD_STATE_VERSION, HardStateRecoveryOutcome,

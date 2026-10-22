@@ -31,6 +31,7 @@ Measurements were captured using `cargo xtask bench` in release mode (`--release
 | **Raft Core Follower Tick** | Steady-State Heap Allocations | **0** | **0 bytes / 0 allocs** | **0 allocs** | **PASSED** (verified by `CountingAlloc`) |
 | **Raft Core Leader Heartbeat** | Steady-State Heap Allocations | **0** | **0 bytes / 0 allocs** | **0 allocs** | **PASSED** (verified by `CountingAlloc`) |
 | **Raft Replication Amortized** | Allocations per Entry | $\le 1.0$ | **1.001 allocs/entry** | $\le 1.05\text{ allocs}$ | **PASSED** (transient persist op) |
+| **WAL Recovery Scan** (`StorageEngine::scan_recovery`) | Scanned Byte Bandwidth (1 core) | $\ge 1.00\text{ GB/s}$ | **2.13 GB/s** | **1.70 GB/s** | **PASSED** (+113% over floor) |
 
 ---
 
