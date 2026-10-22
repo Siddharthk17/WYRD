@@ -186,6 +186,7 @@ dependencies = [
  "blake3",
  "bytes",
  "crc32c",
+ "proptest",
  "thiserror",
 ]
 
