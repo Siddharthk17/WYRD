@@ -272,11 +272,7 @@ impl SimDevice {
     /// Returns a reference to durable file bytes if the file exists.
     #[must_use]
     pub fn get_file_durable_bytes(&self, file_id: FileId) -> Option<&[u8]> {
-        if self.durable_files.contains(&file_id) {
-            self.files.get(&file_id).map(|s| s.durable_data.as_slice())
-        } else {
-            None
-        }
+        self.files.get(&file_id).map(|s| s.durable_data.as_slice())
     }
 
     /// Returns a reference to volatile page cache file bytes if the file exists.

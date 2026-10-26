@@ -119,7 +119,12 @@ dependencies = [
 name = "anvil-device-fs"
 version = "0.1.0"
 dependencies = [
+ "anvil-sim",
  "anvil-storage",
+ "anvil-types",
+ "bytes",
+ "crossbeam-channel",
+ "rand_chacha",
  "rustix",
  "thiserror",
 ]

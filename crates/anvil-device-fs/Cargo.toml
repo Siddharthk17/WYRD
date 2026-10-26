@@ -8,7 +8,14 @@ authors.workspace = true
 [dependencies]
 anvil-storage = { workspace = true }
 rustix = { workspace = true, features = ["fs"] }
+crossbeam-channel = { workspace = true }
+bytes = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+anvil-sim = { workspace = true }
+anvil-types = { workspace = true }
+rand_chacha = { workspace = true }
 
 [lints]
 workspace = true
