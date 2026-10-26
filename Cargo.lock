@@ -171,6 +171,7 @@ name = "anvil-sim"
 version = "0.1.0"
 dependencies = [
  "anvil-raft",
+ "anvil-storage",
  "anvil-types",
  "blake3",
  "bytes",

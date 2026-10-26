@@ -12,6 +12,7 @@ sim = []
 [dependencies]
 anvil-types = { workspace = true }
 anvil-raft = { workspace = true }
+anvil-storage = { workspace = true }
 bytes = { workspace = true }
 blake3 = { workspace = true }
 rand_chacha = { workspace = true }

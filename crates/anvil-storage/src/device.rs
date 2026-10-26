@@ -78,6 +78,34 @@ impl FileId {
         // High bit set to distinguish snapshots from segments
         Self(snapshot_id | (1u64 << 63))
     }
+
+    /// Returns `true` if this `FileId` represents the Hard State file.
+    #[must_use]
+    pub const fn is_hard_state(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Returns `true` if this `FileId` represents a WAL segment.
+    #[must_use]
+    pub const fn is_wal_segment(self) -> bool {
+        self.0 > 0 && (self.0 & (1u64 << 63)) == 0
+    }
+
+    /// Returns `true` if this `FileId` represents a snapshot file.
+    #[must_use]
+    pub const fn is_snapshot(self) -> bool {
+        (self.0 & (1u64 << 63)) != 0
+    }
+
+    /// Returns the segment ID if this file is a WAL segment.
+    #[must_use]
+    pub const fn wal_segment_id(self) -> Option<u64> {
+        if self.is_wal_segment() {
+            Some(self.0.wrapping_sub(1))
+        } else {
+            None
+        }
+    }
 }
 
 /// Abstract I/O operations submitted by the sans-IO storage engine.
