@@ -6,7 +6,9 @@ use crate::config::StorageConfig;
 use crate::device::{DeviceCompletion, DeviceOp, FileId, SectorSize};
 use crate::error::StorageError;
 use crate::format::hard_state::{HardStateRecoveryOutcome, HardStateSlot, recover_hard_state};
-use crate::format::wal::{WalRecordFrame, WalScanResult, WalSegmentHeader, decode_wal_frame};
+use crate::format::wal::{
+    WAL_RECORD_HEADER_FIXED_LEN, WalRecordFrame, WalScanResult, WalSegmentHeader, decode_wal_frame,
+};
 use crate::recovery::{LogRecoveryClassification, RecoveredLog, RecoveredStorageState};
 use anvil_types::{Entry, LogIndex, NodeId, Term};
 use bytes::Bytes;
@@ -590,21 +592,38 @@ impl StorageEngine {
 fn has_valid_records_ahead(
     buf: &[u8],
     sector_size: SectorSize,
-    segment_id: u64,
-    mut offset: u64,
+    _segment_id: u64,
+    _offset: u64,
 ) -> bool {
     let sector_len = sector_size.as_usize();
     let mut cur = 0;
 
     while cur + sector_len <= buf.len() {
         let slice = &buf[cur..];
-        // Test frame decode with speculative CRC seed (0)
-        let res = decode_wal_frame(slice, sector_size, 0, segment_id, offset);
-        if let WalScanResult::Valid { .. } = res {
-            return true;
+        // If the sector is not completely zeroes, inspect record header structure
+        if !slice[..sector_len].iter().all(|&b| b == 0)
+            && slice.len() >= WAL_RECORD_HEADER_FIXED_LEN
+        {
+            let raw_index = u64::from_le_bytes([
+                slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
+            ]);
+            let raw_term = u64::from_le_bytes([
+                slice[8], slice[9], slice[10], slice[11], slice[12], slice[13], slice[14],
+                slice[15],
+            ]);
+            let payload_len =
+                u32::from_le_bytes([slice[16], slice[17], slice[18], slice[19]]) as usize;
+            let kind_byte = slice[20];
+
+            if raw_index > 0
+                && raw_term > 0
+                && (kind_byte == 0 || kind_byte == 1)
+                && payload_len <= 16 * 1024 * 1024
+            {
+                return true;
+            }
         }
         cur += sector_len;
-        offset += sector_len as u64;
     }
 
     false

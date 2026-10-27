@@ -105,6 +105,32 @@ pub enum InvariantViolation {
         previous_vote: Option<NodeId>,
         new_vote: Option<NodeId>,
     },
+    #[error(
+        "VoteNeverForgotten violated on {node} in term {term}: recorded vote was {expected_vote:?}, but recovered vote was {recovered_vote:?}"
+    )]
+    VoteNeverForgotten {
+        node: NodeId,
+        term: Term,
+        expected_vote: Option<NodeId>,
+        recovered_vote: Option<NodeId>,
+    },
+    #[error(
+        "RecoveredLogMissingAcknowledgedEntry violated on {node} at index {index}: acknowledged term was {expected_term}, but recovered entry was {recovered_term:?}"
+    )]
+    RecoveredLogMissingAcknowledgedEntry {
+        node: NodeId,
+        index: LogIndex,
+        expected_term: Term,
+        recovered_term: Option<Term>,
+    },
+    #[error(
+        "CommittedNeverLostAcrossCrashes violated at index {index}: committed entry in term {expected_term} was lost across crash recovery (actual: {actual_term:?})"
+    )]
+    CommittedNeverLostAcrossCrashes {
+        index: LogIndex,
+        expected_term: Term,
+        actual_term: Option<Term>,
+    },
 }
 
 /// Global online invariant checker evaluating Raft safety across cluster nodes.
@@ -415,5 +441,62 @@ impl RaftInvariantChecker {
     #[must_use]
     pub fn committed_entries_count(&self) -> usize {
         self.committed_oracle.len()
+    }
+
+    /// Returns a reference to the global committed oracle.
+    #[must_use]
+    pub fn committed_oracle(&self) -> &BTreeMap<LogIndex, Entry> {
+        &self.committed_oracle
+    }
+
+    /// Verifies that a node's recovered state does not violate `VoteNeverForgotten`.
+    ///
+    /// # Errors
+    /// Returns `InvariantViolation::VoteNeverForgotten` if the recovered vote contradicts the recorded vote.
+    pub fn check_vote_never_forgotten(
+        &self,
+        node: NodeId,
+        term: Term,
+        recovered_vote: Option<NodeId>,
+    ) -> Result<(), InvariantViolation> {
+        if let Some(&recorded_vote) = self.node_votes.get(&(node, term))
+            && recovered_vote != Some(recorded_vote)
+        {
+            return Err(InvariantViolation::VoteNeverForgotten {
+                node,
+                term,
+                expected_vote: Some(recorded_vote),
+                recovered_vote,
+            });
+        }
+        Ok(())
+    }
+
+    /// Verifies that all entries in the global committed oracle are preserved or not contradicted
+    /// by the recovered log.
+    ///
+    /// # Errors
+    /// Returns `InvariantViolation::CommittedNeverLostAcrossCrashes` if a committed entry is contradicted.
+    pub fn check_recovered_log_against_oracle(
+        &self,
+        _node: NodeId,
+        recovered_entries: &[Entry],
+    ) -> Result<(), InvariantViolation> {
+        let mut map = BTreeMap::new();
+        for e in recovered_entries {
+            map.insert(e.index, e.term);
+        }
+        for (&idx, oracle_entry) in &self.committed_oracle {
+            if let Some(&term) = map.get(&idx)
+                && term != oracle_entry.term
+            {
+                return Err(InvariantViolation::CommittedNeverLostAcrossCrashes {
+                    index: idx,
+                    expected_term: oracle_entry.term,
+                    actual_term: Some(term),
+                });
+            }
+        }
+        Ok(())
     }
 }

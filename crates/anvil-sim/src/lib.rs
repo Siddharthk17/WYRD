@@ -19,7 +19,7 @@ pub use buggify::{
     BuggifyPoint, BuggifyRegistry, list_registered_points, reset_buggify_registry,
     set_buggify_enabled, set_buggify_seed,
 };
-pub use cluster::{InFlightPacket, SimCluster};
+pub use cluster::{InFlightPacket, SimCluster, SimNodeStorage};
 pub use device::{FileState, SimDevice, SimDeviceConfig, SimDeviceStats, StorageFaultAtlas};
 pub use farm::{FarmResult, run_farm_seed, run_seed_farm};
 pub use kernel::{Actor, ActorContext, SimError, SimKernel, SimReport};
