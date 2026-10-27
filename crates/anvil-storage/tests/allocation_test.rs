@@ -111,3 +111,74 @@ fn test_empty_append_zero_allocations() {
 
     assert_eq!(allocs, 0, "Empty append must perform 0 allocations");
 }
+
+#[test]
+fn test_in_flight_sync_buffering_zero_allocations() {
+    use anvil_types::{Entry, EntryKind, Term};
+    use bytes::Bytes;
+
+    let _guard = ALLOC_TEST_LOCK.lock().unwrap();
+
+    let config = StorageConfig::for_test(SectorSize::Sector512, 16 * 1024 * 1024);
+    let mut engine = StorageEngine::new_empty(config);
+    let mut output = EngineOutput::default();
+    output.device_ops.reserve(64);
+    output.persisted_tokens.reserve(64);
+
+    let payload =
+        Bytes::from_static(b"zero_alloc_payload_64_bytes_static_slice_reference_test_data");
+    let initial_entry = Entry {
+        index: LogIndex::from_raw(1),
+        term: Term::from_raw(1),
+        kind: EntryKind::Normal,
+        payload: payload.clone(),
+    };
+
+    // First append triggers write and starts in-flight sync
+    engine.step(
+        EngineInput::AppendEntries {
+            prev_index: LogIndex::from_raw(0),
+            entries: vec![initial_entry],
+            token: 100,
+        },
+        &mut output,
+    );
+    output.clear();
+
+    // Pre-reserve capacity to establish steady-state buffer size
+    engine.reserve_pending_capacity(1_000, 1_000 * 512);
+
+    // Pre-create 1,000 inputs to isolate StorageEngine from caller allocation
+    let mut inputs = Vec::with_capacity(1_000);
+    for i in 2..=1001 {
+        let entry = Entry {
+            index: LogIndex::from_raw(i),
+            term: Term::from_raw(1),
+            kind: EntryKind::Normal,
+            payload: payload.clone(),
+        };
+        inputs.push(EngineInput::AppendEntries {
+            prev_index: LogIndex::from_raw(i - 1),
+            entries: vec![entry],
+            token: i + 100,
+        });
+    }
+
+    // Warm-up one buffering step to ensure vector capacity
+    engine.step(inputs.remove(0), &mut output);
+    output.clear();
+
+    enable_tracking();
+
+    // Hot path steady state: buffer remaining 999 entries while sync is in flight
+    for input in inputs {
+        engine.step(input, &mut output);
+        output.clear();
+    }
+
+    let allocs = disable_tracking();
+    assert_eq!(
+        allocs, 0,
+        "StorageEngine buffering while sync in flight must incur exactly 0 allocations! Observed: {allocs}"
+    );
+}

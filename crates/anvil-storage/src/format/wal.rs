@@ -240,11 +240,17 @@ impl WalRecordFrame {
         }
     }
 
+    /// Computes total frame size for a payload length aligned to the configured sector size.
+    #[must_use]
+    pub const fn compute_frame_size(payload_len: usize, sector_size: SectorSize) -> usize {
+        let unaligned = WAL_RECORD_HEADER_FIXED_LEN + payload_len;
+        sector_size.align_up(unaligned)
+    }
+
     /// Computes total frame size aligned to the configured sector size.
     #[must_use]
     pub fn frame_size(&self, sector_size: SectorSize) -> usize {
-        let unaligned = WAL_RECORD_HEADER_FIXED_LEN + self.payload.len();
-        sector_size.align_up(unaligned)
+        Self::compute_frame_size(self.payload.len(), sector_size)
     }
 
     /// Encodes this record frame into the output buffer, appending zero padding.

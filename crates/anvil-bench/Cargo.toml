@@ -12,6 +12,8 @@ anvil-types = { workspace = true }
 anvil-raft = { workspace = true }
 anvil-storage = { workspace = true }
 anvil-sim = { workspace = true }
+anvil-device-fs = { workspace = true }
+rustix = { workspace = true }
 bytes = { workspace = true }
 rand_chacha = { workspace = true }
 criterion = { workspace = true }

@@ -86,6 +86,7 @@ dependencies = [
 name = "anvil-bench"
 version = "0.1.0"
 dependencies = [
+ "anvil-device-fs",
  "anvil-raft",
  "anvil-sim",
  "anvil-storage",
@@ -95,6 +96,7 @@ dependencies = [
  "criterion",
  "hdrhistogram",
  "rand_chacha",
+ "rustix",
 ]
 
 [[package]]

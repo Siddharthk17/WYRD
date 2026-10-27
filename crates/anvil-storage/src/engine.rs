@@ -212,6 +212,12 @@ impl StorageEngine {
         self.last_entry_index
     }
 
+    /// Pre-reserves capacity for pending tokens and write buffers to guarantee steady-state zero allocation.
+    pub fn reserve_pending_capacity(&mut self, additional_tokens: usize, additional_bytes: usize) {
+        self.pending_tokens.reserve(additional_tokens);
+        self.pending_write_buffer.reserve(additional_bytes);
+    }
+
     /// Returns the fatal storage error if one occurred.
     #[must_use]
     pub fn fatal_error(&self) -> Option<&StorageError> {
@@ -322,13 +328,7 @@ impl StorageEngine {
         // Check if entries fit in active segment; if not, rotate
         let mut needed_bytes = 0usize;
         for entry in entries {
-            let frame = WalRecordFrame::from_entry(
-                entry,
-                self.last_record_crc,
-                self.active_segment_id,
-                self.segment_write_offset + needed_bytes as u64,
-            );
-            needed_bytes += frame.frame_size(sector_size);
+            needed_bytes += WalRecordFrame::compute_frame_size(entry.payload.len(), sector_size);
         }
 
         if self.segment_write_offset + (needed_bytes as u64) > self.config.segment_capacity_bytes {

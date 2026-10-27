@@ -2,7 +2,8 @@
 #![allow(
     clippy::disallowed_methods,
     clippy::disallowed_types,
-    clippy::cast_precision_loss
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation
 )]
 
 //! Deterministic simulation seed farm for ANVIL consensus testing.
@@ -98,6 +99,15 @@ pub fn run_farm_seed(seed: u64) {
         if tick == 12 && cluster_size > 3 {
             let isolated = node_ids[cluster_size - 1];
             cluster.isolate_node(isolated);
+        }
+
+        // Inject node crash and storage recovery at tick 15
+        if tick == 15 {
+            let victim = node_ids[(seed as usize) % cluster_size];
+            if Some(victim) != cluster.leader() {
+                cluster.crash_node(victim);
+                let _ = cluster.restart_node(victim);
+            }
         }
 
         // Heal network at tick 20

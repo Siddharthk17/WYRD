@@ -5,6 +5,26 @@ All notable changes to ANVIL will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.7.1.9]
+
+### Added
+- Storage fault model specification in `docs/storage-fault-model.md` and [ADR 0011](docs/adr/0011-storage-fault-model.md) defining crash semantics, sector torn writes, bit rot, latent sector errors, and cluster survivability rules.
+- On-disk binary format specifications in `docs/formats/` for sector-aligned WAL segments (`docs/formats/wal-segment.md`), 2-slot alternating hard state (`docs/formats/hard-state.md`), and snapshot files (`docs/formats/snapshot.md`) under [ADR 0012](docs/adr/0012-on-disk-storage-formats.md).
+- Binary codecs in `anvil-storage` with zero-copy decoding, chained CRC32C, zero-padding verification, and CRC validation covering file offsets and segment IDs.
+- Pure sans-IO storage engine (`StorageEngine`) in `anvil-storage` under [ADR 0013](docs/adr/0013-sans-io-storage-engine.md) featuring natural batching group commit, segment preallocation and rotation, completion token feedback to Raft persistence contracts, and fail-fast fsync policy.
+- Crash recovery scanner with 4-way classification (`Clean`, `TornTail`, `MidLogCorruption`, and atomic alternating `HardState`).
+- Simulated storage device (`SimDevice`) in `anvil-sim` with volatile page cache, torn write injection, bit rot, read/write bit flips, latent sector errors, directory sync checks, and cluster-wide `StorageFaultAtlas`.
+- Dedicated I/O thread real disk device (`FsDevice`) in `anvil-device-fs` over `std::fs` and `rustix` (`fdatasync`, `fallocate`) with `#![forbid(unsafe_code)]`.
+- Differential test harness in `anvil-device-fs` asserting byte-for-byte identical on-disk states between `FsDevice` and `SimDevice`.
+- Storage integration in `SimCluster` nodes with crash and restart transitions, and online invariants: `VoteNeverForgotten`, `CommittedNeverLostAcrossCrashes`, and `RecoveredLogMissingAcknowledgedEntry`.
+- 4 cargo-fuzz targets (`fuzz_wal_header`, `fuzz_wal_frame`, `fuzz_hard_state`, `fuzz_snapshot`) and checked-in binary seed corpora in `fuzz/corpus/`.
+- Property-based tests verifying arbitrary byte crash safety and persistent cluster consensus invariants.
+- Counting allocator tests in `anvil-storage` verifying zero heap allocations in steady state for append buffering, empty appends, and `EngineOutput::clear`.
+- Storage and disk benchmarks in `anvil-bench` measuring raw `fdatasync`, sequential sync-write ceiling, WAL append throughput at batch sizes 1, 16, and 256, and $> 2$ GB/s recovery scanning.
+- Performance budgets and allocation invariants recorded in `docs/perf/BUDGETS.md`.
+- Full 100,000-seed clean simulator farm evaluation with network faults and node crash recovery.
+- Week 3 milestone progress report in `docs/progress/week3.md`.
+
 ## [2.5.0.8]
 
 ### Added

@@ -18,26 +18,32 @@ Measurements were captured using `cargo xtask bench` in release mode (`--release
 
 ---
 
-## Performance Budgets (Week 1 & 2 Baseline)
+## Performance Budgets (Week 1, 2 & 3 Baseline)
 
 | Component / Hot Path | Metric | Charter Floor | Measured Value | Budget (80% Baseline) | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Event Queue** (`BinaryHeapEventQueue`) | Push-Pop Pairs / sec | $\ge 10.00\text{ M}$ | **14.62 M ops/sec** | **11.70 M ops/sec** | **PASSED** (+46.2% over floor) |
-| **Random Stream** (`DetRng`) | Raw `u64` draws / sec | $\ge 100.00\text{ M}$ | **447.82 M u64/sec** | **358.25 M u64/sec** | **PASSED** (+347.8% over floor) |
-| **Binary Codec** (`Entry::decode_from_bytes`) | 1 KiB Entry Decodes / sec | N/A | **4.05 M entries/sec** | **3.24 M entries/sec** | **PASSED** (4.15 GB/s bandwidth) |
+| **Event Queue** (`BinaryHeapEventQueue`) | Push-Pop Pairs / sec | $\ge 10.00\text{ M}$ | **21.37 M ops/sec** | **17.10 M ops/sec** | **PASSED** (+113.7% over floor) |
+| **Random Stream** (`DetRng`) | Raw `u64` draws / sec | $\ge 100.00\text{ M}$ | **467.37 M u64/sec** | **373.89 M u64/sec** | **PASSED** (+367.4% over floor) |
+| **Binary Codec** (`Entry::decode_from_bytes`) | 1 KiB Entry Decodes / sec | N/A | **4.93 M entries/sec** | **3.94 M entries/sec** | **PASSED** (5.05 GB/s bandwidth) |
 | **Binary Codec** (`Entry::decode_from_bytes`) | Steady-State Heap Allocations | **0** | **0 bytes / 0 allocs** | **0 allocs** | **PASSED** (verified by `CountingAlloc`) |
-| **Simulation Kernel** (`SimKernel::run`) | Simulated Events / sec (1 core) | N/A | **11,185,179 events/sec**| **8,948,143 events/sec**| **PASSED** (11.2 M events/sec) |
-| **Raft Replication** (Leader + 2 Followers) | Entries Replicated / sec (1 core) | $\ge 50,000\text{ /sec}$ | **1,067,141 entries/sec** | **853,713 entries/sec** | **PASSED** (21.3x over floor) |
+| **Simulation Kernel** (`SimKernel::run`) | Simulated Events / sec (1 core) | N/A | **11,378,904 events/sec**| **9,103,123 events/sec**| **PASSED** (11.4 M events/sec) |
+| **Raft Replication** (Leader + 2 Followers) | Entries Replicated / sec (1 core) | $\ge 50,000\text{ /sec}$ | **1,148,992 entries/sec** | **919,194 entries/sec** | **PASSED** (23.0x over floor) |
 | **Raft Core Follower Tick** | Steady-State Heap Allocations | **0** | **0 bytes / 0 allocs** | **0 allocs** | **PASSED** (verified by `CountingAlloc`) |
 | **Raft Core Leader Heartbeat** | Steady-State Heap Allocations | **0** | **0 bytes / 0 allocs** | **0 allocs** | **PASSED** (verified by `CountingAlloc`) |
 | **Raft Replication Amortized** | Allocations per Entry | $\le 1.0$ | **1.001 allocs/entry** | $\le 1.05\text{ allocs}$ | **PASSED** (transient persist op) |
-| **WAL Recovery Scan** (`StorageEngine::scan_recovery`) | Scanned Byte Bandwidth (1 core) | $\ge 1.00\text{ GB/s}$ | **2.13 GB/s** | **1.70 GB/s** | **PASSED** (+113% over floor) |
+| **WAL Recovery Scan** (`StorageEngine::scan_recovery`) | Scanned Byte Bandwidth (1 core) | $\ge 1.00\text{ GB/s}$ | **2.29 GB/s** | **1.83 GB/s** | **PASSED** (+129% over floor) |
+| **Raw fdatasync Rate** (`rustix::fs::fdatasync`) | Sync Operations / sec (NVMe) | $\ge 1,000\text{ /sec}$ | **314,747.7 syncs/sec** | **251,798.2 syncs/sec** | **PASSED** (NVMe cached flush) |
+| **Sequential Sync-Write Ceiling** (4 KiB + sync) | IOPS / Bandwidth | $\ge 500\text{ IOPS}$ | **3,078.7 IOPS (12.61 MB/s)** | **2,463.0 IOPS** | **PASSED** (reference fio ceiling) |
+| **WAL Append (Batch = 1)** (`StorageEngine + FsDevice`)| Entries / sec (NVMe) | $\ge 80\%\text{ ceiling}$ | **3,038.5 entries/sec (98.7%)**| **2,430.8 entries/sec** | **PASSED** (98.7% of sync ceiling) |
+| **WAL Append (Batch = 16)** (`StorageEngine + FsDevice`)| Entries / sec (NVMe) | $\ge 2,000\text{ /sec}$ | **29,237.1 entries/sec (29.94 MB/s)**| **23,389.6 entries/sec**| **PASSED** (9.5x above ceiling) |
+| **WAL Append (Batch = 256)** (`StorageEngine + FsDevice`)| Entries / sec (NVMe) | $\ge 10,000\text{ /sec}$| **153,129.0 entries/sec (156.80 MB/s)**| **122,503.2 entries/sec**| **PASSED** (49.7x above ceiling) |
+| **WAL Buffering (Sync In-Flight)** | Steady-State Heap Allocations | **0** | **0 bytes / 0 allocs** | **0 allocs** | **PASSED** (verified by `CountingAlloc`) |
 
 ---
 
 ## Allocation Invariants
 
-Hot path zero-allocation invariants are continuously checked by `crates/anvil-types/tests/allocation_test.rs` and `crates/anvil-raft/tests/allocation_test.rs` under `CountingAlloc` (ADR 0008):
+Hot path zero-allocation invariants are continuously checked by `crates/anvil-types/tests/allocation_test.rs`, `crates/anvil-raft/tests/allocation_test.rs`, and `crates/anvil-storage/tests/allocation_test.rs` under `CountingAlloc` (ADR 0008):
 
 1. **`Entry::decode_from_bytes`**:
    - Decoding a 1 KiB entry from a shared `bytes::Bytes` slice performs zero heap allocations.
@@ -52,6 +58,12 @@ Hot path zero-allocation invariants are continuously checked by `crates/anvil-ty
    - Broadcasting periodic heartbeat messages to peers in steady state performs zero heap allocations with reused `Output`.
 6. **Raft Entry Replication**:
    - Replicating entries incurs amortized $\le 1$ heap allocation per entry (specifically the single transient container in `PersistOp::AppendEntries` submitted across the sans-IO boundary to storage, while payload slices, logs, and progress trackers are zero-copy).
+7. **Storage Engine Append Buffering**:
+   - Buffering entries into `pending_write_buffer` and `pending_tokens` while a WAL sync is in flight performs zero heap allocations in steady state.
+8. **Storage Engine Empty Append**:
+   - Calling `AppendEntries` with zero entries performs zero heap allocations.
+9. **`EngineOutput::clear`**:
+   - Clearing `EngineOutput` between steps reuses device op buffers and persisted token vectors with zero heap allocations.
 
 ---
 
