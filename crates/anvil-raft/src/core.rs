@@ -1129,12 +1129,22 @@ impl RaftCore {
     }
 
     fn transition_to_follower(&mut self, term: Term, output: &mut Output) {
+        let term_changed = term != self.term;
         self.transition_role(Role::Follower, output);
         self.term = term;
         self.voted_for = None;
         self.lead_transferee = None;
         self.pre_votes_granted.clear();
         self.votes_granted.clear();
+
+        if term_changed {
+            let token = self.next_token();
+            output.persist_ops.push(PersistOp::HardState {
+                term: self.term,
+                vote: self.voted_for,
+                token,
+            });
+        }
     }
 
     fn is_log_up_to_date(&self, candidate_index: LogIndex, candidate_term: Term) -> bool {

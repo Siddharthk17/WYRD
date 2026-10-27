@@ -88,10 +88,13 @@ pub struct StorageEngine {
     last_entry_term: Term,
     last_record_crc: u32,
 
-    // Natural batching group commit state
-    sync_in_flight: bool,
-    in_flight_sync_op_id: Option<u64>,
-    in_flight_tokens: Vec<u64>,
+    // Natural batching group commit state (WAL)
+    wal_sync_in_flight: bool,
+    in_flight_wal_sync_op_id: Option<u64>,
+    in_flight_wal_tokens: Vec<u64>,
+
+    // In-flight hard state sync operations (op_id, token)
+    hard_state_sync_tokens: Vec<(u64, u64)>,
 
     // Pending coalesced batch (while sync is in flight)
     pending_tokens: Vec<u64>,
@@ -138,9 +141,10 @@ impl StorageEngine {
             last_entry_index: recovered.log.last_index,
             last_entry_term: recovered.log.last_term,
             last_record_crc,
-            sync_in_flight: false,
-            in_flight_sync_op_id: None,
-            in_flight_tokens: Vec::with_capacity(64),
+            wal_sync_in_flight: false,
+            in_flight_wal_sync_op_id: None,
+            in_flight_wal_tokens: Vec::with_capacity(64),
+            hard_state_sync_tokens: Vec::with_capacity(4),
             pending_tokens: Vec::with_capacity(64),
             pending_write_buffer: Vec::with_capacity(64 * 1024),
             pending_write_start_offset: segment_write_offset,
@@ -173,9 +177,10 @@ impl StorageEngine {
             last_entry_index: LogIndex::from_raw(0),
             last_entry_term: Term::from_raw(0),
             last_record_crc: dummy_header.header_crc,
-            sync_in_flight: false,
-            in_flight_sync_op_id: None,
-            in_flight_tokens: Vec::with_capacity(64),
+            wal_sync_in_flight: false,
+            in_flight_wal_sync_op_id: None,
+            in_flight_wal_tokens: Vec::with_capacity(64),
+            hard_state_sync_tokens: Vec::with_capacity(4),
             pending_tokens: Vec::with_capacity(64),
             pending_write_buffer: Vec::with_capacity(64 * 1024),
             pending_write_start_offset: sector_size.as_u64(),
@@ -283,18 +288,12 @@ impl StorageEngine {
 
         self.active_hard_state_slot = target_slot;
 
-        if self.sync_in_flight {
-            self.pending_tokens.push(token);
-        } else {
-            let sync_op_id = self.next_op_id();
-            output.device_ops.push(DeviceOp::Fdatasync {
-                op_id: sync_op_id,
-                file_id: FileId::HARD_STATE,
-            });
-            self.sync_in_flight = true;
-            self.in_flight_sync_op_id = Some(sync_op_id);
-            self.in_flight_tokens.push(token);
-        }
+        let sync_op_id = self.next_op_id();
+        output.device_ops.push(DeviceOp::Fdatasync {
+            op_id: sync_op_id,
+            file_id: FileId::HARD_STATE,
+        });
+        self.hard_state_sync_tokens.push((sync_op_id, token));
     }
 
     fn handle_append_entries(
@@ -310,7 +309,7 @@ impl StorageEngine {
         );
 
         if entries.is_empty() {
-            if self.sync_in_flight {
+            if self.wal_sync_in_flight {
                 self.pending_tokens.push(token);
             } else {
                 output.persisted_tokens.push(token);
@@ -359,7 +358,7 @@ impl StorageEngine {
         self.pending_tokens.push(token);
 
         // Natural batching: if no sync is in flight, flush immediately
-        if !self.sync_in_flight {
+        if !self.wal_sync_in_flight {
             self.flush_pending_batch(output);
         }
     }
@@ -457,9 +456,9 @@ impl StorageEngine {
             file_id: self.active_segment_file_id,
         });
 
-        self.sync_in_flight = true;
-        self.in_flight_sync_op_id = Some(sync_op_id);
-        self.in_flight_tokens.append(&mut self.pending_tokens);
+        self.wal_sync_in_flight = true;
+        self.in_flight_wal_sync_op_id = Some(sync_op_id);
+        self.in_flight_wal_tokens.append(&mut self.pending_tokens);
     }
 
     fn handle_completion(&mut self, completion: &DeviceCompletion, output: &mut EngineOutput) {
@@ -469,11 +468,24 @@ impl StorageEngine {
             "FATAL: storage sync operation failed under ADR 0013 (no retry)"
         );
 
-        if Some(completion.op_id) == self.in_flight_sync_op_id {
-            // Fdatasync completed successfully: release all in-flight tokens in submission order
-            output.persisted_tokens.append(&mut self.in_flight_tokens);
-            self.sync_in_flight = false;
-            self.in_flight_sync_op_id = None;
+        // 1. Check if completion is for a HardState sync
+        if let Some(pos) = self
+            .hard_state_sync_tokens
+            .iter()
+            .position(|&(op, _)| op == completion.op_id)
+        {
+            let (_, token) = self.hard_state_sync_tokens.remove(pos);
+            output.persisted_tokens.push(token);
+            return;
+        }
+
+        // 2. Check if completion is for active WAL fdatasync
+        if Some(completion.op_id) == self.in_flight_wal_sync_op_id {
+            output
+                .persisted_tokens
+                .append(&mut self.in_flight_wal_tokens);
+            self.wal_sync_in_flight = false;
+            self.in_flight_wal_sync_op_id = None;
 
             // Coalesced natural batching: flush any writes that queued while sync was in flight
             if !self.pending_write_buffer.is_empty() || !self.pending_tokens.is_empty() {

@@ -7,10 +7,11 @@
 )]
 
 use anvil_storage::{
-    HardStateRecoveryOutcome, HardStateSlot, SectorSize, WalRecordFrame, WalScanResult,
-    WalSegmentHeader, decode_wal_frame, recover_hard_state,
+    HardStateRecoveryOutcome, HardStateSlot, SectorSize, SnapshotChunk, SnapshotFooter,
+    SnapshotHeader, WalRecordFrame, WalScanResult, WalSegmentHeader, decode_wal_frame,
+    recover_hard_state,
 };
-use anvil_types::{Entry, EntryKind, LogIndex, NodeId, Term};
+use anvil_types::{ClusterId, Entry, EntryKind, GroupId, LogIndex, NodeId, Term};
 use bytes::Bytes;
 use proptest::prelude::*;
 
@@ -109,6 +110,11 @@ proptest! {
 
         // Hard state recover must never panic
         let _ = recover_hard_state(&bytes, sector_size);
+
+        // Snapshot decoders must never panic
+        let _ = SnapshotHeader::decode(&bytes);
+        let _ = SnapshotChunk::decode(&bytes, 0);
+        let _ = SnapshotFooter::decode(&bytes);
     }
 
     #[test]
@@ -153,5 +159,58 @@ proptest! {
             }
             other @ HardStateRecoveryOutcome::OneSlotCorrupted { .. } => panic!("expected BothValid outcome, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn prop_snapshot_roundtrip(
+        last_index in 1u64..1_000_000,
+        last_term in 1u64..100_000,
+        cluster_id in 1u64..100,
+        group_id in 1u64..100,
+        chunk_idx in 0u32..100,
+        payload in prop::collection::vec(any::<u8>(), 0..2048),
+        total_len in 128u64..10_000_000,
+        digest_bytes in prop::collection::vec(any::<u8>(), 32..=32),
+        is_4096 in any::<bool>(),
+    ) {
+        let sector_size = if is_4096 {
+            SectorSize::Sector4096
+        } else {
+            SectorSize::Sector512
+        };
+
+        // 1. Snapshot Header roundtrip
+        let header = SnapshotHeader::new(
+            sector_size,
+            LogIndex::from_raw(last_index),
+            Term::from_raw(last_term),
+            ClusterId::from_raw(cluster_id),
+            GroupId::from_raw(group_id),
+            1,
+        );
+        let mut hdr_buf = [0u8; 64];
+        header.encode(&mut hdr_buf).unwrap();
+        let decoded_hdr = SnapshotHeader::decode(&hdr_buf).unwrap();
+        prop_assert_eq!(header, decoded_hdr);
+
+        // 2. Snapshot Chunk roundtrip
+        let chunk = SnapshotChunk {
+            chunk_index: chunk_idx,
+            payload: Bytes::copy_from_slice(&payload),
+        };
+        let mut chunk_buf = Vec::new();
+        chunk.encode(&mut chunk_buf);
+        let (decoded_chunk, consumed) = SnapshotChunk::decode(&chunk_buf, chunk_idx).unwrap();
+        prop_assert_eq!(chunk, decoded_chunk);
+        prop_assert_eq!(chunk_buf.len(), consumed);
+
+        // 3. Snapshot Footer roundtrip
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(&digest_bytes);
+        let footer = SnapshotFooter::new(total_len, digest);
+        let mut footer_buf = [0u8; 64];
+        footer.encode(&mut footer_buf).unwrap();
+        let decoded_footer = SnapshotFooter::decode(&footer_buf).unwrap();
+        prop_assert_eq!(footer, decoded_footer);
     }
 }

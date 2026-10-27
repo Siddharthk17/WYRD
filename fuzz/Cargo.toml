@@ -6,13 +6,13 @@ edition = "2024"
 
 [workspace]
 
-
 [package.metadata]
 cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
 anvil-types = { path = "../crates/anvil-types" }
+anvil-storage = { path = "../crates/anvil-storage" }
 bytes = "1.12"
 
 [[bin]]
@@ -30,5 +30,29 @@ doc = false
 [[bin]]
 name = "fuzz_entry"
 path = "fuzz_targets/fuzz_entry.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_wal_header"
+path = "fuzz_targets/fuzz_wal_header.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_wal_frame"
+path = "fuzz_targets/fuzz_wal_frame.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_hard_state"
+path = "fuzz_targets/fuzz_hard_state.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_snapshot"
+path = "fuzz_targets/fuzz_snapshot.rs"
 test = false
 doc = false

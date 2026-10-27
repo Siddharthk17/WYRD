@@ -269,3 +269,109 @@ fn test_snapshot_header_chunk_and_footer() {
     let recomputed_digest = blake3::hash(&file_data[..file_data.len() - 64]);
     assert_eq!(*recomputed_digest.as_bytes(), decoded_footer.blake3_digest);
 }
+
+#[test]
+fn test_fuzz_corpora_generation() {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let corpus_dir = workspace_root.join("fuzz").join("corpus");
+
+    // 1. Wal Header
+    let wal_hdr_dir = corpus_dir.join("fuzz_wal_header");
+    let _ = std::fs::create_dir_all(&wal_hdr_dir);
+    let hdr512 = WalSegmentHeader::new(
+        SectorSize::Sector512,
+        1,
+        LogIndex::from_raw(1),
+        Term::from_raw(0),
+    );
+    let mut buf512 = vec![0u8; 512];
+    hdr512.encode(&mut buf512).unwrap();
+    let _ = std::fs::write(wal_hdr_dir.join("seed_512"), buf512);
+
+    let hdr4096 = WalSegmentHeader::new(
+        SectorSize::Sector4096,
+        2,
+        LogIndex::from_raw(100),
+        Term::from_raw(3),
+    );
+    let mut buf4096 = vec![0u8; 4096];
+    hdr4096.encode(&mut buf4096).unwrap();
+    let _ = std::fs::write(wal_hdr_dir.join("seed_4096"), buf4096);
+
+    // 2. Wal Frame
+    let wal_frame_dir = corpus_dir.join("fuzz_wal_frame");
+    let _ = std::fs::create_dir_all(&wal_frame_dir);
+    let entry_normal = Entry {
+        index: LogIndex::from_raw(1),
+        term: Term::from_raw(1),
+        kind: EntryKind::Normal,
+        payload: Bytes::from_static(b"hello anvil consensus"),
+    };
+    let frame_normal = WalRecordFrame::from_entry(&entry_normal, 0, 1, 512);
+    let mut enc_normal = Vec::new();
+    frame_normal.encode_frame(SectorSize::Sector512, &mut enc_normal);
+    let _ = std::fs::write(wal_frame_dir.join("seed_normal"), enc_normal);
+
+    let entry_noop = Entry {
+        index: LogIndex::from_raw(2),
+        term: Term::from_raw(1),
+        kind: EntryKind::NoOp,
+        payload: Bytes::new(),
+    };
+    let frame_noop = WalRecordFrame::from_entry(
+        &entry_noop,
+        frame_normal.crc32c,
+        1,
+        512 + frame_normal.frame_size(SectorSize::Sector512) as u64,
+    );
+    let mut enc_noop = Vec::new();
+    frame_noop.encode_frame(SectorSize::Sector512, &mut enc_noop);
+    let _ = std::fs::write(wal_frame_dir.join("seed_noop"), enc_noop);
+
+    // 3. Hard State
+    let hs_dir = corpus_dir.join("fuzz_hard_state");
+    let _ = std::fs::create_dir_all(&hs_dir);
+    let slot0 = HardStateSlot::new(0, 1, Term::from_raw(2), Some(NodeId::new(1).unwrap()));
+    let slot1 = HardStateSlot::new(1, 2, Term::from_raw(2), Some(NodeId::new(1).unwrap()));
+    let mut hs_buf = vec![0u8; 1024];
+    slot0
+        .encode(SectorSize::Sector512, &mut hs_buf[..512])
+        .unwrap();
+    slot1
+        .encode(SectorSize::Sector512, &mut hs_buf[512..])
+        .unwrap();
+    let _ = std::fs::write(hs_dir.join("seed_both_slots"), &hs_buf);
+    let _ = std::fs::write(hs_dir.join("seed_slot0"), &hs_buf[..512]);
+
+    // 4. Snapshot
+    let snp_dir = corpus_dir.join("fuzz_snapshot");
+    let _ = std::fs::create_dir_all(&snp_dir);
+    let snp_hdr = SnapshotHeader::new(
+        SectorSize::Sector512,
+        LogIndex::from_raw(500),
+        Term::from_raw(5),
+        ClusterId::from_raw(1),
+        GroupId::from_raw(1),
+        1,
+    );
+    let mut snp_hdr_buf = [0u8; 64];
+    snp_hdr.encode(&mut snp_hdr_buf).unwrap();
+    let _ = std::fs::write(snp_dir.join("seed_header"), snp_hdr_buf);
+
+    let chunk = SnapshotChunk {
+        chunk_index: 0,
+        payload: Bytes::from_static(b"k1:v1,k2:v2,snapshot_data"),
+    };
+    let mut chunk_buf = Vec::new();
+    chunk.encode(&mut chunk_buf);
+    let _ = std::fs::write(snp_dir.join("seed_chunk"), chunk_buf);
+
+    let footer = SnapshotFooter::new(1024, [0xAA; 32]);
+    let mut footer_buf = [0u8; 64];
+    footer.encode(&mut footer_buf).unwrap();
+    let _ = std::fs::write(snp_dir.join("seed_footer"), footer_buf);
+}

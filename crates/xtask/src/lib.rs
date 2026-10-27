@@ -4,4 +4,5 @@
 
 pub mod ci;
 pub mod determinism;
+pub mod fuzz;
 pub mod tlc;

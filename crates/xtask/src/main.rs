@@ -125,10 +125,13 @@ fn main() -> ExitCode {
                 _ => ExitCode::FAILURE,
             }
         }
-        Commands::Fuzz { .. } => {
-            eprintln!("ERROR: `xtask fuzz` is not yet wired. Failing loudly per charter Rule 5.");
-            ExitCode::FAILURE
-        }
+        Commands::Fuzz { duration_secs } => match xtask::fuzz::run_fuzz(duration_secs) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("Fuzz gate error: {err}");
+                ExitCode::FAILURE
+            }
+        },
         Commands::Docs => {
             eprintln!("ERROR: `xtask docs` is not yet wired. Failing loudly per charter Rule 5.");
             ExitCode::FAILURE
