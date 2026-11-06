@@ -37,6 +37,7 @@ Thumbs.db
 .serena/
 .agents/
 .gemini/
+.opencode/
 
 # Local tools & jars
 tools/*.jar
