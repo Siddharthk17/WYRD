@@ -93,6 +93,7 @@ pub struct SimKernel {
     watchdog: Watchdog,
     tracer: TraceRecorder,
     rng: DetRng,
+    scratch: Vec<(SimTime, u64, u64)>,
 }
 
 impl SimKernel {
@@ -108,6 +109,7 @@ impl SimKernel {
             watchdog: Watchdog::default(),
             tracer: TraceRecorder::new(),
             rng: DetRng::new(seed, "kernel"),
+            scratch: Vec::new(),
         }
     }
 
@@ -138,17 +140,17 @@ impl SimKernel {
     }
 
     /// Returns an immutable reference to an actor downcasted to concrete type `T`.
-    pub fn actor<T: 'static>(&self, id: u64) -> Option<&T> {
+    pub fn actor<T: 'static>(&self, actor_id: u64) -> Option<&T> {
         self.actors
-            .get(&id)
-            .and_then(|a| a.as_any().downcast_ref::<T>())
+            .get(&actor_id)
+            .and_then(|listed| listed.as_any().downcast_ref::<T>())
     }
 
     /// Returns a mutable reference to an actor downcasted to concrete type `T`.
-    pub fn actor_mut<T: 'static>(&mut self, id: u64) -> Option<&mut T> {
+    pub fn actor_mut<T: 'static>(&mut self, actor_id: u64) -> Option<&mut T> {
         self.actors
-            .get_mut(&id)
-            .and_then(|a| a.as_any_mut().downcast_mut::<T>())
+            .get_mut(&actor_id)
+            .and_then(|listed| listed.as_any_mut().downcast_mut::<T>())
     }
 
     /// Schedules an event in the simulation event queue.
@@ -181,6 +183,26 @@ impl SimKernel {
         &self.tracer
     }
 
+    /// Delivers one event payload to its actor, collecting outbound events into `out`.
+    fn dispatch_to_actor(
+        &mut self,
+        actor_id: u64,
+        payload: u64,
+        out: &mut Vec<(SimTime, u64, u64)>,
+    ) -> Result<(), SimError> {
+        let now = self.now;
+        let Some(actor) = self.actors.get_mut(&actor_id) else {
+            return Err(SimError::UnknownActor(actor_id));
+        };
+        let mut progress_made = false;
+        let mut ctx = ActorContext::new(now, out, &mut progress_made);
+        actor.on_event(&mut ctx, payload);
+        if progress_made {
+            self.watchdog.record_progress();
+        }
+        Ok(())
+    }
+
     /// Steps the simulation by exactly one event.
     pub fn step(&mut self) -> Result<Option<ScheduledEvent>, SimError> {
         if let Some(max_time) = self.max_virtual_time
@@ -210,7 +232,6 @@ impl SimKernel {
         self.events_processed = self.events_processed.saturating_add(1);
         self.watchdog.on_event()?;
 
-        // Record trace event
         let mut trace_payload = [0u8; 14];
         trace_payload[0..8].copy_from_slice(&event.payload.to_le_bytes());
         self.tracer.record(TraceEvent {
@@ -220,23 +241,13 @@ impl SimKernel {
             payload: trace_payload,
         });
 
-        // Dispatch to actor
-        let mut out_events = Vec::new();
-        let mut progress_made = false;
-        if let Some(actor) = self.actors.get_mut(&event.actor_id) {
-            let mut ctx = ActorContext::new(self.now, &mut out_events, &mut progress_made);
-            actor.on_event(&mut ctx, event.payload);
-        } else {
-            return Err(SimError::UnknownActor(event.actor_id));
-        }
-
-        if progress_made {
-            self.watchdog.record_progress();
-        }
-
-        for (target_time, target_actor, payload) in out_events {
+        let mut out_events = std::mem::take(&mut self.scratch);
+        let dispatch = self.dispatch_to_actor(event.actor_id, event.payload, &mut out_events);
+        for (target_time, target_actor, payload) in out_events.drain(..) {
             self.schedule(target_time, target_actor, payload);
         }
+        self.scratch = out_events;
+        dispatch?;
 
         Ok(Some(event))
     }

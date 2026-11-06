@@ -152,9 +152,7 @@ fn walk_rs_files(dir: &Path) -> Result<Vec<std::path::PathBuf>, String> {
 /// Executes all CI quality gates sequentially.
 pub fn run_ci() -> Result<(), String> {
     let workspace_root = find_workspace_root();
-    println!("===========================================================");
-    println!("               ANVIL Continuous Integration (CI)          ");
-    println!("===========================================================");
+    println!("ANVIL Continuous Integration (CI)");
 
     // 1. Format check
     let mut fmt_cmd = Command::new("cargo");
@@ -234,21 +232,19 @@ pub fn run_ci() -> Result<(), String> {
     println!("\n>>> Running Gate: Simulator Smoke Farm (2,000 seeds)...");
     let start_farm = Instant::now();
     let num_cpus = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
-    let farm_result = anvil_sim::run_seed_farm(2000, num_cpus);
-    if !farm_result.is_clean() {
+    let farm = anvil_sim::run_seed_farm(2000, num_cpus);
+    if !farm.is_clean() {
         return Err(format!(
             "Simulator smoke farm failed! Failed seed: {:?}, passed: {}/{}",
-            farm_result.failed_seed, farm_result.passed_seeds, farm_result.total_seeds
+            farm.failed_seed, farm.passed_seeds, farm.total_seeds
         ));
     }
     println!(
         ">>> [PASS] Simulator Smoke Farm (2000 seeds in {:.2?}, {:.0} seeds/sec)",
         start_farm.elapsed(),
-        farm_result.seeds_per_second()
+        farm.seeds_per_second()
     );
 
-    println!("\n===========================================================");
-    println!("              ALL CI QUALITY GATES PASSED!                ");
-    println!("===========================================================");
+    println!("ALL CI QUALITY GATES PASSED!");
     Ok(())
 }

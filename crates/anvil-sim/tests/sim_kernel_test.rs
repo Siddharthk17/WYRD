@@ -51,13 +51,11 @@ fn test_det_rng_stream_derivation_isolation() {
 fn test_det_rng_samplers() {
     let mut rng = DetRng::new(42, "test");
 
-    // Unbiased range
     for _ in 0..10_000 {
-        let v = rng.gen_range(10..20);
-        assert!((10..20).contains(&v));
+        let sampled = rng.gen_range(10..20);
+        assert!((10..20).contains(&sampled));
     }
 
-    // Bernoulli
     assert!(rng.bernoulli(10, 10));
     assert!(!rng.bernoulli(0, 10));
 
@@ -68,16 +66,14 @@ fn test_det_rng_samplers() {
     sorted.sort_unstable();
     assert_eq!(sorted, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 
-    // Bimodal
     for _ in 0..100 {
-        let v = rng.bimodal(100, 10, 10_000, 50, 500_000);
-        assert!(v > 0);
+        let sampled = rng.bimodal(100, 10, 10_000, 50, 500_000);
+        assert!(sampled > 0);
     }
 
-    // Exponential
     for _ in 0..100 {
-        let v = rng.exponential(1_000);
-        assert!(v < 100_000); // reasonable bound for mean 1,000
+        let sampled = rng.exponential(1_000);
+        assert!(sampled < 100_000);
     }
 }
 

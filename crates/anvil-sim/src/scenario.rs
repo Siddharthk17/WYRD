@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 //! Standard simulation scenarios for determinism gates, seed farms, and regression tests.
 
 use crate::kernel::{Actor, ActorContext, SimKernel};
@@ -287,17 +285,18 @@ pub fn run_scenario_with_hashmap(
     kernel.register_actor(3, Box::new(node3));
     kernel.register_actor(100, Box::new(client));
 
-    // Schedule events in HashMap iteration order (non-deterministic across processes)
+    // Schedule events in HashMap iteration order (nondeterministic across processes
+    // by construction: this fixture exists to prove the gate detects entropy leaks).
     let mut offset_nanos = 1_000_000;
-    for &k in non_det_map.keys() {
+    for &key in non_det_map.keys() {
         let perturb_msg = ProtocolMsg {
             kind: MSG_CLIENT_PROPOSE,
             sender: 100,
             id_or_idx: 0,
             value: 1,
         };
-        // Schedule slight jitter to cause event reordering based on map order
-        offset_nanos += (k % 5) * 100;
+        // Slight jitter spreads the batch so iteration order changes the event order.
+        offset_nanos += (key % 5) * 100;
         kernel.schedule(SimTime::from_nanos(offset_nanos), 1, perturb_msg.pack());
     }
 

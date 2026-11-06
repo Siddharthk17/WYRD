@@ -6,24 +6,24 @@
 
 #[test]
 fn test_determinism_gate_golden_seeds() {
-    let result = xtask::determinism::run_determinism_gate(false, false);
+    let gate = xtask::determinism::run_determinism_gate(false, false);
     assert!(
-        result.is_ok(),
+        gate.is_ok(),
         "Determinism gate should pass on golden seeds: {:?}",
-        result.err()
+        gate.err()
     );
 }
 
 #[test]
 fn test_negative_test_hashmap_fixture_fails_gate() {
-    let result = xtask::determinism::run_determinism_gate(true, false);
+    let gate = xtask::determinism::run_determinism_gate(true, false);
     assert!(
-        result.is_err(),
+        gate.is_err(),
         "Determinism gate MUST fail when HashMap fixture is used"
     );
-    let err = result.unwrap_err();
+    let gate_err = gate.unwrap_err();
     assert!(
-        err.contains("Divergence detected in negative test fixture"),
-        "Unexpected error: {err}"
+        gate_err.contains("Divergence detected in negative test fixture"),
+        "Unexpected error: {gate_err}"
     );
 }

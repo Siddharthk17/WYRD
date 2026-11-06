@@ -604,9 +604,7 @@ fn measure_wal_append_throughput(batch_size: usize) -> (f64, f64, usize) {
 fn main() {
     let cli = Cli::parse();
 
-    println!("===========================================================");
-    println!("             ANVIL Performance Benchmark Suite            ");
-    println!("===========================================================");
+    println!("ANVIL Performance Benchmark Suite");
 
     println!("Benchmarking Event Queue (Binary Min-Heap)...");
     let (queue_m_ops, queue_samples) = measure_event_queue();
@@ -657,9 +655,7 @@ fn main() {
         "  -> {wal_b256_eps:.1} entries/sec ({wal_b256_mb_sec:.2} MB/s, {total_b256} entries)"
     );
 
-    println!("\n===========================================================");
-    println!("                     Summary vs Budgets                    ");
-    println!("===========================================================");
+    println!("\nSummary vs Budgets");
     println!("| Metric                          | Measured   | Charter Floor | Budget (80%) |");
     println!("| :---                            | :---       | :---          | :---         |");
     println!(
@@ -706,7 +702,6 @@ fn main() {
         "| WAL Append Batch=256 (entries/s)| {wal_b256_eps:>8.1}   | >= 10,000 /s  | {budget_b256:>10.1}   |",
         budget_b256 = wal_b256_eps * 0.8
     );
-    println!("===========================================================");
 
     if cli.verify_budgets {
         let mut passed = true;

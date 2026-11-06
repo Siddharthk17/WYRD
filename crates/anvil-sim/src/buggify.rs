@@ -62,7 +62,8 @@ impl BuggifyRegistry {
             return false;
         }
 
-        // Fast deterministic pseudo-random draw using SplitMix64 round
+        // Registry draws use their own SplitMix64 finalizer so bookkeeping here
+        // never perturbs the DetRng streams driving the simulation itself.
         self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.state;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -96,7 +97,6 @@ impl Default for BuggifyRegistry {
 static GLOBAL_BUGGIFY: Mutex<BuggifyRegistry> = Mutex::new(BuggifyRegistry::new());
 
 /// Evaluates a buggify point against the global registry.
-#[allow(clippy::unwrap_used)]
 pub fn record_and_evaluate(name: &str, file: &str, line: u32, probability_ppm: u32) -> bool {
     let mut reg = GLOBAL_BUGGIFY
         .lock()
@@ -105,7 +105,6 @@ pub fn record_and_evaluate(name: &str, file: &str, line: u32, probability_ppm: u
 }
 
 /// Lists all buggify points recorded so far.
-#[allow(clippy::unwrap_used)]
 pub fn list_registered_points() -> Vec<BuggifyPoint> {
     let reg = GLOBAL_BUGGIFY
         .lock()
@@ -114,7 +113,6 @@ pub fn list_registered_points() -> Vec<BuggifyPoint> {
 }
 
 /// Configures whether buggify points fire.
-#[allow(clippy::unwrap_used)]
 pub fn set_buggify_enabled(enabled: bool) {
     let mut reg = GLOBAL_BUGGIFY
         .lock()
@@ -123,7 +121,6 @@ pub fn set_buggify_enabled(enabled: bool) {
 }
 
 /// Sets the master seed for buggify pseudo-random evaluation.
-#[allow(clippy::unwrap_used)]
 pub fn set_buggify_seed(seed: u64) {
     let mut reg = GLOBAL_BUGGIFY
         .lock()
@@ -132,7 +129,6 @@ pub fn set_buggify_seed(seed: u64) {
 }
 
 /// Resets the global buggify registry.
-#[allow(clippy::unwrap_used)]
 pub fn reset_buggify_registry() {
     let mut reg = GLOBAL_BUGGIFY
         .lock()

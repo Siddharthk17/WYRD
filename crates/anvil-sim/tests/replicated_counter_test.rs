@@ -25,10 +25,6 @@ use anvil_sim::watchdog::{Watchdog, WatchdogError};
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 
-// ---------------------------------------------------------------------------
-// Toy Replicated-Counter Protocol Model
-// ---------------------------------------------------------------------------
-
 const MSG_CLIENT_PROPOSE: u8 = 1;
 const MSG_REPLICATE: u8 = 2;
 const MSG_REPLICATE_ACK: u8 = 3;
@@ -121,7 +117,6 @@ impl Actor for NodeActor {
                 self_acks.insert(self.id);
                 self.acks.insert(idx, self_acks);
 
-                // Broadcast Replicate to peers
                 for &peer in &self.peers {
                     let delay_nanos = self.rng.gen_range(5_000_000..15_000_000);
                     let replicate_msg = ProtocolMsg {
@@ -142,11 +137,9 @@ impl Actor for NodeActor {
                     return;
                 }
 
-                // Check buggify fault injection
                 if self.enable_buggify_drop
                     && anvil_sim::buggify!("counter_drop_replicate", 250_000)
                 {
-                    // Simulated message drop
                     return;
                 }
 
@@ -171,7 +164,6 @@ impl Actor for NodeActor {
                 let acks = self.acks.entry(idx).or_default();
                 acks.insert(msg.sender);
 
-                // Majority of 3 nodes is 2
                 if acks.len() >= 2 && idx > self.commit_index {
                     self.commit_index = idx;
                     if let Some(val) = self.proposal_values.get(&idx) {
@@ -179,7 +171,6 @@ impl Actor for NodeActor {
                     }
                     ctx.record_progress();
 
-                    // Commit to peers
                     for &peer in &self.peers {
                         let delay = self.rng.gen_range(2_000_000..5_000_000);
                         let commit_msg = ProtocolMsg {
@@ -306,7 +297,6 @@ fn build_replicated_counter_sim(seed: u64, proposals: u32, enable_buggify: bool)
     kernel.register_actor(3, Box::new(node3));
     kernel.register_actor(100, Box::new(client));
 
-    // Seed first client proposal at T = 1 ms
     let first_req = ProtocolMsg {
         kind: MSG_CLIENT_PROPOSE,
         sender: 100,
@@ -317,10 +307,6 @@ fn build_replicated_counter_sim(seed: u64, proposals: u32, enable_buggify: bool)
 
     kernel
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_replicated_counter_determinism_across_runs() {
@@ -336,7 +322,6 @@ fn test_replicated_counter_determinism_across_runs() {
     let mut kernel3 = build_replicated_counter_sim(MASTER_SEED, NUM_PROPOSALS, false);
     let report3 = kernel3.run().expect("run 3 should succeed");
 
-    // All metrics and hashes must match byte-for-byte
     assert_eq!(report1.final_time, report2.final_time);
     assert_eq!(report2.final_time, report3.final_time);
     assert_eq!(report1.events_processed, report2.events_processed);
@@ -344,7 +329,6 @@ fn test_replicated_counter_determinism_across_runs() {
     assert_eq!(report1.trace_hash, report2.trace_hash);
     assert_eq!(report2.trace_hash, report3.trace_hash);
 
-    // Final state of nodes must match exactly
     let client1 = kernel1.actor::<ClientActor>(100).expect("client 1");
     let client2 = kernel2.actor::<ClientActor>(100).expect("client 2");
     let client3 = kernel3.actor::<ClientActor>(100).expect("client 3");
@@ -355,7 +339,6 @@ fn test_replicated_counter_determinism_across_runs() {
     assert_eq!(client2.final_counter, NUM_PROPOSALS);
     assert_eq!(client3.final_counter, NUM_PROPOSALS);
 
-    // Different seed must produce a distinct trace hash
     let mut kernel_diff = build_replicated_counter_sim(MASTER_SEED + 1, NUM_PROPOSALS, false);
     let report_diff = kernel_diff.run().expect("diff run should succeed");
     assert_ne!(
@@ -366,7 +349,6 @@ fn test_replicated_counter_determinism_across_runs() {
 
 #[test]
 fn test_replicated_counter_tie_ordering() {
-    // Test that events with identical timestamps are popped in strictly monotonic sequence order
     struct CollectorActor {
         order: Vec<u64>,
     }
@@ -420,11 +402,11 @@ fn test_replicated_counter_time_never_goes_backward() {
     let mut kernel = build_replicated_counter_sim(777, 30, false);
     kernel.run().expect("run should complete cleanly");
 
-    for id in [1, 2, 3] {
-        let node = kernel.actor::<NodeActor>(id).expect("node");
+    for node_id in [1, 2, 3] {
+        let node = kernel.actor::<NodeActor>(node_id).expect("node");
         assert!(
             !node.time_travel_detected,
-            "node {id} detected backward time movement"
+            "node {node_id} detected backward time movement"
         );
     }
     let client = kernel.actor::<ClientActor>(100).expect("client");
@@ -433,7 +415,6 @@ fn test_replicated_counter_time_never_goes_backward() {
         "client detected backward time movement"
     );
 
-    // Negative verification: if an event is processed with a past timestamp, kernel rejects it loudly
     let mut regressed_kernel = SimKernel::new(123);
     struct Dummy;
     impl Actor for Dummy {
@@ -446,13 +427,11 @@ fn test_replicated_counter_time_never_goes_backward() {
         }
     }
     regressed_kernel.register_actor(1, Box::new(Dummy));
-    // Advance kernel time to 100ns
     regressed_kernel.schedule(SimTime::from_nanos(100), 1, 0);
     let _ = regressed_kernel.step().expect("step 1");
     assert_eq!(regressed_kernel.now(), SimTime::from_nanos(100));
 
-    // Force an event at 50ns (in the past relative to current now)
-    // Note: EventQueue itself does not prevent inserting past events, but kernel.step() checks time monotonicity
+    // The queue accepts past events; the kernel rejects them at step time.
     regressed_kernel.schedule(SimTime::from_nanos(50), 1, 0);
     let err = regressed_kernel.step().unwrap_err();
     match err {
@@ -470,7 +449,6 @@ fn test_replicated_counter_buggify_points_fire() {
     set_buggify_enabled(true);
     set_buggify_seed(4242);
 
-    // Run simulation with buggify enabled
     let mut kernel = build_replicated_counter_sim(4242, 25, true);
     let _ = kernel.run();
 
@@ -491,7 +469,6 @@ fn test_replicated_counter_buggify_points_fire() {
         "counter_drop_replicate must fire at least once"
     );
 
-    // Disable buggify and verify activations freeze
     set_buggify_enabled(false);
     let mut hits = 0;
     for _ in 0..50 {
@@ -516,7 +493,6 @@ fn test_watchdog_trips_on_deliberately_stuck_protocol_stagnation() {
             } else {
                 MSG_STUCK_PING as u64
             };
-            // Never call ctx.record_progress()!
             ctx.schedule(ctx.now().saturating_add_nanos(1_000), self.peer, next_kind);
         }
 
@@ -552,15 +528,12 @@ fn test_watchdog_trips_on_deliberately_stuck_protocol_stagnation() {
 
 #[test]
 fn test_watchdog_trips_on_early_queue_depletion() {
-    // Queue empties at T = 10ms, but watchdog expects simulation to run for at least 100ms
     let mut kernel =
         SimKernel::new(666).with_watchdog(Watchdog::new(Some(SimTime::from_millis(100)), 10_000));
 
     struct TerminatingActor;
     impl Actor for TerminatingActor {
-        fn on_event(&mut self, _ctx: &mut ActorContext<'_>, _payload: u64) {
-            // Empties queue immediately
-        }
+        fn on_event(&mut self, _ctx: &mut ActorContext<'_>, _payload: u64) {}
 
         fn as_any(&self) -> &dyn Any {
             self

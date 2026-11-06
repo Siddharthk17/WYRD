@@ -9,22 +9,22 @@ use proptest::prelude::*;
 
 proptest! {
     #[test]
-    fn prop_varint_u64_roundtrip(val in any::<u64>()) {
+    fn prop_varint_u64_roundtrip(value in any::<u64>()) {
         let mut buf = Vec::new();
-        encode_varint_u64(val, &mut buf);
+        encode_varint_u64(value, &mut buf);
         let mut cursor = &buf[..];
         let decoded = decode_varint_u64(&mut cursor).expect("varint must decode successfully");
-        prop_assert_eq!(decoded, val);
+        prop_assert_eq!(decoded, value);
         prop_assert!(cursor.is_empty());
     }
 
     #[test]
-    fn prop_varint_i64_roundtrip(val in any::<i64>()) {
+    fn prop_varint_i64_roundtrip(value in any::<i64>()) {
         let mut buf = Vec::new();
-        encode_varint_i64(val, &mut buf);
+        encode_varint_i64(value, &mut buf);
         let mut cursor = &buf[..];
         let decoded = decode_varint_i64(&mut cursor).expect("zigzag varint must decode");
-        prop_assert_eq!(decoded, val);
+        prop_assert_eq!(decoded, value);
         prop_assert!(cursor.is_empty());
     }
 

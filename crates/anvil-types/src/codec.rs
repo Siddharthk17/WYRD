@@ -253,16 +253,12 @@ impl Frame {
     }
 }
 
-// ---------------------------------------------------------------------------
-// LEB128 Varint Encoders and Decoders
-// ---------------------------------------------------------------------------
-
-/// Encodes an unsigned 64-bit integer into an LEB128 varint sequence.
-pub fn encode_varint_u64(mut val: u64, buf: &mut Vec<u8>) {
+/// Encodes an unsigned 64-bit integer as LEB128, least-significant group first.
+pub fn encode_varint_u64(mut value: u64, buf: &mut Vec<u8>) {
     loop {
-        let byte = (val & 0x7F) as u8;
-        val >>= 7;
-        if val == 0 {
+        let byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value == 0 {
             buf.push(byte);
             break;
         }
@@ -270,7 +266,7 @@ pub fn encode_varint_u64(mut val: u64, buf: &mut Vec<u8>) {
     }
 }
 
-/// Decodes an unsigned 64-bit integer from an LEB128 varint sequence, advancing the slice.
+/// Decodes an unsigned 64-bit integer from LEB128, advancing the slice past it.
 pub fn decode_varint_u64(buf: &mut &[u8]) -> Result<u64, CodecError> {
     let mut result: u64 = 0;
     let mut shift = 0;
@@ -281,15 +277,15 @@ pub fn decode_varint_u64(buf: &mut &[u8]) -> Result<u64, CodecError> {
         *buf = &buf[1..];
         bytes_read += 1;
 
-        let val = u64::from(byte & 0x7F);
-        if shift == 63 && val > 1 {
+        let group = u64::from(byte & 0x7F);
+        if shift == 63 && group > 1 {
             return Err(CodecError::VarintOverflow);
         }
         if shift > 63 {
             return Err(CodecError::VarintOverflow);
         }
 
-        result |= val << shift;
+        result |= group << shift;
         shift += 7;
 
         if (byte & 0x80) == 0 {
@@ -306,35 +302,31 @@ pub fn decode_varint_u64(buf: &mut &[u8]) -> Result<u64, CodecError> {
     })
 }
 
-/// Helper that decodes a `u64` varint from a slice without modifying it, returning the value and consumed bytes.
+/// Decodes a `u64` varint from the head of a slice, returning the value and bytes consumed.
 pub fn decode_varint_u64_slice(slice: &[u8]) -> Result<(u64, usize), CodecError> {
     let mut cursor = slice;
-    let val = decode_varint_u64(&mut cursor)?;
+    let value = decode_varint_u64(&mut cursor)?;
     let consumed = slice.len() - cursor.len();
-    Ok((val, consumed))
+    Ok((value, consumed))
 }
 
-/// Encodes a signed 64-bit integer using Zigzag LEB128 encoding.
+/// Encodes a signed 64-bit integer with `ZigZag` mapping so small negatives stay short.
 #[allow(clippy::cast_sign_loss)]
-pub fn encode_varint_i64(val: i64, buf: &mut Vec<u8>) {
-    let zigzag = ((val << 1) ^ (val >> 63)) as u64;
+pub fn encode_varint_i64(value: i64, buf: &mut Vec<u8>) {
+    let zigzag = ((value << 1) ^ (value >> 63)) as u64;
     encode_varint_u64(zigzag, buf);
 }
 
-/// Decodes a signed 64-bit integer using Zigzag LEB128 encoding.
+/// Decodes a ZigZag-mapped signed 64-bit integer, advancing the slice past it.
 #[allow(clippy::cast_possible_wrap)]
 pub fn decode_varint_i64(buf: &mut &[u8]) -> Result<i64, CodecError> {
-    let u = decode_varint_u64(buf)?;
-    let val = ((u >> 1) as i64) ^ -((u & 1) as i64);
-    Ok(val)
+    let raw = decode_varint_u64(buf)?;
+    let value = ((raw >> 1) as i64) ^ -((raw & 1) as i64);
+    Ok(value)
 }
 
-// ---------------------------------------------------------------------------
-// Little-Endian Fixed-Width Codecs
-// ---------------------------------------------------------------------------
-
-pub fn encode_u16_le(val: u16, buf: &mut Vec<u8>) {
-    buf.extend_from_slice(&val.to_le_bytes());
+pub fn encode_u16_le(value: u16, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&value.to_le_bytes());
 }
 
 pub fn decode_u16_le(buf: &mut &[u8]) -> Result<u16, CodecError> {
@@ -344,13 +336,13 @@ pub fn decode_u16_le(buf: &mut &[u8]) -> Result<u16, CodecError> {
             available: buf.len(),
         });
     }
-    let val = u16::from_le_bytes([buf[0], buf[1]]);
+    let value = u16::from_le_bytes([buf[0], buf[1]]);
     *buf = &buf[2..];
-    Ok(val)
+    Ok(value)
 }
 
-pub fn encode_u32_le(val: u32, buf: &mut Vec<u8>) {
-    buf.extend_from_slice(&val.to_le_bytes());
+pub fn encode_u32_le(value: u32, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&value.to_le_bytes());
 }
 
 pub fn decode_u32_le(buf: &mut &[u8]) -> Result<u32, CodecError> {
@@ -360,13 +352,13 @@ pub fn decode_u32_le(buf: &mut &[u8]) -> Result<u32, CodecError> {
             available: buf.len(),
         });
     }
-    let val = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let value = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
     *buf = &buf[4..];
-    Ok(val)
+    Ok(value)
 }
 
-pub fn encode_u64_le(val: u64, buf: &mut Vec<u8>) {
-    buf.extend_from_slice(&val.to_le_bytes());
+pub fn encode_u64_le(value: u64, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&value.to_le_bytes());
 }
 
 pub fn decode_u64_le(buf: &mut &[u8]) -> Result<u64, CodecError> {
@@ -376,33 +368,24 @@ pub fn decode_u64_le(buf: &mut &[u8]) -> Result<u64, CodecError> {
             available: buf.len(),
         });
     }
-    let val = u64::from_le_bytes([
+    let value = u64::from_le_bytes([
         buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
     ]);
     *buf = &buf[8..];
-    Ok(val)
+    Ok(value)
 }
-
-// ---------------------------------------------------------------------------
-// Entry Encoding and Zero-Copy Decoding
-// ---------------------------------------------------------------------------
 
 impl Entry {
     /// Encodes an entry into a framed wire buffer.
     pub fn encode(&self, buf: &mut Vec<u8>) {
-        let mut body_prefix = Vec::with_capacity(32);
-        encode_varint_u64(self.index.as_u64(), &mut body_prefix);
-        encode_varint_u64(self.term.as_u64(), &mut body_prefix);
-        body_prefix.push(self.kind.as_u8());
+        let mut body = Vec::with_capacity(32 + self.payload.len());
+        encode_varint_u64(self.index.as_u64(), &mut body);
+        encode_varint_u64(self.term.as_u64(), &mut body);
+        body.push(self.kind.as_u8());
+        body.extend_from_slice(&self.payload);
 
-        let total_payload_len = body_prefix.len() + self.payload.len();
-        assert!(total_payload_len <= MAX_FRAME_PAYLOAD_LEN as usize);
-
-        let mut payload = Vec::with_capacity(total_payload_len);
-        payload.extend_from_slice(&body_prefix);
-        payload.extend_from_slice(&self.payload);
-
-        Frame::encode(FrameType::Entry, &payload, buf);
+        assert!(body.len() <= MAX_FRAME_PAYLOAD_LEN as usize);
+        Frame::encode(FrameType::Entry, &body, buf);
     }
 
     /// Decodes an entry zero-copy from a `Bytes` buffer.
@@ -469,18 +452,14 @@ impl Entry {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Newtypes Binary Encoding
-// ---------------------------------------------------------------------------
-
 impl NodeId {
     pub fn encode(self, buf: &mut Vec<u8>) {
         encode_varint_u64(self.get(), buf);
     }
 
     pub fn decode(buf: &mut &[u8]) -> Result<Self, CodecError> {
-        let val = decode_varint_u64(buf)?;
-        Self::new(val).ok_or(CodecError::ZeroNodeId)
+        let raw = decode_varint_u64(buf)?;
+        Self::new(raw).ok_or(CodecError::ZeroNodeId)
     }
 }
 
@@ -490,8 +469,8 @@ impl Term {
     }
 
     pub fn decode(buf: &mut &[u8]) -> Result<Self, CodecError> {
-        let val = decode_varint_u64(buf)?;
-        Ok(Self::from_raw(val))
+        let raw = decode_varint_u64(buf)?;
+        Ok(Self::from_raw(raw))
     }
 }
 
@@ -501,8 +480,8 @@ impl LogIndex {
     }
 
     pub fn decode(buf: &mut &[u8]) -> Result<Self, CodecError> {
-        let val = decode_varint_u64(buf)?;
-        Ok(Self::from_raw(val))
+        let raw = decode_varint_u64(buf)?;
+        Ok(Self::from_raw(raw))
     }
 }
 
@@ -512,8 +491,8 @@ impl GroupId {
     }
 
     pub fn decode(buf: &mut &[u8]) -> Result<Self, CodecError> {
-        let val = decode_varint_u64(buf)?;
-        Ok(Self::from_raw(val))
+        let raw = decode_varint_u64(buf)?;
+        Ok(Self::from_raw(raw))
     }
 }
 
@@ -523,8 +502,8 @@ impl ClusterId {
     }
 
     pub fn decode(buf: &mut &[u8]) -> Result<Self, CodecError> {
-        let val = decode_varint_u64(buf)?;
-        Ok(Self::from_raw(val))
+        let raw = decode_varint_u64(buf)?;
+        Ok(Self::from_raw(raw))
     }
 }
 
@@ -534,8 +513,8 @@ impl SessionId {
     }
 
     pub fn decode(buf: &mut &[u8]) -> Result<Self, CodecError> {
-        let val = decode_varint_u64(buf)?;
-        Ok(Self::from_raw(val))
+        let raw = decode_varint_u64(buf)?;
+        Ok(Self::from_raw(raw))
     }
 }
 
@@ -545,7 +524,7 @@ impl SeqNo {
     }
 
     pub fn decode(buf: &mut &[u8]) -> Result<Self, CodecError> {
-        let val = decode_varint_u64(buf)?;
-        Ok(Self::from_raw(val))
+        let raw = decode_varint_u64(buf)?;
+        Ok(Self::from_raw(raw))
     }
 }

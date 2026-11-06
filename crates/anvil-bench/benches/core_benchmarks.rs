@@ -27,12 +27,12 @@ fn bench_event_queue(c: &mut Criterion) {
         let mut queue = BinaryHeapEventQueue::new();
         b.iter(|| {
             for i in 0..BATCH_SIZE {
-                let t = SimTime::from_nanos((i * 37) % 50_000);
-                queue.push(t, 1, i);
+                let at = SimTime::from_nanos((i * 37) % 50_000);
+                queue.push(at, 1, i);
             }
             for _ in 0..BATCH_SIZE {
-                let ev = queue.pop();
-                black_box(ev);
+                let popped = queue.pop();
+                black_box(popped);
             }
         });
     });

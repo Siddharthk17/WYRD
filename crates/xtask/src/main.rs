@@ -87,20 +87,20 @@ fn main() -> ExitCode {
             }
         },
         Commands::Farm { seeds } => {
-            println!("=== ANVIL Simulator Seed Farm ===");
+            println!("ANVIL Simulator Seed Farm");
             let threads =
                 std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
             println!("Evaluating {seeds} seeds across {threads} parallel worker threads...");
-            let res = anvil_sim::run_seed_farm(seeds, threads);
+            let farm = anvil_sim::run_seed_farm(seeds, threads);
             println!(
                 "Farm Result: {}/{} passed in {:.2?} ({:.1} seeds/sec)",
-                res.passed_seeds,
-                res.total_seeds,
-                res.duration,
-                res.seeds_per_second()
+                farm.passed_seeds,
+                farm.total_seeds,
+                farm.duration,
+                farm.seeds_per_second()
             );
-            if let Some(f_seed) = res.failed_seed {
-                eprintln!("FARM FAILURE: Seed {f_seed} produced an invariant violation!");
+            if let Some(failed_seed) = farm.failed_seed {
+                eprintln!("FARM FAILURE: Seed {failed_seed} produced an invariant violation!");
                 ExitCode::FAILURE
             } else {
                 println!(
@@ -121,7 +121,7 @@ fn main() -> ExitCode {
                 ])
                 .status();
             match status {
-                Ok(s) if s.success() => ExitCode::SUCCESS,
+                Ok(finished) if finished.success() => ExitCode::SUCCESS,
                 _ => ExitCode::FAILURE,
             }
         }

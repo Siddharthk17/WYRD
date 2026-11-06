@@ -22,8 +22,8 @@ impl NodeId {
     }
 
     /// Creates a new `NodeId` from a known `NonZeroU64`.
-    pub const fn from_nonzero(val: NonZeroU64) -> Self {
-        Self(val)
+    pub const fn from_nonzero(nonzero: NonZeroU64) -> Self {
+        Self(nonzero)
     }
 
     /// Returns the underlying raw integer.

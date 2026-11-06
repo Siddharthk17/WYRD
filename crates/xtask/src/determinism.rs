@@ -158,12 +158,12 @@ fn run_in_child_process(
 
 /// Executes worker child process mode for a single seed and outputs the BLAKE3 trace digest.
 pub fn run_worker(seed: u64, negative_test: bool) {
-    let result = if negative_test {
+    let outcome = if negative_test {
         anvil_sim::run_scenario_with_hashmap(seed)
     } else {
         anvil_sim::run_golden_scenario(seed)
     };
-    match result {
+    match outcome {
         Ok((_, hash)) => println!("{}", hash.to_hex()),
         Err(err) => {
             eprintln!("Scenario failed for seed {seed}: {err}");
@@ -196,29 +196,26 @@ fn verify_single_seed(
     expected_hash: &str,
     negative_test: bool,
 ) -> Result<String, String> {
-    // Run 1 in-process
-    let res1 = if negative_test {
+    let first_run = if negative_test {
         anvil_sim::run_scenario_with_hashmap(seed)
     } else {
         anvil_sim::run_golden_scenario(seed)
     };
-    let (_, hash1) = res1.map_err(|e| format!("In-process run 1 failed: {e}"))?;
+    let (_, hash1) = first_run.map_err(|e| format!("In-process run 1 failed: {e}"))?;
     let h1_str = hash1.to_hex().to_string();
 
-    // Run 2 in-process
-    let res2 = if negative_test {
+    let second_run = if negative_test {
         anvil_sim::run_scenario_with_hashmap(seed)
     } else {
         anvil_sim::run_golden_scenario(seed)
     };
-    let (_, hash2) = res2.map_err(|e| format!("In-process run 2 failed: {e}"))?;
+    let (_, hash2) = second_run.map_err(|e| format!("In-process run 2 failed: {e}"))?;
     let h2_str = hash2.to_hex().to_string();
 
     if h1_str != h2_str {
         return Err(format!("In-process run 1 ({h1_str}) != run 2 ({h2_str})"));
     }
 
-    // Run 3 in fresh child process with ASLR and modified env
     let h3_str = run_in_child_process(workspace_root, seed, negative_test)?;
     if h1_str != h3_str {
         return Err(format!(
@@ -245,7 +242,7 @@ pub fn run_determinism_gate(negative_test: bool, update_golden: bool) -> Result<
     }
 
     let golden_hashes = load_golden_hashes(&workspace_root)?;
-    println!("=== ANVIL Determinism Gate ===");
+    println!("ANVIL Determinism Gate");
     println!(
         "Evaluating {} golden seeds (negative_test={})...",
         golden_hashes.len(),
@@ -281,8 +278,8 @@ pub fn run_determinism_gate(negative_test: bool, update_golden: bool) -> Result<
 
     if !all_passed {
         eprintln!("\nDETERMINISM GATE FAILED! Divergences found:");
-        for div in &divergences {
-            eprintln!("  - {div}");
+        for divergence in &divergences {
+            eprintln!("  - {divergence}");
         }
         return Err(format!(
             "Determinism gate failed with {} divergence(s)",

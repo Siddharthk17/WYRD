@@ -20,9 +20,9 @@ fn test_generate_and_verify_seed_corpus() {
     fs::create_dir_all(&entry_dir).expect("create entry corpus dir");
 
     // Varint seeds
-    for (i, val) in [0u64, 1, 127, 128, 16384, u64::MAX].iter().enumerate() {
+    for (i, value) in [0u64, 1, 127, 128, 16384, u64::MAX].iter().enumerate() {
         let mut buf = Vec::new();
-        encode_varint_u64(*val, &mut buf);
+        encode_varint_u64(*value, &mut buf);
         fs::write(varint_dir.join(format!("seed_{i}")), &buf).expect("write varint seed");
     }
 

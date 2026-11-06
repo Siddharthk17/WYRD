@@ -69,8 +69,8 @@ impl HierarchicalTimingWheel {
         let shift = level * WHEEL_BITS;
         let slot = ((self.current_time.as_nanos() >> shift) & WHEEL_MASK) as usize;
         let events = std::mem::take(&mut self.levels[level][slot]);
-        for ev in events {
-            self.insert_event(ev);
+        for event in events {
+            self.insert_event(event);
         }
     }
 }
@@ -97,7 +97,6 @@ impl EventQueue for HierarchicalTimingWheel {
             return None;
         }
 
-        // Search for earliest event across current slot and levels
         loop {
             let slot0 = (self.current_time.as_nanos() & WHEEL_MASK) as usize;
             if !self.levels[0][slot0].is_empty() {
@@ -115,40 +114,40 @@ impl EventQueue for HierarchicalTimingWheel {
                 return Some(event);
             }
 
-            // Need to advance or cascade
-            // Check if all levels are empty except overflow
             let mut found_next_time = None;
 
             for level in &self.levels {
                 for slot in level {
-                    for ev in slot {
+                    for event in slot {
                         match found_next_time {
-                            None => found_next_time = Some(ev.time),
-                            Some(t) if ev.time < t => found_next_time = Some(ev.time),
+                            None => found_next_time = Some(event.time),
+                            Some(earliest) if event.time < earliest => {
+                                found_next_time = Some(event.time);
+                            }
                             _ => {}
                         }
                     }
                 }
             }
 
-            for ev in &self.overflow {
+            for event in &self.overflow {
                 match found_next_time {
-                    None => found_next_time = Some(ev.time),
-                    Some(t) if ev.time < t => found_next_time = Some(ev.time),
+                    None => found_next_time = Some(event.time),
+                    Some(earliest) if event.time < earliest => {
+                        found_next_time = Some(event.time);
+                    }
                     _ => {}
                 }
             }
 
             let next_time = found_next_time?;
             self.current_time = next_time;
-            // Cascade higher levels
-            for lvl in (1..NUM_LEVELS).rev() {
-                self.cascade_level(lvl);
+            for level in (1..NUM_LEVELS).rev() {
+                self.cascade_level(level);
             }
-            // Re-insert overflow items that now fit in wheels
             let overflow_items = std::mem::take(&mut self.overflow);
-            for ev in overflow_items {
-                self.insert_event(ev);
+            for event in overflow_items {
+                self.insert_event(event);
             }
         }
     }
@@ -161,19 +160,19 @@ impl EventQueue for HierarchicalTimingWheel {
         let mut best: Option<&ScheduledEvent> = None;
         for level in &self.levels {
             for slot in level {
-                for ev in slot {
+                for event in slot {
                     match best {
-                        None => best = Some(ev),
-                        Some(b) if ev < b => best = Some(ev),
+                        None => best = Some(event),
+                        Some(current) if event < current => best = Some(event),
                         _ => {}
                     }
                 }
             }
         }
-        for ev in &self.overflow {
+        for event in &self.overflow {
             match best {
-                None => best = Some(ev),
-                Some(b) if ev < b => best = Some(ev),
+                None => best = Some(event),
+                Some(current) if event < current => best = Some(event),
                 _ => {}
             }
         }

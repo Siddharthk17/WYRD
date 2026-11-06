@@ -77,12 +77,12 @@ fn test_varint_u64_edge_cases() {
         u64::from(u32::MAX),
         u64::MAX,
     ];
-    for val in cases {
+    for value in cases {
         let mut buf = Vec::new();
-        encode_varint_u64(val, &mut buf);
+        encode_varint_u64(value, &mut buf);
         let mut cursor = &buf[..];
         let decoded = decode_varint_u64(&mut cursor).expect("successful decode");
-        assert_eq!(decoded, val);
+        assert_eq!(decoded, value);
         assert_eq!(cursor, []);
     }
 }
@@ -109,12 +109,12 @@ fn test_varint_i64_zigzag() {
         i64::MIN,
         i64::MAX,
     ];
-    for val in cases {
+    for value in cases {
         let mut buf = Vec::new();
-        encode_varint_i64(val, &mut buf);
+        encode_varint_i64(value, &mut buf);
         let mut cursor = &buf[..];
         let decoded = decode_varint_i64(&mut cursor).expect("successful decode");
-        assert_eq!(decoded, val);
+        assert_eq!(decoded, value);
         assert_eq!(cursor, []);
     }
 }
