@@ -479,7 +479,6 @@ fn measure_wal_append_throughput(batch_size: usize) -> (f64, f64, usize) {
     let config = StorageConfig {
         sector_size,
         segment_capacity_bytes: 512 * 1024 * 1024,
-        max_batch_bytes: 4 * 1024 * 1024,
         sync_directories: true,
     };
 

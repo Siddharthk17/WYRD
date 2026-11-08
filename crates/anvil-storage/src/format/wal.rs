@@ -322,13 +322,6 @@ pub fn decode_wal_frame(
         return WalScanResult::Unallocated;
     }
 
-    if buf.len() < WAL_RECORD_HEADER_FIXED_LEN {
-        return WalScanResult::Corrupted(StorageError::BufferTooSmall {
-            required: WAL_RECORD_HEADER_FIXED_LEN,
-            provided: buf.len(),
-        });
-    }
-
     let raw_index = u64::from_le_bytes([
         buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
     ]);

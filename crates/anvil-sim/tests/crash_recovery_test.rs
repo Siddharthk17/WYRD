@@ -313,7 +313,6 @@ fn test_rolling_crashes_and_restarts_quorum_survivability() {
     let mut cluster = SimCluster::new(5, 6006);
     let leader_id = cluster.elect_leader(40);
 
-    // 1. Commit batch 1
     for i in 1..=5 {
         cluster.propose(leader_id, Bytes::from(format!("batch1-{i}")));
     }
@@ -321,7 +320,6 @@ fn test_rolling_crashes_and_restarts_quorum_survivability() {
     let commit1 = cluster.highest_commit_index();
     assert!(commit1 >= LogIndex::from_raw(5));
 
-    // 2. Crash 2 followers (minority of 5)
     let followers: Vec<NodeId> = cluster
         .nodes
         .keys()
@@ -334,7 +332,6 @@ fn test_rolling_crashes_and_restarts_quorum_survivability() {
     cluster.crash_node(crashed1);
     cluster.crash_node(crashed2);
 
-    // 3. Propose batch 2 with 3 live nodes
     for i in 6..=10 {
         cluster.propose(leader_id, Bytes::from(format!("batch2-{i}")));
     }
@@ -342,20 +339,16 @@ fn test_rolling_crashes_and_restarts_quorum_survivability() {
     let commit2 = cluster.highest_commit_index();
     assert!(commit2 >= LogIndex::from_raw(10));
 
-    // 4. Restart crashed1
     cluster.restart_node(crashed1).expect("restart crashed1");
 
-    // 5. Crash remaining 2 followers from initial live set
     let crashed3 = followers[2];
     cluster.crash_node(crashed3);
 
-    // 6. Cluster still has majority (leader, crashed1, followers[3])
     for i in 11..=15 {
         cluster.propose(leader_id, Bytes::from(format!("batch3-{i}")));
     }
     cluster.tick_n(30);
 
-    // 7. Restart all crashed nodes
     cluster.restart_node(crashed2).expect("restart crashed2");
     cluster.restart_node(crashed3).expect("restart crashed3");
 

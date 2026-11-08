@@ -179,8 +179,7 @@ proptest! {
             SectorSize::Sector512
         };
 
-        // 1. Snapshot Header roundtrip
-        let header = SnapshotHeader::new(
+            let header = SnapshotHeader::new(
             sector_size,
             LogIndex::from_raw(last_index),
             Term::from_raw(last_term),
@@ -193,8 +192,7 @@ proptest! {
         let decoded_hdr = SnapshotHeader::decode(&hdr_buf).unwrap();
         prop_assert_eq!(header, decoded_hdr);
 
-        // 2. Snapshot Chunk roundtrip
-        let chunk = SnapshotChunk {
+            let chunk = SnapshotChunk {
             chunk_index: chunk_idx,
             payload: Bytes::copy_from_slice(&payload),
         };
@@ -204,8 +202,7 @@ proptest! {
         prop_assert_eq!(chunk, decoded_chunk);
         prop_assert_eq!(chunk_buf.len(), consumed);
 
-        // 3. Snapshot Footer roundtrip
-        let mut digest = [0u8; 32];
+            let mut digest = [0u8; 32];
         digest.copy_from_slice(&digest_bytes);
         let footer = SnapshotFooter::new(total_len, digest);
         let mut footer_buf = [0u8; 64];

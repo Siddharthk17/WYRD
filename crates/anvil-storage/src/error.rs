@@ -2,6 +2,7 @@
 
 //! Error definitions for the ANVIL storage engine and on-disk codecs.
 
+use anvil_types::{NodeId, Term};
 use thiserror::Error;
 
 /// Storage and on-disk codec errors.
@@ -70,6 +71,14 @@ pub enum StorageError {
     #[error("both hard-state slots are corrupt; node cannot safely determine term or vote")]
     CorruptHardStateBothSlots,
 
+    /// Structural field validation failure (not a checksum issue): slot index
+    /// mismatch, invalid vote flag, zero node id with vote set, or out-of-order chunk.
+    #[error("invalid field: {context}")]
+    InvalidField {
+        /// Description of the field that failed validation.
+        context: &'static str,
+    },
+
     /// Unrecoverable fsync error.
     #[error("fsync failed: {reason}")]
     FsyncFailed {
@@ -91,6 +100,23 @@ pub enum StorageError {
     SegmentFull {
         /// Target segment ID.
         segment_id: u64,
+    },
+
+    /// Recovered hard state is older than acknowledged writes: the node forgot
+    /// an acknowledged term or vote (silent corruption of the latest slot) and
+    /// must be replaced under a new node id, never resumed.
+    #[error(
+        "stale hard state: recovered {recovered_term}/{recovered_vote:?}, acknowledged {acked_term}/{acked_vote:?}"
+    )]
+    StaleHardState {
+        /// Term found during recovery.
+        recovered_term: Term,
+        /// Vote found during recovery, if any.
+        recovered_vote: Option<NodeId>,
+        /// Highest acknowledged term.
+        acked_term: Term,
+        /// Acknowledged vote for that term, if any.
+        acked_vote: Option<NodeId>,
     },
 
     /// Abstract device I/O error.

@@ -48,8 +48,8 @@ impl SectorSize {
     }
 
     /// Parses a raw `u16` into a known `SectorSize`.
-    pub const fn from_u16(val: u16) -> Result<Self, StorageError> {
-        match val {
+    pub const fn from_u16(value: u16) -> Result<Self, StorageError> {
+        match value {
             512 => Ok(Self::Sector512),
             4096 => Ok(Self::Sector4096),
             other => Err(StorageError::UnsupportedSectorSize { found: other }),

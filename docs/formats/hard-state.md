@@ -46,7 +46,7 @@ Each slot has the following structure:
 | `magic` | `[u8; 8]` | 0 | ASCII `"ANVILHST"` (`0x41 0x4E 0x56 0x49 0x4C 0x48 0x53 0x54`) |
 | `version` | `u16` (LE) | 8 | Format version (`1`) |
 | `slot_index` | `u16` (LE) | 10 | `0` for Slot 0, `1` for Slot 1 |
-| `crc32c` | `u32` (LE) | 12 | CRC32C calculated over fields from offset 16 to end of slot |
+| `crc32c` | `u32` (LE) | 12 | CRC32C calculated over bytes `[16..41]` |
 | `sequence_no` | `u64` (LE) | 16 | Monotonically increasing sequence number |
 | `current_term` | `u64` (LE) | 24 | Raft consensus `Term` |
 | `voted_for` | `u64` (LE) | 32 | Raft `NodeId` voted for in `current_term` (0 if none) |
@@ -75,3 +75,11 @@ On startup:
    - **Slot 0 valid, Slot 1 corrupted**: Use Slot 0. The corrupt write in Slot 1 was a torn write or crash.
    - **Slot 1 valid, Slot 0 corrupted**: Use Slot 1.
    - **Both slots corrupted**: **Refuse to start.** The node must not attempt to guess its term or vote. A node that forgets its vote can vote twice in the same term, causing catastrophic split-brain. The operator must replace the node under a new node id.
+
+---
+
+## 6. Write Verification and Stale Recovery
+
+Every hard-state write is verified by reading the slot back after `fdatasync` and comparing term, vote and sequence number before the engine acknowledges the persistence token. A mismatch (silent corruption of the just-written slot, or a failed read) latches a fatal error and crashes the node instead of acknowledging durability it cannot prove.
+
+On recovery, if the valid slot holds a term or vote older than an acknowledged write, the node refuses to start under `StaleHardState` instead of resuming with forgotten state. The surviving slot is only trustworthy when nothing newer was ever acknowledged.

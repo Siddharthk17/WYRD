@@ -169,8 +169,7 @@ fn test_hard_state_alternating_slots_recovery() {
             .encode(sector_size, &mut file_buf[sector_len..])
             .unwrap();
 
-        // 1. Both valid: picks slot 1 (higher seq)
-        let outcome = recover_hard_state(&file_buf, sector_size).unwrap();
+            let outcome = recover_hard_state(&file_buf, sector_size).unwrap();
         assert_eq!(
             outcome,
             HardStateRecoveryOutcome::BothValid {
@@ -181,8 +180,7 @@ fn test_hard_state_alternating_slots_recovery() {
             }
         );
 
-        // 2. Slot 1 corrupted: recovers from slot 0
-        let mut corrupt_slot1 = file_buf.clone();
+            let mut corrupt_slot1 = file_buf.clone();
         corrupt_slot1[sector_len + 12] ^= 0xFF; // corrupt slot1 CRC
         let outcome1 = recover_hard_state(&corrupt_slot1, sector_size).unwrap();
         assert_eq!(
@@ -196,8 +194,7 @@ fn test_hard_state_alternating_slots_recovery() {
             }
         );
 
-        // 3. Slot 0 corrupted: recovers from slot 1
-        let mut corrupt_slot0 = file_buf.clone();
+            let mut corrupt_slot0 = file_buf.clone();
         corrupt_slot0[12] ^= 0xFF; // corrupt slot0 CRC
         let outcome0 = recover_hard_state(&corrupt_slot0, sector_size).unwrap();
         assert_eq!(
@@ -211,8 +208,7 @@ fn test_hard_state_alternating_slots_recovery() {
             }
         );
 
-        // 4. Both corrupted: refuses to start
-        let mut both_corrupt = file_buf.clone();
+            let mut both_corrupt = file_buf.clone();
         both_corrupt[12] ^= 0xFF;
         both_corrupt[sector_len + 12] ^= 0xFF;
         let err = recover_hard_state(&both_corrupt, sector_size).unwrap_err();
@@ -279,7 +275,6 @@ fn test_fuzz_corpora_generation() {
         .unwrap();
     let corpus_dir = workspace_root.join("fuzz").join("corpus");
 
-    // 1. Wal Header
     let wal_hdr_dir = corpus_dir.join("fuzz_wal_header");
     let _ = std::fs::create_dir_all(&wal_hdr_dir);
     let hdr512 = WalSegmentHeader::new(
@@ -302,7 +297,6 @@ fn test_fuzz_corpora_generation() {
     hdr4096.encode(&mut buf4096).unwrap();
     let _ = std::fs::write(wal_hdr_dir.join("seed_4096"), buf4096);
 
-    // 2. Wal Frame
     let wal_frame_dir = corpus_dir.join("fuzz_wal_frame");
     let _ = std::fs::create_dir_all(&wal_frame_dir);
     let entry_normal = Entry {
@@ -332,7 +326,6 @@ fn test_fuzz_corpora_generation() {
     frame_noop.encode_frame(SectorSize::Sector512, &mut enc_noop);
     let _ = std::fs::write(wal_frame_dir.join("seed_noop"), enc_noop);
 
-    // 3. Hard State
     let hs_dir = corpus_dir.join("fuzz_hard_state");
     let _ = std::fs::create_dir_all(&hs_dir);
     let slot0 = HardStateSlot::new(0, 1, Term::from_raw(2), Some(NodeId::new(1).unwrap()));
@@ -347,7 +340,6 @@ fn test_fuzz_corpora_generation() {
     let _ = std::fs::write(hs_dir.join("seed_both_slots"), &hs_buf);
     let _ = std::fs::write(hs_dir.join("seed_slot0"), &hs_buf[..512]);
 
-    // 4. Snapshot
     let snp_dir = corpus_dir.join("fuzz_snapshot");
     let _ = std::fs::create_dir_all(&snp_dir);
     let snp_hdr = SnapshotHeader::new(

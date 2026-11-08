@@ -84,9 +84,8 @@ pub fn run_tlc_check() -> Result<(), String> {
     println!("Running TLC model checking on ANVIL Raft formal specification...");
     let start = Instant::now();
 
-    // 1. Positive Verification
     println!("\n>>> 1. Verifying positive model (specs/anvil_raft.cfg)...");
-    let pos_output = Command::new("java")
+    let positive_output = Command::new("java")
         .args([
             "-XX:+UseParallelGC",
             "-cp",
@@ -104,22 +103,21 @@ pub fn run_tlc_check() -> Result<(), String> {
         .output()
         .map_err(|e| format!("Failed to execute TLC: {e}"))?;
 
-    let pos_stdout = String::from_utf8_lossy(&pos_output.stdout);
-    let pos_stderr = String::from_utf8_lossy(&pos_output.stderr);
+    let positive_stdout = String::from_utf8_lossy(&positive_output.stdout);
+    let positive_stderr = String::from_utf8_lossy(&positive_output.stderr);
 
-    if !pos_output.status.success()
-        || pos_stdout.contains("Error:")
-        || pos_stdout.contains("violated")
+    if !positive_output.status.success()
+        || positive_stdout.contains("Error:")
+        || positive_stdout.contains("violated")
     {
         return Err(format!(
-            "TLC positive verification FAILED!\nSTDOUT:\n{pos_stdout}\nSTDERR:\n{pos_stderr}"
+            "TLC positive verification FAILED!\nSTDOUT:\n{positive_stdout}\nSTDERR:\n{positive_stderr}"
         ));
     }
     println!(">>> [PASS] Positive verification: all invariants held, 0 errors.");
 
-    // 2. Negative Verification (Figure 8 Counterexample)
     println!("\n>>> 2. Verifying negative model counterexample (specs/anvil_raft_negative.cfg)...");
-    let neg_output = Command::new("java")
+    let negative_output = Command::new("java")
         .args([
             "-XX:+UseParallelGC",
             "-cp",
@@ -137,14 +135,13 @@ pub fn run_tlc_check() -> Result<(), String> {
         .output()
         .map_err(|e| format!("Failed to execute negative TLC: {e}"))?;
 
-    let neg_stdout = String::from_utf8_lossy(&neg_output.stdout);
+    let negative_stdout = String::from_utf8_lossy(&negative_output.stdout);
 
-    // Negative check MUST detect an invariant violation
     let violation_found =
-        neg_stdout.contains("Error: Invariant") || neg_stdout.contains("is violated");
+        negative_stdout.contains("Error: Invariant") || negative_stdout.contains("is violated");
     if !violation_found {
         return Err(format!(
-            "TLC negative verification failed: expected invariant violation (Figure 8), but TLC did not report an error.\nSTDOUT:\n{neg_stdout}"
+            "TLC negative verification failed: expected invariant violation (Figure 8), but TLC did not report an error.\nSTDOUT:\n{negative_stdout}"
         ));
     }
     println!(

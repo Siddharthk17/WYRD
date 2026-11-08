@@ -59,7 +59,7 @@ ANVIL explicitly defends against nine classes of storage faults:
 
 ### Fault 6: Latent Sector Errors (EIO on Read)
 - **Behavior**: Physical media sectors become unreadable (bad blocks), returning `EIO` or `EUNATCH` when accessed.
-- **Defense**: I/O errors encountered while reading log segments trigger recovery classification. If the unreadable region is at the log tail, it is handled as a torn tail. If located mid-log, the node transitions to `NeedsRepair` and pauses voting/leadership until repaired from peers.
+- **Defense**: Unreadable regions are handled according to what can be verified. If corruption or an unreadable tail follows a fully verified prefix, the tail is truncated and recovery continues. If corruption sits ahead of verifiable data (mid-log) or a segment header cannot be decoded while later segments exist, the node is sidelined for peer repair and never votes or leads. If recovery reads themselves fail (EIO on hard state or an unreadable segment with no way forward), the node stays down rather than fabricate state; an operator restarts it or replaces it under a new node id.
 
 ### Fault 7: Disk Exhaustion (ENOSPC)
 - **Behavior**: The storage volume runs out of free space during preallocation or append.
@@ -67,7 +67,7 @@ ANVIL explicitly defends against nine classes of storage faults:
 
 ### Fault 8: fsync Failure (Postgres "fsyncgate" Defense)
 - **Behavior**: An `fsync` call returns an error (`EIO`, `EROFS`). The Linux kernel may invalidate dirty page cache pages after an error, meaning a subsequent `fsync` retry could falsely report success while data was lost.
-- **Defense**: **ANVIL never retries a failed fsync.** Any `fsync` or `fdatasync` failure immediately panics/crashes the process. The node restarts and executes clean crash recovery from the surviving physical media.
+- **Defense**: **ANVIL never retries a failed fsync.** Any `fsync` or `fdatasync` failure latches a typed fatal error in the storage engine, which stops issuing new operations and crashes the node process without retrying. The node restarts and executes clean crash recovery from the surviving non-volatile state.
 
 ### Fault 9: Gray Failure (fsync Stalls)
 - **Behavior**: Storage stalls or cloud EBS volumes freeze, causing `fsync` operations to block for seconds or minutes.

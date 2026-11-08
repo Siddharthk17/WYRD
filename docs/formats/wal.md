@@ -65,7 +65,7 @@ Following the header sector, records are appended sequentially in sector-aligned
 | `index` | `u64` (LE) | 0 | Raft `LogIndex` of the entry |
 | `term` | `u64` (LE) | 8 | Raft `Term` of the entry |
 | `payload_len` | `u32` (LE) | 16 | Length of raw payload bytes $N$ |
-| `record_kind` | `u8` | 20 | Entry kind (`0 = Normal`, `1 = NoOp`, `2 = Configuration`) |
+| `record_kind` | `u8` | 20 | Entry kind (`0 = Normal`, `1 = NoOp`; any other value is rejected as corrupt) |
 | `crc32c` | `u32` (LE) | 21 | Chained CRC32C checksum (see below) |
 | `payload` | `[u8; N]` | 25 | Entry payload data |
 | `padding` | `[u8; P]` | 25+N | Zero padding such that total frame length is a multiple of `sector_size` |

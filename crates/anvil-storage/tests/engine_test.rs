@@ -21,7 +21,6 @@ fn test_engine_natural_batching_group_commit() {
     let mut engine = StorageEngine::new_empty(config);
     let mut output = EngineOutput::default();
 
-    // 1. Submit initial append (token 101)
     let entry1 = Entry {
         index: LogIndex::from_raw(1),
         term: Term::from_raw(1),
@@ -38,7 +37,6 @@ fn test_engine_natural_batching_group_commit() {
         &mut output,
     );
 
-    // Engine should emit a Write and an Fdatasync
     assert_eq!(output.device_ops.len(), 2);
     assert!(matches!(output.device_ops[0], DeviceOp::Write { .. }));
     let sync_op_id = match output.device_ops[1] {
@@ -48,7 +46,6 @@ fn test_engine_natural_batching_group_commit() {
     assert!(output.persisted_tokens.is_empty());
     output.clear();
 
-    // 2. While fdatasync is in flight, submit append 2 (token 102) and append 3 (token 103)
     let entry2 = Entry {
         index: LogIndex::from_raw(2),
         term: Term::from_raw(1),
@@ -70,7 +67,6 @@ fn test_engine_natural_batching_group_commit() {
         },
         &mut output,
     );
-    // Should NOT emit new sync because one is already in flight!
     assert!(output.device_ops.is_empty());
 
     engine.step(
@@ -83,7 +79,6 @@ fn test_engine_natural_batching_group_commit() {
     );
     assert!(output.device_ops.is_empty());
 
-    // 3. Complete the first fdatasync
     engine.step(
         EngineInput::Completion(DeviceCompletion {
             op_id: sync_op_id,
@@ -92,9 +87,7 @@ fn test_engine_natural_batching_group_commit() {
         &mut output,
     );
 
-    // Token 101 is released!
     assert_eq!(output.persisted_tokens, vec![101]);
-    // Coalesced natural batch: single Write for entries 2 & 3, followed by single Fdatasync!
     assert_eq!(output.device_ops.len(), 2);
     assert!(matches!(output.device_ops[0], DeviceOp::Write { .. }));
     let sync2_op_id = match output.device_ops[1] {
@@ -103,7 +96,6 @@ fn test_engine_natural_batching_group_commit() {
     };
     output.clear();
 
-    // 4. Complete the second fdatasync
     engine.step(
         EngineInput::Completion(DeviceCompletion {
             op_id: sync2_op_id,
@@ -112,19 +104,16 @@ fn test_engine_natural_batching_group_commit() {
         &mut output,
     );
 
-    // Tokens 102 and 103 released in exact submission order!
     assert_eq!(output.persisted_tokens, vec![102, 103]);
     assert!(output.device_ops.is_empty());
 }
 
 #[test]
 fn test_engine_segment_rotation_and_preallocation() {
-    // 1536 byte segment capacity (Header 512B + room for 2 frames of 512B)
     let config = StorageConfig::for_test(SectorSize::Sector512, 1536);
     let mut engine = StorageEngine::new_empty(config);
     let mut output = EngineOutput::default();
 
-    // Append 2 entries: 512B header + 512B entry1 + 512B entry2 = 1536B (fills segment 1)
     let entry1 = Entry {
         index: LogIndex::from_raw(1),
         term: Term::from_raw(1),
@@ -154,7 +143,6 @@ fn test_engine_segment_rotation_and_preallocation() {
     );
     output.clear();
 
-    // Appending entry 3 should trigger segment rotation
     engine.step(
         EngineInput::AppendEntries {
             prev_index: LogIndex::from_raw(2),
@@ -164,7 +152,6 @@ fn test_engine_segment_rotation_and_preallocation() {
         &mut output,
     );
 
-    // Verify rotation operations: Create for segment 2, SyncDir, Write Header
     let has_create_seg2 = output.device_ops.iter().any(|op| match op {
         DeviceOp::Create {
             file_id,
@@ -191,7 +178,6 @@ fn test_engine_segment_rotation_and_preallocation() {
 }
 
 #[test]
-#[should_panic(expected = "FATAL: storage sync operation failed under ADR 0013")]
 fn test_engine_fsync_fail_fast_policy() {
     let config = StorageConfig::default();
     let mut engine = StorageEngine::new_empty(config);
@@ -206,6 +192,27 @@ fn test_engine_fsync_fail_fast_policy() {
         }),
         &mut output,
     );
+
+    assert!(
+        matches!(engine.fatal_error(), Some(StorageError::FsyncFailed { .. })),
+        "fsync failure must latch a fatal error instead of retrying"
+    );
+    assert!(output.persisted_tokens.is_empty());
+
+    let ops_before = output.device_ops.len();
+    engine.step(
+        EngineInput::AppendEntries {
+            prev_index: LogIndex::from_raw(0),
+            entries: Vec::new(),
+            token: 7,
+        },
+        &mut output,
+    );
+    assert_eq!(
+        output.device_ops.len(),
+        ops_before,
+        "halted engine must emit no further device operations"
+    );
 }
 
 #[test]
@@ -213,7 +220,6 @@ fn test_recovery_scanner_clean_and_torn_tail() {
     let sector_size = SectorSize::Sector512;
     let sector_len = sector_size.as_usize();
 
-    // Prepare hard state buffer
     let mut hard_state_buf = vec![0u8; sector_len * 2];
     let slot0 =
         anvil_storage::HardStateSlot::new(0, 5, Term::from_raw(2), Some(NodeId::new(1).unwrap()));
@@ -221,7 +227,6 @@ fn test_recovery_scanner_clean_and_torn_tail() {
         .encode(sector_size, &mut hard_state_buf[..sector_len])
         .unwrap();
 
-    // Prepare WAL segment buffer
     let mut seg_buf = vec![0u8; 4096];
     let seg_hdr = WalSegmentHeader::new(sector_size, 1, LogIndex::from_raw(1), Term::from_raw(0));
     seg_hdr.encode(&mut seg_buf[..sector_len]).unwrap();
@@ -250,7 +255,6 @@ fn test_recovery_scanner_clean_and_torn_tail() {
     let f2_offset = 512 + f1_bytes.len();
     seg_buf[f2_offset..f2_offset + f2_bytes.len()].copy_from_slice(&f2_bytes);
 
-    // 1. Clean recovery
     let recovered_clean =
         StorageEngine::scan_recovery(&hard_state_buf, &[(seg_hdr.clone(), &seg_buf)], sector_size)
             .unwrap();
@@ -262,10 +266,8 @@ fn test_recovery_scanner_clean_and_torn_tail() {
     );
     assert!(!recovered_clean.log.needs_repair());
 
-    // 2. Torn tail: corrupt entry 2 payload
     let mut torn_buf = seg_buf.clone();
     torn_buf[f2_offset + 30] ^= 0xFF; // flip byte in record 2
-    // Rest of segment beyond record 2 is zeroes
     torn_buf[f2_offset + f2_bytes.len()..].fill(0);
 
     let recovered_torn =
@@ -281,4 +283,82 @@ fn test_recovery_scanner_clean_and_torn_tail() {
         }
     );
     assert!(!recovered_torn.log.needs_repair());
+}
+
+fn sync_op_id(ops: &[DeviceOp]) -> u64 {
+    ops.iter()
+        .find_map(|op| match op {
+            DeviceOp::Fdatasync { op_id, .. } => Some(*op_id),
+            _ => None,
+        })
+        .expect("fdatasync op present")
+}
+
+fn append_one(engine: &mut StorageEngine, index: u64, token: u64, output: &mut EngineOutput) {
+    engine.step(
+        EngineInput::AppendEntries {
+            prev_index: LogIndex::from_raw(index - 1),
+            entries: vec![Entry {
+                index: LogIndex::from_raw(index),
+                term: Term::from_raw(1),
+                kind: EntryKind::Normal,
+                payload: Bytes::from(vec![7u8; 100]),
+            }],
+            token,
+        },
+        output,
+    );
+}
+
+#[test]
+fn test_engine_rotation_during_in_flight_sync() {
+    let config = StorageConfig::for_test(SectorSize::Sector512, 1536);
+    let mut engine = StorageEngine::new_empty(config);
+    let mut output = EngineOutput::default();
+
+    append_one(&mut engine, 1, 101, &mut output);
+    let sync1 = sync_op_id(&output.device_ops);
+    output.clear();
+
+    append_one(&mut engine, 2, 102, &mut output);
+    assert!(output.device_ops.is_empty());
+
+    append_one(&mut engine, 3, 103, &mut output);
+    let sync2 = sync_op_id(&output.device_ops);
+    assert_ne!(sync1, sync2);
+    output.clear();
+
+    engine.step(
+        EngineInput::Completion(DeviceCompletion {
+            op_id: sync2,
+            result: Ok(CompletionPayload::Synced),
+        }),
+        &mut output,
+    );
+    assert_eq!(output.persisted_tokens, vec![102]);
+    let sync3 = sync_op_id(&output.device_ops);
+    output.clear();
+
+    engine.step(
+        EngineInput::Completion(DeviceCompletion {
+            op_id: sync1,
+            result: Ok(CompletionPayload::Synced),
+        }),
+        &mut output,
+    );
+    assert_eq!(output.persisted_tokens, vec![101]);
+    assert!(
+        output.device_ops.is_empty(),
+        "no new flush: pending batch already drained"
+    );
+
+    output.clear();
+    engine.step(
+        EngineInput::Completion(DeviceCompletion {
+            op_id: sync3,
+            result: Ok(CompletionPayload::Synced),
+        }),
+        &mut output,
+    );
+    assert_eq!(output.persisted_tokens, vec![103]);
 }

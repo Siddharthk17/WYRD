@@ -9,7 +9,7 @@
 //! - Process crashes and restart recovery with invariant verification
 //! - Per-step online invariant verification across all nodes
 
-use crate::device::{SimDevice, SimDeviceConfig};
+use crate::device::{SimDevice, SimDeviceConfig, StorageFaultAtlas};
 use crate::raft_invariants::RaftInvariantChecker;
 use crate::rng::{DetRng, derive_component_seed};
 use anvil_raft::{Input, Message, Output, RaftConfig, RaftCore, RecoveredState, Role};
@@ -83,6 +83,9 @@ pub struct SimCluster {
     pub partitions: BTreeSet<(NodeId, NodeId)>,
     /// Global online invariant checker called after every node transition.
     pub checker: RaftInvariantChecker,
+    /// Storage fault atlas enforcing the quorum survivability rule.
+    /// `None` unless the cluster was built with storage faults enabled.
+    pub fault_atlas: Option<StorageFaultAtlas>,
     /// Scratch output buffer reused across steps to eliminate allocations.
     output_scratch: Output,
     /// Optional hook to drop selected packets `(from, to, message) -> bool`.
@@ -97,6 +100,35 @@ impl SimCluster {
     /// Constructs a new `SimCluster` with `size` nodes (typically 3, 5, or 7) seeded from `master_seed`.
     #[must_use]
     pub fn new(size: usize, master_seed: u64) -> Self {
+        Self::build(
+            size,
+            master_seed,
+            &SimDeviceConfig::for_test(SectorSize::Sector512),
+            None,
+        )
+    }
+
+    /// Constructs a `SimCluster` with storage fault injection enabled.
+    ///
+    /// Every node device uses `dev_config` (chaotic fault rates) and shares one
+    /// `StorageFaultAtlas`, so injected read/write corruption can never destroy
+    /// every surviving copy of a committed entry on a quorum.
+    #[must_use]
+    pub fn new_with_storage_faults(
+        size: usize,
+        master_seed: u64,
+        dev_config: &SimDeviceConfig,
+    ) -> Self {
+        let atlas = StorageFaultAtlas::new(size);
+        Self::build(size, master_seed, dev_config, Some(atlas))
+    }
+
+    fn build(
+        size: usize,
+        master_seed: u64,
+        dev_config: &SimDeviceConfig,
+        atlas: Option<StorageFaultAtlas>,
+    ) -> Self {
         assert!(
             (1..=9).contains(&size),
             "cluster size must be between 1 and 9 nodes"
@@ -143,9 +175,11 @@ impl SimCluster {
 
             // Initialize storage layer with real SimDevice and StorageEngine
             let storage_config = StorageConfig::for_test(SectorSize::Sector512, 64 * 1024);
-            let dev_config = SimDeviceConfig::for_test(SectorSize::Sector512);
             let dev_rng = DetRng::new(master_seed, &format!("cluster/storage/{}", id.get()));
-            let mut sim_dev = SimDevice::new(dev_config, dev_rng);
+            let mut sim_dev = SimDevice::new(dev_config.clone(), dev_rng);
+            if let Some(shared_atlas) = &atlas {
+                sim_dev = sim_dev.with_atlas(shared_atlas.clone(), id);
+            }
             init_node_storage(&mut sim_dev, &storage_config);
             let engine = StorageEngine::new_empty(storage_config.clone());
 
@@ -174,6 +208,7 @@ impl SimCluster {
             in_flight: Vec::new(),
             partitions: BTreeSet::new(),
             checker: RaftInvariantChecker::new(),
+            fault_atlas: atlas,
             output_scratch: Output::new(),
             drop_hook: None,
             duplicate_hook: None,
@@ -189,7 +224,6 @@ impl SimCluster {
     pub fn tick(&mut self) {
         self.current_tick = self.current_tick.saturating_add(1);
 
-        // 1. Tick every live node
         let node_ids: Vec<NodeId> = self.nodes.keys().copied().collect();
         for id in node_ids {
             if !self.is_node_crashed(id) {
@@ -197,7 +231,6 @@ impl SimCluster {
             }
         }
 
-        // 2. Deliver all in-flight packets scheduled for now or earlier
         self.deliver_due_messages();
     }
 
@@ -290,24 +323,18 @@ impl SimCluster {
         self.sync_node_storage_with_core(id);
         self.output_scratch.clear();
 
-        // Step the core
         if let Some(core) = self.nodes.get_mut(&id) {
             core.step(input, &mut self.output_scratch);
         }
 
-        // Enqueue outbound network messages into simulated network
         let outbound = std::mem::take(&mut self.output_scratch.messages);
         for msg in outbound {
             self.route_message(id, msg.to, msg.message);
         }
 
-        // Check invariants immediately after step
         self.checker.check_invariants(&self.nodes);
 
         // Process persistence operations through real StorageEngine and SimDevice
-        let mut completed_tokens = Vec::new();
-        let mut should_crash = false;
-
         if let Some(storage) = self.storage.get_mut(&id) {
             if !self.output_scratch.persist_ops.is_empty() {
                 let persist_ops = std::mem::take(&mut self.output_scratch.persist_ops);
@@ -355,26 +382,6 @@ impl SimCluster {
                         }
                     }
                 }
-
-                // Submit emitted device operations to SimDevice
-                let device_ops = std::mem::take(&mut storage.engine_output.device_ops);
-                for dev_op in device_ops {
-                    storage.device.submit(dev_op);
-                }
-
-                // Drain completions from SimDevice
-                while let Some(comp) = storage.device.poll_completion() {
-                    storage
-                        .engine
-                        .step(EngineInput::Completion(comp), &mut storage.engine_output);
-                }
-
-                // If fatal error occurred in engine (e.g. fsync failure injected), mark for crash
-                if storage.engine.fatal_error().is_some() {
-                    should_crash = true;
-                } else {
-                    completed_tokens = std::mem::take(&mut storage.engine_output.persisted_tokens);
-                }
             }
         } else {
             // Fallback for standalone nodes without storage configuration
@@ -397,9 +404,17 @@ impl SimCluster {
             }
         }
 
-        if should_crash {
-            self.crash_node(id);
-            return;
+        // Drive pending storage work to quiescence (including completions that
+        // became ready while the node was idle) and collect acknowledgements.
+        let mut completed_tokens = Vec::new();
+        if self.storage.contains_key(&id) {
+            if self.drive_storage(id) {
+                self.crash_node(id);
+                return;
+            }
+            if let Some(storage) = self.storage.get_mut(&id) {
+                completed_tokens = std::mem::take(&mut storage.engine_output.persisted_tokens);
+            }
         }
 
         if !completed_tokens.is_empty() {
@@ -415,7 +430,7 @@ impl SimCluster {
                         core.log()
                             .entries()
                             .iter()
-                            .map(|e| (e.index, e.term))
+                            .map(|entry| (entry.index, entry.term))
                             .collect::<Vec<_>>(),
                         core.term(),
                         core.voted_for(),
@@ -433,11 +448,69 @@ impl SimCluster {
                 }
             }
 
+            if let Some(atlas) = &self.fault_atlas
+                && let Some(node_storage) = self.storage.get(&id)
+            {
+                for &(idx, _) in &node_storage.acknowledged_entries {
+                    atlas.record_persisted(id, idx);
+                }
+                atlas.advance_commit_index(self.highest_commit_index());
+            }
+
             for msg in all_follow_ups {
                 self.route_message(id, msg.to, msg.message);
             }
             self.checker.check_invariants(&self.nodes);
         }
+    }
+
+    /// Drives a node's storage to quiescence: submits buffered device operations,
+    /// drains ready completions through the engine (which may emit follow-up
+    /// operations such as batched syncs or verification reads), and repeats
+    /// until no work remains. Each round either submits new work or observes
+    /// none, so the loop always terminates.
+    ///
+    /// Returns true if the engine latched a fatal error, in which case the
+    /// caller must crash the node.
+    fn drive_storage(&mut self, id: NodeId) -> bool {
+        loop {
+            let mut submitted = false;
+            if let Some(storage) = self.storage.get_mut(&id) {
+                for dev_op in std::mem::take(&mut storage.engine_output.device_ops) {
+                    storage.device.submit(dev_op);
+                    submitted = true;
+                }
+            } else {
+                return false;
+            }
+
+            let mut drained = false;
+            loop {
+                let completion = self
+                    .storage
+                    .get_mut(&id)
+                    .and_then(|storage| storage.device.poll_completion());
+                match completion {
+                    None => break,
+                    Some(comp) => {
+                        drained = true;
+                        if let Some(storage) = self.storage.get_mut(&id) {
+                            storage
+                                .engine
+                                .step(EngineInput::Completion(comp), &mut storage.engine_output);
+                            if storage.engine.fatal_error().is_some() {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !submitted && !drained {
+                break;
+            }
+        }
+        false
     }
 
     /// Crashes a specific node: invokes `SimDevice::crash()`, removes volatile `RaftCore`,
@@ -463,34 +536,51 @@ impl SimCluster {
         })?;
 
         let sector_size = storage.config.sector_size;
-        let hard_state_bytes = storage
-            .device
-            .get_file_durable_bytes(FileId::HARD_STATE)
-            .unwrap_or(&[]);
+        let sector_len = sector_size.as_usize();
+        let hard_state_bytes = storage.device.read_durable(FileId::HARD_STATE)?;
 
-        // Collect all WAL segments present in durable storage
-        let mut segments = Vec::new();
+        // Collect all WAL segments present in durable storage, verifying each
+        // header as it is read. A header that fails to decode ends collection:
+        // a later segment means mid-log corruption, otherwise the segment is
+        // a torn tail whose header is rewritten below.
+        let mut segments: Vec<(WalSegmentHeader, Bytes)> = Vec::new();
         let mut seg_id = 1u64;
+        let mut torn_header_seg: Option<u64> = None;
+        let mut header_gap_before_next = false;
         loop {
             let file_id = FileId::wal_segment(seg_id);
-            let Some(seg_bytes) = storage.device.get_file_durable_bytes(file_id) else {
-                break;
-            };
-            if seg_bytes.len() < sector_size.as_usize() {
+            let durable_len = storage
+                .device
+                .get_file_durable_bytes(file_id)
+                .map_or(0, <[u8]>::len);
+            if durable_len < sector_len {
                 break;
             }
-            let Ok(hdr) =
-                WalSegmentHeader::decode(&seg_bytes[..sector_size.as_usize()], sector_size)
-            else {
-                break;
-            };
-            segments.push((hdr, seg_bytes));
-            seg_id += 1;
+            let seg_bytes = storage.device.read_durable(file_id)?;
+            if let Ok(hdr) = WalSegmentHeader::decode(&seg_bytes[..sector_len], sector_size) {
+                segments.push((hdr, seg_bytes));
+                seg_id += 1;
+                continue;
+            }
+            let next_len = storage
+                .device
+                .get_file_durable_bytes(FileId::wal_segment(seg_id + 1))
+                .map_or(0, <[u8]>::len);
+            if next_len >= sector_len {
+                header_gap_before_next = true;
+            } else {
+                torn_header_seg = Some(seg_id);
+            }
+            break;
         }
 
-        let recovery_res = StorageEngine::scan_recovery(hard_state_bytes, &segments, sector_size);
+        let seg_refs: Vec<(WalSegmentHeader, &[u8])> = segments
+            .iter()
+            .map(|(hdr, bytes)| (hdr.clone(), bytes.as_ref()))
+            .collect();
+        let recovery_res = StorageEngine::scan_recovery(&hard_state_bytes, &seg_refs, sector_size);
 
-        let recovered = match recovery_res {
+        let mut recovered = match recovery_res {
             Ok(rec) => rec,
             Err(e) => {
                 // Both slots corrupted: refuse to start under ADR 0012
@@ -500,6 +590,68 @@ impl SimCluster {
             }
         };
 
+        // A recovered term or vote older than the latest acknowledged write means
+        // silent corruption destroyed the latest hard-state slot. The node forgot
+        // an acknowledged vote and must be replaced, never resumed: rejoining
+        // could let it vote twice in one term.
+        if let Some((&max_term, &max_vote)) =
+            storage.persisted_votes.iter().max_by_key(|(term, _)| *term)
+            && (recovered.current_term < max_term
+                || (recovered.current_term == max_term && recovered.voted_for != max_vote))
+        {
+            storage.refused_start = true;
+            storage.crashed = false;
+            return Err(StorageError::StaleHardState {
+                recovered_term: recovered.current_term,
+                recovered_vote: recovered.voted_for,
+                acked_term: max_term,
+                acked_vote: max_vote,
+            });
+        }
+
+        if header_gap_before_next {
+            recovered.log.classification = LogRecoveryClassification::MidLogCorruption {
+                corrupt_index: recovered
+                    .log
+                    .last_index
+                    .next()
+                    .unwrap_or(recovered.log.last_index),
+                corrupt_offset: 0,
+            };
+        }
+
+        let max_acked = storage
+            .acknowledged_entries
+            .iter()
+            .map(|&(idx, _)| idx)
+            .max();
+        let lost_acked_bound = match &recovered.log.classification {
+            LogRecoveryClassification::TornTail {
+                last_valid_index, ..
+            } => Some(*last_valid_index),
+            LogRecoveryClassification::Clean
+            | LogRecoveryClassification::MidLogCorruption { .. } => None,
+        };
+        let torn_acked = torn_header_seg.is_some()
+            && max_acked.is_some_and(|max_ack| max_ack > recovered.log.last_index);
+        let truncated_acked =
+            lost_acked_bound.is_some_and(|bound| max_acked.is_some_and(|max_ack| max_ack > bound));
+        if header_gap_before_next || torn_acked || truncated_acked {
+            let corrupt_index = lost_acked_bound
+                .unwrap_or(recovered.log.last_index)
+                .next()
+                .unwrap_or(recovered.log.last_index);
+            recovered.log.classification = LogRecoveryClassification::MidLogCorruption {
+                corrupt_index,
+                corrupt_offset: 0,
+            };
+        } else if torn_header_seg.is_some() {
+            recovered.log.classification = LogRecoveryClassification::TornTail {
+                truncated_offset: 0,
+                last_valid_index: recovered.log.last_index,
+            };
+        }
+
         match &recovered.log.classification {
             LogRecoveryClassification::MidLogCorruption { .. } => {
                 // Mid-log corruption: marked NeedsRepair, does not vote or lead
@@ -508,31 +660,6 @@ impl SimCluster {
                 Ok(recovered)
             }
             LogRecoveryClassification::Clean | LogRecoveryClassification::TornTail { .. } => {
-                // Invariant 1: VoteNeverForgotten
-                let vote_res = self.checker.check_vote_never_forgotten(
-                    id,
-                    recovered.current_term,
-                    recovered.voted_for,
-                );
-                assert!(
-                    vote_res.is_ok(),
-                    "VoteNeverForgotten invariant failed: {:?}",
-                    vote_res.err()
-                );
-
-                if let Some(&Some(expected_vote)) =
-                    storage.persisted_votes.get(&recovered.current_term)
-                {
-                    assert_eq!(
-                        recovered.voted_for,
-                        Some(expected_vote),
-                        "VoteNeverForgotten: recovered vote for term {} ({:?}) != expected ({:?})",
-                        recovered.current_term,
-                        recovered.voted_for,
-                        expected_vote
-                    );
-                }
-
                 // Invariant 2: Recovered log contains all acknowledged entries
                 for &(ack_idx, ack_term) in &storage.acknowledged_entries {
                     let entry_opt = recovered.log.entries.iter().find(|e| e.index == ack_idx);
@@ -581,25 +708,58 @@ impl SimCluster {
                 let core = RaftCore::new(config, recovered_state, rng);
                 self.nodes.insert(id, core);
 
-                // Re-initialize StorageEngine from recovered state
-                let active_seg_id = if segments.is_empty() {
-                    1
-                } else {
-                    segments.len() as u64
-                };
-                let (write_offset, last_crc) = if let Some((last_hdr, _)) = segments.last() {
-                    let mut cur_offset = sector_size.as_u64();
-                    let mut cur_crc = last_hdr.header_crc;
-                    for e in &recovered.log.entries {
-                        let frame =
-                            WalRecordFrame::from_entry(e, cur_crc, active_seg_id, cur_offset);
-                        cur_crc = frame.crc32c;
-                        cur_offset += frame.frame_size(sector_size) as u64;
+                // Re-initialize StorageEngine from recovered state.
+                // Only entries at or after the active segment's first index are
+                // replayed to recompute the write offset and CRC seed, so the
+                // values exactly match a fresh scan of the active segment.
+                let (active_seg_id, resume_index, resume_crc) = match torn_header_seg {
+                    Some(torn_id) => {
+                        let resume_index = recovered
+                            .log
+                            .last_index
+                            .next()
+                            .unwrap_or(recovered.log.last_index);
+                        let resume_header = WalSegmentHeader::new(
+                            sector_size,
+                            torn_id,
+                            resume_index,
+                            recovered.log.last_term,
+                        );
+                        let mut hdr_buf = vec![0u8; sector_len];
+                        let _ = resume_header.encode(&mut hdr_buf);
+                        storage
+                            .device
+                            .overwrite_durable(FileId::wal_segment(torn_id), 0, &hdr_buf);
+                        (torn_id, resume_index, resume_header.header_crc)
                     }
-                    (cur_offset, cur_crc)
-                } else {
-                    (sector_size.as_u64(), 0)
+                    None => {
+                        if let Some((last_hdr, _)) = segments.last() {
+                            (
+                                last_hdr.segment_id,
+                                last_hdr.first_index,
+                                last_hdr.header_crc,
+                            )
+                        } else {
+                            let fresh = WalSegmentHeader::new(
+                                sector_size,
+                                1,
+                                LogIndex::from_raw(1),
+                                Term::from_raw(0),
+                            );
+                            (1, fresh.first_index, fresh.header_crc)
+                        }
+                    }
                 };
+                let mut write_offset = sector_size.as_u64();
+                let mut last_crc = resume_crc;
+                for e in &recovered.log.entries {
+                    if e.index >= resume_index {
+                        let frame =
+                            WalRecordFrame::from_entry(e, last_crc, active_seg_id, write_offset);
+                        last_crc = frame.crc32c;
+                        write_offset += frame.frame_size(sector_size) as u64;
+                    }
+                }
 
                 storage.engine = StorageEngine::new(
                     storage.config.clone(),

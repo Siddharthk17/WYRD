@@ -15,8 +15,8 @@ use std::collections::BTreeSet;
 
 fn make_config(node_id: u64, peers: &[u64]) -> RaftConfig {
     let mut peer_set = BTreeSet::new();
-    for &p in peers {
-        peer_set.insert(NodeId::new(p).expect("valid peer"));
+    for &peer in peers {
+        peer_set.insert(NodeId::new(peer).expect("valid peer"));
     }
     RaftConfig {
         node_id: NodeId::new(node_id).expect("valid node id"),
@@ -37,6 +37,43 @@ fn make_core(node_id: u64, peers: &[u64], seed: u64) -> RaftCore {
     RaftCore::new(config, recovered, rng)
 }
 
+/// Drives a 3-node core through `PreVote` and election to a settled leader,
+/// returning the leader, its voting peer, and the handshake output.
+fn elect_leader(seed: u64) -> (RaftCore, NodeId, Output) {
+    let mut leader = make_core(1, &[2, 3], seed);
+    let mut output = Output::new();
+    for _ in 0..10 {
+        leader.step(Input::Tick, &mut output);
+    }
+    let peer = NodeId::new(2).expect("peer");
+    output.clear();
+    leader.step(
+        Input::Recv {
+            from: peer,
+            message: Message::PreVoteResponse {
+                term: Term::from_raw(0),
+                vote_granted: true,
+                from: peer,
+            },
+        },
+        &mut output,
+    );
+    output.clear();
+    leader.step(
+        Input::Recv {
+            from: peer,
+            message: Message::RequestVoteResponse {
+                term: Term::from_raw(1),
+                vote_granted: true,
+                from: peer,
+            },
+        },
+        &mut output,
+    );
+    assert_eq!(leader.role(), Role::Leader);
+    (leader, peer, output)
+}
+
 #[test]
 fn test_initial_state_is_follower() {
     let core = make_core(1, &[2, 3], 42);
@@ -49,24 +86,21 @@ fn test_initial_state_is_follower() {
 
 #[test]
 fn test_prevote_to_candidate_and_election_win() {
-    let mut node1 = make_core(1, &[2, 3], 100);
+    let mut candidate = make_core(1, &[2, 3], 100);
     let mut output = Output::new();
 
-    // Tick until election timeout triggers PreVote
     for _ in 0..10 {
-        node1.step(Input::Tick, &mut output);
+        candidate.step(Input::Tick, &mut output);
     }
-    assert_eq!(node1.role(), Role::PreCandidate);
+    assert_eq!(candidate.role(), Role::PreCandidate);
     assert!(!output.messages.is_empty());
 
-    // Filter PreVote requests sent to peers
-    let peer2 = NodeId::new(2).unwrap();
-    let peer3 = NodeId::new(3).unwrap();
+    let peer2 = NodeId::new(2).expect("peer 2");
+    let peer3 = NodeId::new(3).expect("peer 3");
 
     output.clear();
 
-    // Node 2 grants PreVote
-    node1.step(
+    candidate.step(
         Input::Recv {
             from: peer2,
             message: Message::PreVoteResponse {
@@ -78,22 +112,20 @@ fn test_prevote_to_candidate_and_election_win() {
         &mut output,
     );
 
-    // Node 1 should now transition to Candidate and broadcast RequestVoteRequest
-    assert_eq!(node1.role(), Role::Candidate);
-    assert_eq!(node1.term().as_u64(), 1);
-    assert_eq!(node1.voted_for(), Some(NodeId::new(1).unwrap()));
+    assert_eq!(candidate.role(), Role::Candidate);
+    assert_eq!(candidate.term().as_u64(), 1);
+    assert_eq!(candidate.voted_for(), Some(NodeId::new(1).expect("node 1")));
 
-    // Verify persistence contract: HardState persist op was emitted
+    // Persistence contract: HardState persist op was emitted
     let has_hard_state = output
         .persist_ops
         .iter()
-        .any(|op| matches!(op, PersistOp::HardState { term, vote, .. } if term.as_u64() == 1 && *vote == Some(NodeId::new(1).unwrap())));
+        .any(|op| matches!(op, PersistOp::HardState { term, vote, .. } if term.as_u64() == 1 && *vote == Some(NodeId::new(1).expect("node 1"))));
     assert!(has_hard_state);
 
     output.clear();
 
-    // Node 3 grants formal vote
-    node1.step(
+    candidate.step(
         Input::Recv {
             from: peer3,
             message: Message::RequestVoteResponse {
@@ -105,53 +137,23 @@ fn test_prevote_to_candidate_and_election_win() {
         &mut output,
     );
 
-    // Node 1 should now be Leader
-    assert_eq!(node1.role(), Role::Leader);
+    assert_eq!(candidate.role(), Role::Leader);
     // Leader appends a NoOp on election (charter rule)
-    assert_eq!(node1.last_log_index().as_u64(), 1);
+    assert_eq!(candidate.last_log_index().as_u64(), 1);
     assert_eq!(
-        node1.log().entry_at(LogIndex::from_raw(1)).unwrap().kind,
+        candidate
+            .log()
+            .entry_at(LogIndex::from_raw(1))
+            .expect("noop entry")
+            .kind,
         anvil_types::EntryKind::NoOp
     );
 }
 
 #[test]
 fn test_leader_propose_and_parallel_persist_contract() {
-    let mut leader = make_core(1, &[2, 3], 200);
-    let mut output = Output::new();
+    let (mut leader, peer2, mut output) = elect_leader(200);
 
-    // Bootstrap leader directly by stepping tick and votes
-    for _ in 0..10 {
-        leader.step(Input::Tick, &mut output);
-    }
-    let peer2 = NodeId::new(2).unwrap();
-    output.clear();
-    leader.step(
-        Input::Recv {
-            from: peer2,
-            message: Message::PreVoteResponse {
-                term: Term::from_raw(0),
-                vote_granted: true,
-                from: peer2,
-            },
-        },
-        &mut output,
-    );
-    output.clear();
-    leader.step(
-        Input::Recv {
-            from: peer2,
-            message: Message::RequestVoteResponse {
-                term: Term::from_raw(1),
-                vote_granted: true,
-                from: peer2,
-            },
-        },
-        &mut output,
-    );
-    assert_eq!(leader.role(), Role::Leader);
-
-    // Disk and peer2 acknowledge initial NoOp entry #1
     let noop_token = output
         .persist_ops
         .iter()
@@ -183,7 +185,6 @@ fn test_leader_propose_and_parallel_persist_contract() {
     );
     output.clear();
 
-    // Client proposes a command
     let cmd_payload = Bytes::from_static(b"set key=val");
     leader.step(
         Input::Propose {
@@ -192,9 +193,7 @@ fn test_leader_propose_and_parallel_persist_contract() {
         &mut output,
     );
 
-    // Leader appends entry #2
     assert_eq!(leader.last_log_index().as_u64(), 2);
-    // Emits PersistOp::AppendEntries
     let token = output
         .persist_ops
         .iter()
@@ -216,7 +215,6 @@ fn test_leader_propose_and_parallel_persist_contract() {
 
     output.clear();
 
-    // Peer 2 responds with success for index 2
     leader.step(
         Input::Recv {
             from: peer2,
@@ -235,10 +233,8 @@ fn test_leader_propose_and_parallel_persist_contract() {
     // Entry #1 was already committed, but entry #2 requires leader's own persist to complete first!
     assert_eq!(leader.commit_index().as_u64(), 1);
 
-    // Disk notifies leader that entry #2 is durable
     leader.step(Input::Persisted { token }, &mut output);
 
-    // Now quorum (leader + peer2) is achieved for current-term entry #2 -> commits!
     assert_eq!(leader.commit_index().as_u64(), 2);
     assert_eq!(output.committed_entries.len(), 1); // normal #2 newly committed
 }
@@ -248,7 +244,6 @@ fn test_conflict_hints_1_rtt_repair() {
     let mut follower = make_core(2, &[1, 3], 300);
     let mut output = Output::new();
 
-    // Populate follower log with an entry at term 1
     follower.step(
         Input::Recv {
             from: NodeId::new(1).unwrap(),
@@ -269,7 +264,6 @@ fn test_conflict_hints_1_rtt_repair() {
     );
     output.clear();
 
-    // Leader sends AppendEntries for term 2 expecting prev_log_term = 2 at index 1
     follower.step(
         Input::Recv {
             from: NodeId::new(1).unwrap(),
@@ -289,7 +283,6 @@ fn test_conflict_hints_1_rtt_repair() {
         &mut output,
     );
 
-    // Follower must reject with conflict hint
     let rejection = output.messages.first().expect("rejection response");
     match &rejection.message {
         Message::AppendEntriesResponse {
@@ -308,42 +301,9 @@ fn test_conflict_hints_1_rtt_repair() {
 
 #[test]
 fn test_linearizable_read_index() {
-    let mut leader = make_core(1, &[2, 3], 400);
-    let mut output = Output::new();
-
-    // Advance to leader
-    for _ in 0..10 {
-        leader.step(Input::Tick, &mut output);
-    }
-    let peer2 = NodeId::new(2).unwrap();
-    output.clear();
-    leader.step(
-        Input::Recv {
-            from: peer2,
-            message: Message::PreVoteResponse {
-                term: Term::from_raw(0),
-                vote_granted: true,
-                from: peer2,
-            },
-        },
-        &mut output,
-    );
-    output.clear();
-    leader.step(
-        Input::Recv {
-            from: peer2,
-            message: Message::RequestVoteResponse {
-                term: Term::from_raw(1),
-                vote_granted: true,
-                from: peer2,
-            },
-        },
-        &mut output,
-    );
-    assert_eq!(leader.role(), Role::Leader);
+    let (mut leader, peer2, mut output) = elect_leader(400);
     output.clear();
 
-    // Submit ReadIndex request
     let ctx = Bytes::from_static(b"client-req-999");
     leader.step(
         Input::ReadIndex {
@@ -352,12 +312,10 @@ fn test_linearizable_read_index() {
         &mut output,
     );
 
-    // Heartbeats sent out to peers with context
     assert!(output.messages.iter().any(|m| matches!(&m.message, Message::HeartbeatRequest { read_context: Some(c), .. } if c == &ctx)));
     assert!(output.completed_reads.is_empty());
     output.clear();
 
-    // Peer 2 responds to heartbeat
     leader.step(
         Input::Recv {
             from: peer2,
@@ -370,48 +328,15 @@ fn test_linearizable_read_index() {
         &mut output,
     );
 
-    // Quorum confirmed (leader + peer2): read is completed and linearizable
     assert_eq!(output.completed_reads.len(), 1);
     assert_eq!(output.completed_reads[0].context, ctx);
 }
 
 #[test]
 fn test_leadership_transfer_timeout_now() {
-    let mut leader = make_core(1, &[2, 3], 500);
-    let mut output = Output::new();
-
-    // Bootstrap leader
-    for _ in 0..10 {
-        leader.step(Input::Tick, &mut output);
-    }
-    let peer2 = NodeId::new(2).unwrap();
-    output.clear();
-    leader.step(
-        Input::Recv {
-            from: peer2,
-            message: Message::PreVoteResponse {
-                term: Term::from_raw(0),
-                vote_granted: true,
-                from: peer2,
-            },
-        },
-        &mut output,
-    );
-    output.clear();
-    leader.step(
-        Input::Recv {
-            from: peer2,
-            message: Message::RequestVoteResponse {
-                term: Term::from_raw(1),
-                vote_granted: true,
-                from: peer2,
-            },
-        },
-        &mut output,
-    );
+    let (mut leader, peer2, mut output) = elect_leader(500);
     output.clear();
 
-    // Update peer 2 match index to leader's last log index
     leader.step(
         Input::Recv {
             from: peer2,
@@ -431,7 +356,6 @@ fn test_leadership_transfer_timeout_now() {
     // Request leader transfer to peer 2
     leader.step(Input::TransferLeader { to: peer2 }, &mut output);
 
-    // TimeoutNow must be dispatched immediately
     let timeout_now = output
         .messages
         .iter()
@@ -442,47 +366,13 @@ fn test_leadership_transfer_timeout_now() {
 
 #[test]
 fn test_check_quorum_step_down() {
-    let mut leader = make_core(1, &[2, 3], 600);
-    let mut output = Output::new();
-
-    // Bootstrap leader
-    for _ in 0..10 {
-        leader.step(Input::Tick, &mut output);
-    }
-    let peer2 = NodeId::new(2).unwrap();
-    output.clear();
-    leader.step(
-        Input::Recv {
-            from: peer2,
-            message: Message::PreVoteResponse {
-                term: Term::from_raw(0),
-                vote_granted: true,
-                from: peer2,
-            },
-        },
-        &mut output,
-    );
-    output.clear();
-    leader.step(
-        Input::Recv {
-            from: peer2,
-            message: Message::RequestVoteResponse {
-                term: Term::from_raw(1),
-                vote_granted: true,
-                from: peer2,
-            },
-        },
-        &mut output,
-    );
-    assert_eq!(leader.role(), Role::Leader);
+    let (mut leader, _peer, mut output) = elect_leader(600);
     output.clear();
 
-    // Run 5 ticks (election_timeout_ticks) without any peer responses
     for _ in 0..5 {
         leader.step(Input::Tick, &mut output);
     }
 
-    // Leader must step down to follower
     assert_eq!(leader.role(), Role::Follower);
     assert!(
         output

@@ -36,7 +36,6 @@ fn test_sim_device_directory_durability_syncdir_guarantee() {
     let file_synced = FileId::wal_segment(1);
     let file_unsynced = FileId::wal_segment(2);
 
-    // 1. Create file 1 and run SyncDir
     device.submit(DeviceOp::Create {
         op_id: 1,
         file_id: file_synced,
@@ -46,7 +45,6 @@ fn test_sim_device_directory_durability_syncdir_guarantee() {
     device.submit(DeviceOp::SyncDir { op_id: 2 });
     assert!(device.poll_completion().unwrap().result.is_ok());
 
-    // 2. Create file 2 without SyncDir
     device.submit(DeviceOp::Create {
         op_id: 3,
         file_id: file_unsynced,
@@ -59,7 +57,6 @@ fn test_sim_device_directory_durability_syncdir_guarantee() {
     assert!(device.is_file_durable(file_synced));
     assert!(!device.is_file_durable(file_unsynced));
 
-    // 3. Crash!
     device.crash();
 
     // File 1 must survive; File 2 was unsynced and vanished from namespace!

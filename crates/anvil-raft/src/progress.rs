@@ -91,16 +91,16 @@ impl PeerProgress {
         self.inflight_count = self.inflight_count.saturating_sub(1);
         self.state = ProgressState::Probe;
 
-        let resolved_next = if let Some(c_term) = conflict_term {
-            if let Some(leader_last_idx) = last_index_for_term(c_term) {
+        let resolved_next = if let Some(conflicting) = conflict_term {
+            if let Some(leader_last_idx) = last_index_for_term(conflicting) {
                 leader_last_idx.next().unwrap_or(leader_last_idx)
-            } else if let Some(c_idx) = conflict_index {
-                c_idx
+            } else if let Some(hint_idx) = conflict_index {
+                hint_idx
             } else {
                 self.next_index.prev().unwrap_or(LogIndex::from_raw(1))
             }
-        } else if let Some(c_idx) = conflict_index {
-            c_idx
+        } else if let Some(hint_idx) = conflict_index {
+            hint_idx
         } else {
             self.next_index.prev().unwrap_or(LogIndex::from_raw(1))
         };

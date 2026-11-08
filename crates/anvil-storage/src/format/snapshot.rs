@@ -212,9 +212,7 @@ impl SnapshotChunk {
 
         let chunk_index = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         if chunk_index != expected_chunk_index {
-            return Err(StorageError::CrcMismatch {
-                expected: expected_chunk_index,
-                computed: chunk_index,
+            return Err(StorageError::InvalidField {
                 context: "snapshot_chunk_index",
             });
         }

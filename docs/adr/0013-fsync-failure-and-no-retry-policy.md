@@ -9,13 +9,13 @@ In 2018, the PostgreSQL development community uncovered the "fsyncgate" vulnerab
 ## Options Considered
 1. **Retry `fsync()` on Error**: Loop with exponential backoff on `EIO` or `EAGAIN`.
 2. **Re-dirty Buffer and Rewrite**: Attempt to locate the failed offsets in user memory and re-issue `pwrite()`.
-3. **Fail-Fast Crash on Any Sync Error**: Treat any `fsync()` or `fdatasync()` error as a fatal condition; panic or terminate immediately without retrying.
+3. **Fail-Fast Crash on Any Sync Error**: Treat any `fsync()` or `fdatasync()` error as a fatal condition: record a typed fatal error, stop issuing storage operations, and terminate the node process immediately without retrying.
 
 ## Decision
 ANVIL adopts the **Fail-Fast Crash on Any Sync Error** policy:
 - **Zero Retries**: The storage engine never retries an `fsync()` or `fdatasync()` that returns an error.
-- **Immediate Crash**: Upon receiving an error from a sync operation, the storage engine triggers an immediate crash.
-- **Recovery Resolution**: Upon node restart, the recovery scanner inspects durable state on disk, evaluates alternating hard state slots, and validates WAL CRC chains to recover cleanly from known good non-volatile state.
+- **Immediate Crash**: Upon receiving an error from a sync operation, the storage engine latches a typed fatal error, stops issuing further operations, and the node process crashes without retrying.
+- **Recovery Resolution**: Upon node restart, the recovery scanner inspects durable state on disk, evaluates alternating hard state slots, and validates WAL CRC chains to recover cleanly from known good non-volatile state. If recovery finds acknowledged hard state missing, the node refuses to start rather than risk voting twice.
 - **Simulation**: In `anvil-sim`, injected fsync errors immediately signal node failure and initiate crash recovery.
 
 ## Consequences

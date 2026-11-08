@@ -1,9 +1,5 @@
 #![forbid(unsafe_code)]
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::collapsible_if,
-    clippy::similar_names
-)]
+#![allow(clippy::cast_possible_truncation, clippy::similar_names)]
 
 //! Simulated disk storage device (`SimDevice`) for ANVIL.
 //!
@@ -275,6 +271,89 @@ impl SimDevice {
         self.files.get(&file_id).map(|s| s.durable_data.as_slice())
     }
 
+    /// Overwrites durable bytes synchronously, used only for crash-recovery repair.
+    ///
+    /// Writes straight through to durable storage (as if synced) and keeps the
+    /// volatile page cache coherent. Recovery uses this to rewrite a torn
+    /// segment header after classifying the segment as a torn tail.
+    pub fn overwrite_durable(&mut self, file_id: FileId, offset: u64, data: &[u8]) {
+        let end = (offset as usize) + data.len();
+        if let Some(state) = self.files.get_mut(&file_id) {
+            if state.durable_data.len() < end {
+                state.durable_data.resize(end, 0);
+            }
+            state.durable_data[offset as usize..end].copy_from_slice(data);
+            if state.volatile_data.len() < end {
+                state.volatile_data.resize(end, 0);
+            }
+            state.volatile_data[offset as usize..end].copy_from_slice(data);
+
+            let sector_size = self.config.sector_size.as_u64();
+            let first_sector = offset / sector_size;
+            let last_sector = (offset + data.len() as u64).saturating_sub(1) / sector_size;
+            for sector in first_sector..=last_sector {
+                state.dirty_sectors.remove(&sector);
+            }
+        }
+    }
+
+    /// Reads durable bytes for crash recovery, applying read-path fault injection.
+    ///
+    /// Recovery must observe the same faults as the read path: latent sector
+    /// errors surface as `Err`, and bit-rot flips on frame sectors are gated by
+    /// the atlas so a committed entry is never corrupted on every surviving copy.
+    /// A flipped header sector fails to decode and is classified as mid-log
+    /// corruption by the caller, which sidelines the node for repair.
+    pub fn read_durable(&mut self, file_id: FileId) -> Result<Bytes, StorageError> {
+        if !self.volatile_files.contains(&file_id) {
+            return Err(StorageError::DeviceError(format!(
+                "File {file_id:?} not found"
+            )));
+        }
+
+        if self.config.read_eio_rate_ppm > 0
+            && self.rng.bernoulli_ppm(self.config.read_eio_rate_ppm)
+        {
+            self.stats.read_eios_injected += 1;
+            return Err(StorageError::DeviceError(
+                "EIO: latent sector error on read".to_string(),
+            ));
+        }
+
+        let Some(file_state) = self.files.get(&file_id) else {
+            return Err(StorageError::DeviceError(format!(
+                "File {file_id:?} not found"
+            )));
+        };
+        let mut read_bytes = file_state.durable_data.clone();
+
+        if self.config.read_corruption_rate_ppm > 0 && !read_bytes.is_empty() {
+            let sector_len = self.config.sector_size.as_usize();
+            let full_sectors = read_bytes.len() / sector_len;
+            let corrupt_offset = if full_sectors > 1 {
+                self.rng.gen_range(0..full_sectors as u64) as usize * sector_len
+            } else {
+                0
+            };
+            let corruptible = self.can_corrupt_wal_frame(
+                file_id,
+                corrupt_offset as u64,
+                &read_bytes[corrupt_offset.min(read_bytes.len())..],
+            );
+            if self.rng.bernoulli_ppm(self.config.read_corruption_rate_ppm) && corruptible {
+                let corrupted_index =
+                    Self::frame_index_at(&read_bytes[corrupt_offset.min(read_bytes.len())..]);
+                read_bytes[corrupt_offset] ^= 0x3C;
+                self.stats.read_corruptions_injected += 1;
+                if let Some(index) = corrupted_index {
+                    self.record_corruption_at(file_id, corrupt_offset as u64, index);
+                }
+            }
+        }
+
+        Ok(Bytes::from(read_bytes))
+    }
+
     /// Returns a reference to volatile page cache file bytes if the file exists.
     #[must_use]
     pub fn get_file_volatile_bytes(&self, file_id: FileId) -> Option<&[u8]> {
@@ -422,22 +501,41 @@ impl SimDevice {
         self.pending_completions.clear();
     }
 
+    /// Extracts the WAL record index from the head of a frame buffer.
+    fn frame_index_at(data: &[u8]) -> Option<LogIndex> {
+        if data.len() < 8 {
+            return None;
+        }
+        let mut index_bytes = [0u8; 8];
+        index_bytes.copy_from_slice(&data[0..8]);
+        let raw_index = u64::from_le_bytes(index_bytes);
+        if raw_index > 0 {
+            Some(LogIndex::from_raw(raw_index))
+        } else {
+            None
+        }
+    }
+
     /// Internal helper to check if a corruption of a WAL frame is permitted by the atlas.
     fn can_corrupt_wal_frame(&self, file_id: FileId, offset: u64, data: &[u8]) -> bool {
-        if let (Some(atlas), Some(node_id)) = (&self.atlas, self.node_id) {
-            if file_id.is_wal_segment() && offset >= self.config.sector_size.as_u64() {
-                if data.len() >= 8 {
-                    let mut index_bytes = [0u8; 8];
-                    index_bytes.copy_from_slice(&data[0..8]);
-                    let raw_index = u64::from_le_bytes(index_bytes);
-                    if raw_index > 0 {
-                        let log_index = LogIndex::from_raw(raw_index);
-                        return atlas.can_corrupt_entry(node_id, log_index);
-                    }
-                }
-            }
+        if let (Some(atlas), Some(node_id)) = (&self.atlas, self.node_id)
+            && file_id.is_wal_segment()
+            && offset >= self.config.sector_size.as_u64()
+            && let Some(index) = Self::frame_index_at(data)
+        {
+            return atlas.can_corrupt_entry(node_id, index);
         }
         true
+    }
+
+    /// Records an injected corruption against the atlas survivability accounting.
+    fn record_corruption_at(&self, file_id: FileId, offset: u64, index: LogIndex) {
+        if let (Some(atlas), Some(node_id)) = (&self.atlas, self.node_id)
+            && file_id.is_wal_segment()
+            && offset >= self.config.sector_size.as_u64()
+        {
+            atlas.record_corruption(node_id, index);
+        }
     }
 
     /// Computes asynchronous latency for an operation.
@@ -545,9 +643,13 @@ impl SimDevice {
                         .bernoulli_ppm(self.config.write_corruption_rate_ppm)
                     && self.can_corrupt_wal_frame(file_id, offset, &write_bytes)
                 {
+                    let corrupted_index = Self::frame_index_at(&write_bytes);
                     if !write_bytes.is_empty() {
                         write_bytes[0] ^= 0x5A;
                         self.stats.write_corruptions_injected += 1;
+                        if let Some(index) = corrupted_index {
+                            self.record_corruption_at(file_id, offset, index);
+                        }
                     }
                 }
 
@@ -627,9 +729,13 @@ impl SimDevice {
                     && self.rng.bernoulli_ppm(self.config.read_corruption_rate_ppm)
                     && self.can_corrupt_wal_frame(file_id, offset, &read_bytes)
                 {
+                    let corrupted_index = Self::frame_index_at(&read_bytes);
                     if !read_bytes.is_empty() {
                         read_bytes[0] ^= 0x3C;
                         self.stats.read_corruptions_injected += 1;
+                        if let Some(index) = corrupted_index {
+                            self.record_corruption_at(file_id, offset, index);
+                        }
                     }
                 }
 
@@ -756,17 +862,15 @@ impl Device for SimDevice {
     }
 
     fn poll_completion(&mut self) -> Option<DeviceCompletion> {
-        if let Some(top) = self.pending_completions.peek() {
-            if top.completion_tick <= self.current_tick {
-                if let Some(comp) = self.pending_completions.pop() {
-                    return Some(DeviceCompletion {
-                        op_id: comp.op_id,
-                        result: comp.result,
-                    });
-                }
-            }
+        let due = matches!(self.pending_completions.peek(), Some(top) if top.completion_tick <= self.current_tick);
+        if due {
+            self.pending_completions.pop().map(|comp| DeviceCompletion {
+                op_id: comp.op_id,
+                result: comp.result,
+            })
+        } else {
+            None
         }
-        None
     }
 }
 

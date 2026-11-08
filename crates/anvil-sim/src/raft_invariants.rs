@@ -157,8 +157,11 @@ impl RaftInvariantChecker {
     ///
     /// Must be called after every transition step of every node in the simulator.
     pub fn check_invariants(&mut self, nodes: &BTreeMap<NodeId, RaftCore>) {
-        let res = self.try_check_invariants(nodes);
-        assert!(res.is_ok(), "FATAL RAFT INVARIANT VIOLATION: {res:?}");
+        let outcome = self.try_check_invariants(nodes);
+        assert!(
+            outcome.is_ok(),
+            "FATAL RAFT INVARIANT VIOLATION: {outcome:?}"
+        );
     }
 
     /// Internal evaluation returning a `Result` for testing or error propagation.
@@ -205,13 +208,13 @@ impl RaftInvariantChecker {
         nodes: &BTreeMap<NodeId, RaftCore>,
     ) -> Result<(), InvariantViolation> {
         for (&id, core) in nodes {
+            let applied = core.applied_index();
             let commit = core.commit_index();
             let last = core.last_log_index();
-            // Note: applied is 0 until state machine applies entries; applied <= commit <= last
-            if commit > last {
+            if applied > commit || commit > last {
                 return Err(InvariantViolation::AppliedLeqCommittedLeqLastIndex {
                     node: id,
-                    applied: LogIndex::from_raw(0),
+                    applied,
                     commit,
                     last,
                 });
@@ -297,18 +300,17 @@ impl RaftInvariantChecker {
                     if let (Some(term1), Some(term2)) = (t1, t2)
                         && term1 == term2
                     {
-                        // Verify all prefixes 1..=idx match identically
-                        for p in 1..=idx {
-                            let p_idx = LogIndex::from_raw(p);
-                            let pt1 = core1.log().term_at(p_idx).unwrap_or(Term::from_raw(0));
-                            let pt2 = core2.log().term_at(p_idx).unwrap_or(Term::from_raw(0));
+                        for prefix in 1..=idx {
+                            let prefix_idx = LogIndex::from_raw(prefix);
+                            let pt1 = core1.log().term_at(prefix_idx).unwrap_or(Term::from_raw(0));
+                            let pt2 = core2.log().term_at(prefix_idx).unwrap_or(Term::from_raw(0));
                             if pt1 != pt2 {
                                 return Err(InvariantViolation::LogMatching {
                                     node1: *id1,
                                     node2: *id2,
                                     match_index: log_idx,
                                     term: term1,
-                                    prefix_index: p_idx,
+                                    prefix_index: prefix_idx,
                                     term1: pt1,
                                     term2: pt2,
                                 });

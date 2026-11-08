@@ -53,61 +53,51 @@ fn test_differential_basic_operations() {
     let file2 = FileId::HARD_STATE;
 
     let ops = vec![
-        // 1. Create file 1 with 4096 bytes preallocation
         DeviceOp::Create {
             op_id: 1,
             file_id: file1,
             preallocate_bytes: 4096,
         },
-        // 2. Sync directory
         DeviceOp::SyncDir { op_id: 2 },
-        // 3. Write 512 bytes at offset 0
         DeviceOp::Write {
             op_id: 3,
             file_id: file1,
             offset: 0,
             data: Bytes::from(vec![0xAAu8; 512]),
         },
-        // 4. Write 256 bytes at offset 1024
         DeviceOp::Write {
             op_id: 4,
             file_id: file1,
             offset: 1024,
             data: Bytes::from(vec![0xBBu8; 256]),
         },
-        // 5. Read back first write
         DeviceOp::Read {
             op_id: 5,
             file_id: file1,
             offset: 0,
             len: 512,
         },
-        // 6. Read back second write
         DeviceOp::Read {
             op_id: 6,
             file_id: file1,
             offset: 1024,
             len: 256,
         },
-        // 7. Fdatasync file 1
         DeviceOp::Fdatasync {
             op_id: 7,
             file_id: file1,
         },
-        // 8. Create file 2 (Hard State) with 1024 bytes
         DeviceOp::Create {
             op_id: 8,
             file_id: file2,
             preallocate_bytes: 1024,
         },
-        // 9. Write to Hard State slot 0
         DeviceOp::Write {
             op_id: 9,
             file_id: file2,
             offset: 0,
             data: Bytes::from(vec![0x55u8; 512]),
         },
-        // 10. Sync Hard State
         DeviceOp::Fdatasync {
             op_id: 10,
             file_id: file2,

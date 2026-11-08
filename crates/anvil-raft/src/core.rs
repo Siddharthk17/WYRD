@@ -68,7 +68,7 @@ impl RaftCore {
         let last_log_idx = recovered
             .entries
             .last()
-            .map_or(LogIndex::from_raw(0), |e| e.index);
+            .map_or(LogIndex::from_raw(0), |entry| entry.index);
         let initial_next = last_log_idx.next().unwrap_or(last_log_idx);
 
         for &peer in &config.peers {
@@ -140,6 +140,12 @@ impl RaftCore {
         self.commit_index
     }
 
+    /// Returns the highest log index applied to the state machine.
+    #[must_use]
+    pub const fn applied_index(&self) -> LogIndex {
+        self.applied_index
+    }
+
     /// Returns the highest index present in the log.
     #[must_use]
     pub fn last_log_index(&self) -> LogIndex {
@@ -176,10 +182,6 @@ impl RaftCore {
         self.become_leader(output);
     }
 
-    // ------------------------------------------------------------------------
-    // Tick Handling
-    // ------------------------------------------------------------------------
-
     fn handle_tick(&mut self, output: &mut Output) {
         match self.role {
             Role::Follower | Role::PreCandidate | Role::Candidate => {
@@ -206,7 +208,6 @@ impl RaftCore {
                     self.broadcast_heartbeat(output);
                 }
 
-                // CheckQuorum: leader steps down if quorum contact is lost
                 if self.config.check_quorum
                     && self.election_elapsed_ticks >= self.config.election_timeout_ticks
                 {
@@ -222,13 +223,8 @@ impl RaftCore {
         }
     }
 
-    // ------------------------------------------------------------------------
-    // PreVote Protocol
-    // ------------------------------------------------------------------------
-
     fn start_pre_vote(&mut self, output: &mut Output) {
         if self.config.peers.is_empty() {
-            // Single-node cluster: directly become leader
             self.start_election(output);
             return;
         }
@@ -300,10 +296,6 @@ impl RaftCore {
         }
     }
 
-    // ------------------------------------------------------------------------
-    // Election Protocol
-    // ------------------------------------------------------------------------
-
     fn start_election(&mut self, output: &mut Output) {
         let new_term = self.term.next().unwrap_or(self.term);
         self.term = new_term;
@@ -320,7 +312,6 @@ impl RaftCore {
         });
 
         if self.config.peers.is_empty() {
-            // Single node cluster: immediately become leader
             self.become_leader(output);
             return;
         }
@@ -427,11 +418,11 @@ impl RaftCore {
             .last_index()
             .next()
             .unwrap_or(self.log.last_index());
-        for p in self.progress.values_mut() {
-            p.next_index = next_idx;
-            p.match_index = LogIndex::from_raw(0);
-            p.state = crate::progress::ProgressState::Probe;
-            p.inflight_count = 0;
+        for peer_progress in self.progress.values_mut() {
+            peer_progress.next_index = next_idx;
+            peer_progress.match_index = LogIndex::from_raw(0);
+            peer_progress.state = crate::progress::ProgressState::Probe;
+            peer_progress.inflight_count = 0;
         }
 
         // Leader appends a no-op entry upon election (charter requirement)
@@ -454,13 +445,8 @@ impl RaftCore {
             },
         );
 
-        // Replicate to all peers immediately
         self.broadcast_append_entries(output);
     }
-
-    // ------------------------------------------------------------------------
-    // Client Proposal & Log Replication
-    // ------------------------------------------------------------------------
 
     fn handle_propose(&mut self, payload: Bytes, output: &mut Output) {
         if self.role != Role::Leader || self.lead_transferee.is_some() {
@@ -501,7 +487,7 @@ impl RaftCore {
                 .slice_from(progress.next_index, self.config.max_bytes_per_message);
             let entries_count = entries.len();
             let last_sent = if entries_count > 0 {
-                entries.last().map_or(prev_index, |e| e.index)
+                entries.last().map_or(prev_index, |entry| entry.index)
             } else {
                 prev_index
             };
@@ -527,17 +513,24 @@ impl RaftCore {
             return;
         }
 
-        let mut peers = [NodeId::from_nonzero(core::num::NonZeroU64::MIN); 16];
-        let mut count = 0usize;
-        for &peer in &self.config.peers {
-            if count < peers.len() {
-                peers[count] = peer;
-                count += 1;
+        if self.config.peers.len() < 16 {
+            let mut peers = [NodeId::from_nonzero(core::num::NonZeroU64::MIN); 16];
+            let mut count = 0usize;
+            for &peer in &self.config.peers {
+                if count < peers.len() {
+                    peers[count] = peer;
+                    count += 1;
+                }
             }
-        }
 
-        for &peer in &peers[..count] {
-            self.send_append_entries(peer, output);
+            for &peer in &peers[..count] {
+                self.send_append_entries(peer, output);
+            }
+        } else {
+            let peers: Vec<NodeId> = self.config.peers.iter().copied().collect();
+            for peer in peers {
+                self.send_append_entries(peer, output);
+            }
         }
     }
 
@@ -572,13 +565,11 @@ impl RaftCore {
             return;
         }
 
-        // Valid leader confirmed: reset election timer
         self.election_elapsed_ticks = 0;
         if self.role != Role::Follower {
             self.transition_to_follower(term, output);
         }
 
-        // 1. Check if log contains an entry at prev_log_index with prev_log_term
         let local_prev_term = self.log.term_at(prev_log_index);
         let matches = match local_prev_term {
             Some(t) => t == prev_log_term,
@@ -620,7 +611,6 @@ impl RaftCore {
             return;
         }
 
-        // 2. Append/truncate entries
         let mut new_match = prev_log_index;
         let mut entries_to_append = Vec::new();
         let mut truncate_from = None;
@@ -630,7 +620,6 @@ impl RaftCore {
                 entries_to_append.push(entry);
             } else if let Some(existing_term) = self.log.term_at(entry.index) {
                 if existing_term != entry.term {
-                    // First point of divergence: truncate from this entry onward
                     truncate_from = Some(entry.index);
                     entries_to_append.push(entry);
                 }
@@ -667,8 +656,8 @@ impl RaftCore {
         } else if !entries_to_append.is_empty() {
             let start_append_idx = entries_to_append[0].index;
             let prev_idx = start_append_idx.prev().unwrap_or(LogIndex::from_raw(0));
-            for e in &entries_to_append {
-                self.log.append(e.clone());
+            for entry in &entries_to_append {
+                self.log.append(entry.clone());
             }
             new_match = self.log.last_index();
 
@@ -692,7 +681,6 @@ impl RaftCore {
             };
             self.queue_pending_action(token, PendingAction::SendMessage(resp));
         } else {
-            // No new entries: immediate response (heartbeat)
             output.messages.push(OutboundMessage {
                 to: from,
                 message: Message::AppendEntriesResponse {
@@ -706,7 +694,6 @@ impl RaftCore {
             });
         }
 
-        // 3. Advance follower commit index
         if leader_commit > self.commit_index {
             let target_commit = std::cmp::min(leader_commit, self.log.last_index());
             if target_commit > self.commit_index {
@@ -743,7 +730,6 @@ impl RaftCore {
             progress.on_success(match_index);
             self.maybe_advance_commit(output);
 
-            // Check if leader transfer is pending for this node
             if self.lead_transferee == Some(from) && match_index >= self.log.last_index() {
                 output.messages.push(OutboundMessage {
                     to: from,
@@ -755,41 +741,51 @@ impl RaftCore {
                 self.lead_transferee = None;
             }
         } else {
-            let last_idx_fn = |t| self.log.find_last_index_of_term(t);
+            let last_idx_fn = |term| self.log.find_last_index_of_term(term);
             progress.on_rejection(conflict_term, conflict_index, last_idx_fn);
-            // Trigger immediate retry with updated next_index
             self.broadcast_append_entries(output);
         }
     }
-
-    // ------------------------------------------------------------------------
-    // Commit Advancement (Raft Current-Term Commit Rule)
-    // ------------------------------------------------------------------------
 
     fn maybe_advance_commit(&mut self, output: &mut Output) {
         if self.role != Role::Leader {
             return;
         }
 
-        // Fixed-size stack buffer avoiding heap allocation for cluster sizes <= 16
-        let mut matches = [LogIndex::from_raw(0); 16];
-        let mut count = 0usize;
+        if self.progress.len() < 16 {
+            // Fixed-size stack buffer avoiding heap allocation for cluster sizes <= 16
+            let mut matches = [LogIndex::from_raw(0); 16];
+            let mut count = 0usize;
 
-        for p in self.progress.values() {
+            for peer_progress in self.progress.values() {
+                if count < matches.len() {
+                    matches[count] = peer_progress.match_index;
+                    count += 1;
+                }
+            }
             if count < matches.len() {
-                matches[count] = p.match_index;
+                matches[count] = self.leader_persisted_index;
                 count += 1;
             }
-        }
-        if count < matches.len() {
-            matches[count] = self.leader_persisted_index;
-            count += 1;
-        }
 
-        let active_matches = &mut matches[..count];
-        active_matches.sort_unstable();
+            let active_matches = &mut matches[..count];
+            active_matches.sort_unstable();
+            self.commit_from_sorted_matches(active_matches, output);
+        } else {
+            let mut matches: Vec<LogIndex> = self
+                .progress
+                .values()
+                .map(|peer| peer.match_index)
+                .collect();
+            matches.push(self.leader_persisted_index);
+            matches.sort_unstable();
+            self.commit_from_sorted_matches(&mut matches, output);
+        }
+    }
 
+    fn commit_from_sorted_matches(&mut self, active_matches: &mut [LogIndex], output: &mut Output) {
         let quorum = self.config.quorum_size();
+        let count = active_matches.len();
         if count >= quorum {
             let median_pos = count - quorum;
             let median_commit = active_matches[median_pos];
@@ -815,10 +811,6 @@ impl RaftCore {
             }
         }
     }
-
-    // ------------------------------------------------------------------------
-    // Heartbeats & Linearizable ReadIndex
-    // ------------------------------------------------------------------------
 
     fn broadcast_heartbeat(&mut self, output: &mut Output) {
         for &peer in &self.config.peers {
@@ -927,7 +919,6 @@ impl RaftCore {
         }
 
         if self.config.peers.is_empty() {
-            // Single node cluster: immediately linearizable
             output.completed_reads.push(ReadIndexResult {
                 context,
                 read_index: self.commit_index,
@@ -958,10 +949,6 @@ impl RaftCore {
         }
     }
 
-    // ------------------------------------------------------------------------
-    // Leadership Transfer
-    // ------------------------------------------------------------------------
-
     fn handle_transfer_leader(&mut self, to: NodeId, output: &mut Output) {
         if self.role != Role::Leader || to == self.config.node_id {
             return;
@@ -969,9 +956,8 @@ impl RaftCore {
 
         self.lead_transferee = Some(to);
 
-        if let Some(prog) = self.progress.get(&to) {
-            if prog.match_index >= self.log.last_index() {
-                // Follower is already up to date: trigger TimeoutNow immediately
+        if let Some(peer) = self.progress.get(&to) {
+            if peer.match_index >= self.log.last_index() {
                 output.messages.push(OutboundMessage {
                     to,
                     message: Message::TimeoutNow {
@@ -981,7 +967,6 @@ impl RaftCore {
                 });
                 self.lead_transferee = None;
             } else {
-                // Catch up transferee log
                 self.broadcast_append_entries(output);
             }
         }
@@ -992,10 +977,6 @@ impl RaftCore {
             self.start_election(output);
         }
     }
-
-    // ------------------------------------------------------------------------
-    // Persistence Callbacks
-    // ------------------------------------------------------------------------
 
     fn handle_persisted(&mut self, token: PersistToken, output: &mut Output) {
         if let Some(pos) = self.pending_persists.iter().position(|(t, _)| *t == token) {
@@ -1019,10 +1000,6 @@ impl RaftCore {
             self.applied_index = index;
         }
     }
-
-    // ------------------------------------------------------------------------
-    // Message Dispatch
-    // ------------------------------------------------------------------------
 
     fn handle_message(&mut self, from: NodeId, message: Message, output: &mut Output) {
         match message {
@@ -1113,10 +1090,6 @@ impl RaftCore {
         }
     }
 
-    // ------------------------------------------------------------------------
-    // Helpers
-    // ------------------------------------------------------------------------
-
     fn transition_role(&mut self, new_role: Role, output: &mut Output) {
         if self.role != new_role {
             output.role_changes.push(RoleChangeEvent {
@@ -1177,6 +1150,9 @@ impl RaftCore {
 
     /// Draws an unbiased randomized election timeout in `[base_ticks, 2 * base_ticks]`
     /// using Lemire's nearly divisionless algorithm.
+    ///
+    /// The sampler duplicates `DetRng::gen_range` on purpose: `anvil-raft` sits below
+    /// `anvil-sim` in the crate DAG and cannot depend on it (ADR 0004).
     #[allow(clippy::cast_possible_truncation)]
     fn sample_random_timeout(base_ticks: u64, rng: &mut ChaCha8Rng) -> u64 {
         let low = base_ticks;

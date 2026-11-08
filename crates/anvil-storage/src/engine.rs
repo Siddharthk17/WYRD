@@ -3,7 +3,7 @@
 //! Sans-IO Storage Engine with natural batching group commit and crash recovery.
 
 use crate::config::StorageConfig;
-use crate::device::{DeviceCompletion, DeviceOp, FileId, SectorSize};
+use crate::device::{CompletionPayload, DeviceCompletion, DeviceOp, FileId, SectorSize};
 use crate::error::StorageError;
 use crate::format::hard_state::{HardStateRecoveryOutcome, HardStateSlot, recover_hard_state};
 use crate::format::wal::{
@@ -12,6 +12,7 @@ use crate::format::wal::{
 use crate::recovery::{LogRecoveryClassification, RecoveredLog, RecoveredStorageState};
 use anvil_types::{Entry, LogIndex, NodeId, Term};
 use bytes::Bytes;
+use std::collections::VecDeque;
 
 /// Input events fed into `StorageEngine::step`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,11 +46,6 @@ pub enum EngineInput {
     },
     /// Completion event returned by the underlying abstract `Device`.
     Completion(DeviceCompletion),
-    /// Request log compaction / snapshot retention up to `compact_index`.
-    CompactLog {
-        /// Boundary up to which earlier log records may be purged.
-        compact_index: LogIndex,
-    },
 }
 
 /// Output actions produced by `StorageEngine::step`.
@@ -67,6 +63,40 @@ impl EngineOutput {
         self.device_ops.clear();
         self.persisted_tokens.clear();
     }
+}
+
+/// A hard-state update whose sync has been submitted but not yet verified.
+#[derive(Debug, Clone)]
+struct HardStateSync {
+    /// Device op id of the `Fdatasync` that persists this update.
+    sync_op_id: u64,
+    /// Token to acknowledge once the update is verified durable.
+    token: u64,
+    /// Slot index the update was written to.
+    slot: u16,
+    /// Sequence number written with the update.
+    sequence_no: u64,
+    /// Term written with the update.
+    term: Term,
+    /// Vote written with the update.
+    vote: Option<NodeId>,
+}
+
+/// A hard-state verification read awaiting comparison against the written values.
+#[derive(Debug, Clone)]
+struct HardStateVerify {
+    /// Device op id of the verification `Read`.
+    read_op_id: u64,
+    /// Token to acknowledge once verification succeeds.
+    token: u64,
+    /// Slot index the update was written to.
+    slot: u16,
+    /// Expected sequence number.
+    sequence_no: u64,
+    /// Expected term.
+    term: Term,
+    /// Expected vote.
+    vote: Option<NodeId>,
 }
 
 /// Sans-IO consensus storage engine.
@@ -89,12 +119,12 @@ pub struct StorageEngine {
     last_record_crc: u32,
 
     // Natural batching group commit state (WAL)
-    wal_sync_in_flight: bool,
-    in_flight_wal_sync_op_id: Option<u64>,
-    in_flight_wal_tokens: Vec<u64>,
+    in_flight_wal_syncs: VecDeque<(u64, Vec<u64>)>,
 
-    // In-flight hard state sync operations (op_id, token)
-    hard_state_sync_tokens: Vec<(u64, u64)>,
+    // In-flight hard state sync operations awaiting verification reads
+    hard_state_syncs: Vec<HardStateSync>,
+    // In-flight hard state verification reads awaiting comparison
+    hard_state_verifies: Vec<HardStateVerify>,
 
     // Pending coalesced batch (while sync is in flight)
     pending_tokens: Vec<u64>,
@@ -141,10 +171,9 @@ impl StorageEngine {
             last_entry_index: recovered.log.last_index,
             last_entry_term: recovered.log.last_term,
             last_record_crc,
-            wal_sync_in_flight: false,
-            in_flight_wal_sync_op_id: None,
-            in_flight_wal_tokens: Vec::with_capacity(64),
-            hard_state_sync_tokens: Vec::with_capacity(4),
+            in_flight_wal_syncs: VecDeque::new(),
+            hard_state_syncs: Vec::with_capacity(4),
+            hard_state_verifies: Vec::with_capacity(4),
             pending_tokens: Vec::with_capacity(64),
             pending_write_buffer: Vec::with_capacity(64 * 1024),
             pending_write_start_offset: segment_write_offset,
@@ -177,10 +206,9 @@ impl StorageEngine {
             last_entry_index: LogIndex::from_raw(0),
             last_entry_term: Term::from_raw(0),
             last_record_crc: dummy_header.header_crc,
-            wal_sync_in_flight: false,
-            in_flight_wal_sync_op_id: None,
-            in_flight_wal_tokens: Vec::with_capacity(64),
-            hard_state_sync_tokens: Vec::with_capacity(4),
+            in_flight_wal_syncs: VecDeque::new(),
+            hard_state_syncs: Vec::with_capacity(4),
+            hard_state_verifies: Vec::with_capacity(4),
             pending_tokens: Vec::with_capacity(64),
             pending_write_buffer: Vec::with_capacity(64 * 1024),
             pending_write_start_offset: sector_size.as_u64(),
@@ -258,9 +286,6 @@ impl StorageEngine {
             EngineInput::Completion(completion) => {
                 self.handle_completion(&completion, output);
             }
-            EngineInput::CompactLog { compact_index } => {
-                self.handle_compact_log(compact_index, output);
-            }
         }
     }
 
@@ -299,7 +324,14 @@ impl StorageEngine {
             op_id: sync_op_id,
             file_id: FileId::HARD_STATE,
         });
-        self.hard_state_sync_tokens.push((sync_op_id, token));
+        self.hard_state_syncs.push(HardStateSync {
+            sync_op_id,
+            token,
+            slot: target_slot_u16,
+            sequence_no: self.hard_state_seq,
+            term,
+            vote,
+        });
     }
 
     fn handle_append_entries(
@@ -315,10 +347,10 @@ impl StorageEngine {
         );
 
         if entries.is_empty() {
-            if self.wal_sync_in_flight {
-                self.pending_tokens.push(token);
-            } else {
+            if self.in_flight_wal_syncs.is_empty() {
                 output.persisted_tokens.push(token);
+            } else {
+                self.pending_tokens.push(token);
             }
             return;
         }
@@ -358,7 +390,7 @@ impl StorageEngine {
         self.pending_tokens.push(token);
 
         // Natural batching: if no sync is in flight, flush immediately
-        if !self.wal_sync_in_flight {
+        if self.in_flight_wal_syncs.is_empty() {
             self.flush_pending_batch(output);
         }
     }
@@ -434,10 +466,8 @@ impl StorageEngine {
     }
 
     fn flush_pending_batch(&mut self, output: &mut EngineOutput) {
-        if self.pending_write_buffer.is_empty() && self.pending_tokens.is_empty() {
-            return;
-        }
-
+        // Callers guarantee a non-empty batch: staged appends always carry
+        // data or tokens, so an empty flush would only emit a useless sync.
         if !self.pending_write_buffer.is_empty() {
             let write_op_id = self.next_op_id();
             let batch_bytes = Bytes::copy_from_slice(&self.pending_write_buffer);
@@ -448,6 +478,7 @@ impl StorageEngine {
                 data: batch_bytes,
             });
             self.pending_write_buffer.clear();
+            self.pending_write_start_offset = self.segment_write_offset;
         }
 
         let sync_op_id = self.next_op_id();
@@ -456,46 +487,82 @@ impl StorageEngine {
             file_id: self.active_segment_file_id,
         });
 
-        self.wal_sync_in_flight = true;
-        self.in_flight_wal_sync_op_id = Some(sync_op_id);
-        self.in_flight_wal_tokens.append(&mut self.pending_tokens);
+        self.in_flight_wal_syncs
+            .push_back((sync_op_id, std::mem::take(&mut self.pending_tokens)));
     }
 
     fn handle_completion(&mut self, completion: &DeviceCompletion, output: &mut EngineOutput) {
-        // Enforce ADR 0013: Fail-Fast Crash on Any Sync Error, NEVER retry!
-        assert!(
-            completion.result.is_ok(),
-            "FATAL: storage sync operation failed under ADR 0013 (no retry)"
-        );
-
-        // 1. Check if completion is for a HardState sync
-        if let Some(pos) = self
-            .hard_state_sync_tokens
-            .iter()
-            .position(|&(op, _)| op == completion.op_id)
-        {
-            let (_, token) = self.hard_state_sync_tokens.remove(pos);
-            output.persisted_tokens.push(token);
+        if let Err(e) = &completion.result {
+            self.fatal_error = Some(e.clone());
             return;
         }
 
-        // 2. Check if completion is for active WAL fdatasync
-        if Some(completion.op_id) == self.in_flight_wal_sync_op_id {
-            output
-                .persisted_tokens
-                .append(&mut self.in_flight_wal_tokens);
-            self.wal_sync_in_flight = false;
-            self.in_flight_wal_sync_op_id = None;
+        if let Some(pos) = self
+            .hard_state_syncs
+            .iter()
+            .position(|entry| entry.sync_op_id == completion.op_id)
+        {
+            let sync = self.hard_state_syncs.remove(pos);
+            let read_op_id = self.next_op_id();
+            output.device_ops.push(DeviceOp::Read {
+                op_id: read_op_id,
+                file_id: FileId::HARD_STATE,
+                offset: (u64::from(sync.slot)) * self.config.sector_size.as_u64(),
+                len: self.config.sector_size.as_usize(),
+            });
+            self.hard_state_verifies.push(HardStateVerify {
+                read_op_id,
+                token: sync.token,
+                slot: sync.slot,
+                sequence_no: sync.sequence_no,
+                term: sync.term,
+                vote: sync.vote,
+            });
+            return;
+        }
 
-            // Coalesced natural batching: flush any writes that queued while sync was in flight
+        if let Some(pos) = self
+            .hard_state_verifies
+            .iter()
+            .position(|entry| entry.read_op_id == completion.op_id)
+        {
+            let verify = self.hard_state_verifies.remove(pos);
+            let verified = match &completion.result {
+                Ok(CompletionPayload::Read(bytes)) => {
+                    HardStateSlot::decode(bytes, verify.slot, self.config.sector_size).is_ok_and(
+                        |slot| {
+                            slot.sequence_no == verify.sequence_no
+                                && slot.term == verify.term
+                                && slot.voted_for == verify.vote
+                        },
+                    )
+                }
+                _ => false,
+            };
+            if verified {
+                output.persisted_tokens.push(verify.token);
+            } else {
+                self.fatal_error = Some(StorageError::DeviceError(
+                    "hard-state read-back verification failed".to_string(),
+                ));
+            }
+            return;
+        }
+
+        if let Some(pos) = self
+            .in_flight_wal_syncs
+            .iter()
+            .position(|&(op, _)| op == completion.op_id)
+        {
+            if let Some((_, tokens)) = self.in_flight_wal_syncs.remove(pos) {
+                output.persisted_tokens.extend(tokens);
+            }
+
+            // Coalesced natural batching: flush writes queued while syncs were in flight
             if !self.pending_write_buffer.is_empty() || !self.pending_tokens.is_empty() {
                 self.flush_pending_batch(output);
             }
         }
-    }
-
-    fn handle_compact_log(&mut self, compact_index: LogIndex, _output: &mut EngineOutput) {
-        let _ = (self.config.segment_capacity_bytes, compact_index);
     }
 
     /// Pure sans-IO crash recovery scanner.
@@ -556,14 +623,8 @@ impl StorageEngine {
                         break;
                     }
                     WalScanResult::Corrupted(_) => {
-                        // Check whether corruption is at the tail or mid-log
-                        let remainder = &seg_bytes[offset + sector_len..];
-                        let has_valid_after = has_valid_records_ahead(
-                            remainder,
-                            sector_size,
-                            seg_hdr.segment_id,
-                            (offset + sector_len) as u64,
-                        );
+                        let remainder = seg_bytes.get(offset + sector_len..).unwrap_or(&[]);
+                        let has_valid_after = has_valid_records_ahead(remainder, sector_size);
 
                         if has_valid_after {
                             classification = LogRecoveryClassification::MidLogCorruption {
@@ -600,35 +661,29 @@ impl StorageEngine {
     }
 }
 
-/// Helper function to determine if any valid record exists ahead of a corrupted sector.
-fn has_valid_records_ahead(
-    buf: &[u8],
-    sector_size: SectorSize,
-    _segment_id: u64,
-    _offset: u64,
-) -> bool {
+/// Scans sectors following a corrupt record for any structurally valid record header.
+///
+/// A structurally valid header (non-zero index, known kind, sane length) is treated
+/// as evidence of mid-log corruption, which is the conservative classification: the
+/// node is sidelined for repair instead of truncating data that might be committed.
+/// Term 0 is accepted because leaders append no-op entries at term 0 on election.
+fn has_valid_records_ahead(buf: &[u8], sector_size: SectorSize) -> bool {
     let sector_len = sector_size.as_usize();
     let mut cur = 0;
 
     while cur + sector_len <= buf.len() {
         let slice = &buf[cur..];
-        // If the sector is not completely zeroes, inspect record header structure
         if !slice[..sector_len].iter().all(|&b| b == 0)
             && slice.len() >= WAL_RECORD_HEADER_FIXED_LEN
         {
             let raw_index = u64::from_le_bytes([
                 slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
             ]);
-            let raw_term = u64::from_le_bytes([
-                slice[8], slice[9], slice[10], slice[11], slice[12], slice[13], slice[14],
-                slice[15],
-            ]);
             let payload_len =
                 u32::from_le_bytes([slice[16], slice[17], slice[18], slice[19]]) as usize;
             let kind_byte = slice[20];
 
             if raw_index > 0
-                && raw_term > 0
                 && (kind_byte == 0 || kind_byte == 1)
                 && payload_len <= 16 * 1024 * 1024
             {

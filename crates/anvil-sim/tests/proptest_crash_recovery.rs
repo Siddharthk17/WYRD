@@ -281,7 +281,6 @@ proptest! {
         let mut cluster = SimCluster::new(3, seed);
         let node_ids: Vec<NodeId> = cluster.nodes.keys().copied().collect();
 
-        // 1. Elect leader
         for _ in 0..20 {
             cluster.tick();
         }
@@ -294,7 +293,6 @@ proptest! {
             }
         }
 
-        // 2. Perform sequence of crashes and restarts
         for n in crashes {
             let target_node = node_ids[(n as usize) % node_ids.len()];
             cluster.crash_node(target_node);
@@ -303,7 +301,6 @@ proptest! {
             cluster.tick_n(5);
         }
 
-        // 3. Invariants are continuously asserted on every node step and restart
         cluster.checker.check_invariants(&cluster.nodes);
     }
 }

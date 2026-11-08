@@ -21,7 +21,10 @@ pub use buggify::{
 };
 pub use cluster::{InFlightPacket, SimCluster, SimNodeStorage};
 pub use device::{FileState, SimDevice, SimDeviceConfig, SimDeviceStats, StorageFaultAtlas};
-pub use farm::{FarmResult, run_farm_seed, run_seed_farm};
+pub use farm::{
+    FarmResult, run_farm_seed, run_farm_seed_with_storage_faults, run_seed_farm,
+    run_seed_farm_with_storage_faults,
+};
 pub use kernel::{Actor, ActorContext, SimError, SimKernel, SimReport};
 pub use queue::{BinaryHeapEventQueue, EventQueue, HierarchicalTimingWheel, ScheduledEvent};
 pub use raft_invariants::{InvariantViolation, RaftInvariantChecker};

@@ -35,8 +35,8 @@ impl RaftLog {
     #[must_use]
     pub fn new(entries: Vec<Entry>) -> Self {
         let mut hasher = blake3::Hasher::new();
-        for e in &entries {
-            Self::hash_entry(&mut hasher, e);
+        for entry in &entries {
+            Self::hash_entry(&mut hasher, entry);
         }
         Self { entries, hasher }
     }
@@ -58,13 +58,15 @@ impl RaftLog {
     pub fn last_index(&self) -> LogIndex {
         self.entries
             .last()
-            .map_or(LogIndex::from_raw(0), |e| e.index)
+            .map_or(LogIndex::from_raw(0), |entry| entry.index)
     }
 
     /// Returns the term of the highest log index, or 0 if empty.
     #[must_use]
     pub fn last_term(&self) -> Term {
-        self.entries.last().map_or(Term::from_raw(0), |e| e.term)
+        self.entries
+            .last()
+            .map_or(Term::from_raw(0), |entry| entry.term)
     }
 
     /// Returns the term of the entry at `index`, or `Some(Term(0))` if `index == 0`.
@@ -74,10 +76,10 @@ impl RaftLog {
             return Some(Term::from_raw(0));
         }
         let raw = index.as_u64();
-        if raw == 0 || raw > self.entries.len() as u64 {
+        if raw > self.entries.len() as u64 {
             return None;
         }
-        self.entries.get((raw - 1) as usize).map(|e| e.term)
+        self.entries.get((raw - 1) as usize).map(|entry| entry.term)
     }
 
     /// Returns a reference to the entry at `index`.
@@ -104,14 +106,14 @@ impl RaftLog {
         if did_truncate {
             self.entries.truncate(target_len);
             let mut hasher = blake3::Hasher::new();
-            for e in &self.entries {
-                Self::hash_entry(&mut hasher, e);
+            for existing in &self.entries {
+                Self::hash_entry(&mut hasher, existing);
             }
             self.hasher = hasher;
         }
-        for e in new_entries {
-            Self::hash_entry(&mut self.hasher, &e);
-            self.entries.push(e);
+        for entry in new_entries {
+            Self::hash_entry(&mut self.hasher, &entry);
+            self.entries.push(entry);
         }
     }
 
@@ -123,19 +125,19 @@ impl RaftLog {
             return Vec::new();
         }
         let start_idx = (raw - 1) as usize;
-        let mut result = Vec::new();
+        let mut sliced = Vec::new();
         let mut accum_bytes = 0usize;
 
         for entry in &self.entries[start_idx..] {
             let entry_size = entry.payload.len() + 32; // payload + header estimate
-            if !result.is_empty() && accum_bytes + entry_size > max_bytes {
+            if !sliced.is_empty() && accum_bytes + entry_size > max_bytes {
                 break;
             }
-            result.push(entry.clone());
+            sliced.push(entry.clone());
             accum_bytes += entry_size;
         }
 
-        result
+        sliced
     }
 
     /// Finds the first index in the log having the specified `term`.

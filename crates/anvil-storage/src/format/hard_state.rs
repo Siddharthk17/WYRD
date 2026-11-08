@@ -120,9 +120,7 @@ impl HardStateSlot {
 
         let slot_index = u16::from_le_bytes([buf[10], buf[11]]);
         if slot_index != expected_slot_index {
-            return Err(StorageError::CrcMismatch {
-                expected: u32::from(expected_slot_index),
-                computed: u32::from(slot_index),
+            return Err(StorageError::InvalidField {
                 context: "hard_state_slot_index",
             });
         }
@@ -141,15 +139,13 @@ impl HardStateSlot {
 
         let voted_for = match has_vote {
             0 => None,
-            1 => Some(NodeId::new(raw_voted_for).ok_or(StorageError::CrcMismatch {
-                expected: 0,
-                computed: 1,
-                context: "hard_state_zero_node_id",
-            })?),
+            1 => Some(
+                NodeId::new(raw_voted_for).ok_or(StorageError::InvalidField {
+                    context: "hard_state_zero_node_id",
+                })?,
+            ),
             _ => {
-                return Err(StorageError::CrcMismatch {
-                    expected: 0,
-                    computed: u32::from(has_vote),
+                return Err(StorageError::InvalidField {
                     context: "hard_state_has_vote_invalid",
                 });
             }

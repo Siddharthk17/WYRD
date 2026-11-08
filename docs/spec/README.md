@@ -32,7 +32,7 @@ The specification verifies seven core Raft safety invariants:
 
 ## Model Checking Configuration
 
-The primary configuration ([anvil_raft.cfg](file:///mnt/data2/WYRD/specs/anvil_raft.cfg)) defines:
+The primary configuration ([anvil_raft.cfg](anvil_raft.cfg)) defines:
 - **Servers**: 3 nodes (`{s1, s2, s3}`)
 - **Max Term**: 3
 - **Max Log Length**: 3
@@ -41,7 +41,7 @@ The primary configuration ([anvil_raft.cfg](file:///mnt/data2/WYRD/specs/anvil_r
 
 ### Negative Counterexample Configuration (Figure 8)
 
-The negative configuration ([anvil_raft_negative.cfg](file:///mnt/data2/WYRD/specs/anvil_raft_negative.cfg)) disables the current-term commit rule:
+The negative configuration ([anvil_raft_negative.cfg](anvil_raft_negative.cfg)) disables the current-term commit rule:
 - **`RequireCurrentTermCommit = FALSE`**
 
 When this rule is disabled, a leader in term 3 directly commits an entry from term 2 because it has been replicated onto a majority. A partitioned node with a higher term then gets elected and overwrites that entry, violating `StateMachineSafety` and `CommittedEntriesNeverLost`. TLC detects this counterexample and reports an invariant violation, proving that the spec accurately reproduces the classic Figure 8 scenario.
