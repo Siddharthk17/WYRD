@@ -161,7 +161,7 @@ fn test_wal_frame_rejects_bad_inputs() {
     bad_kind[20] = 9;
     assert!(matches!(
         decode_wal_frame(&bad_kind, sector(), 0x1234, 1, 512),
-        WalScanResult::Corrupted(StorageError::CrcMismatch { .. })
+        WalScanResult::Corrupted(StorageError::InvalidField { .. })
     ));
 
     let mut truncated = encoded.clone();

@@ -13,7 +13,7 @@
 - Pinned Rust toolchain 1.99.0 with edition 2024 in `rust-toolchain.toml`.
 - Configured `.cargo/config.toml`, `clippy.toml`, `deny.toml`, and `rustfmt.toml`.
 - Enforced `#![forbid(unsafe_code)]` across all 14 workspace crates.
-- Documented Architecture Decision Records [0001](file:///mnt/data2/WYRD/docs/adr/0001-workspace-crate-boundaries.md) through [0008](file:///mnt/data2/WYRD/docs/adr/0008-test-counting-allocator.md).
+- Documented Architecture Decision Records [0001](../adr/0001-sans-io-core.md) through [0008](../adr/0008-test-counting-allocator.md).
 
 ### B. Hand-Written Binary Codec & Types (`anvil-types`)
 - Domain newtypes (`NodeId`, `Term`, `LogIndex`, `GroupId`, `ClusterId`, `SessionId`, `SeqNo`) with checked monotonic arithmetic and zero-cost abstraction.
@@ -50,7 +50,7 @@
 - Negative test fixture proving that introducing non-deterministic iteration order (via standard `HashMap`) causes the gate to fail immediately.
 
 ### F. Performance Budgets & Zero-Allocation Harness
-- Test-only counting global allocator ([ADR 0008](file:///mnt/data2/WYRD/docs/adr/0008-test-counting-allocator.md)) in `crates/anvil-types/tests/allocation_test.rs` proving **zero heap allocations** for 1 KiB entry and frame decodes in steady state.
+- Test-only counting global allocator ([ADR 0008](../adr/0008-test-counting-allocator.md)) in `crates/anvil-types/tests/allocation_test.rs` proving **zero heap allocations** for 1 KiB entry and frame decodes in steady state.
 - Performance budgets specification and measurement baseline in `docs/perf/BUDGETS.md` ratcheting 80% budgets against real hardware.
 - Standalone benchmark and budget verification CLI `anvil-bench` and `cargo xtask bench`.
 
@@ -233,14 +233,14 @@ Benchmarking Simulation Kernel (1 Core Simulated Throughput)...
 
 ## 4. Architecture Decisions Taken
 
-- [ADR 0001: Workspace Crate Hierarchy and Boundaries](file:///mnt/data2/WYRD/docs/adr/0001-workspace-crate-boundaries.md)
-- [ADR 0002: Rust Toolchain and Edition Selection](file:///mnt/data2/WYRD/docs/adr/0002-toolchain-and-edition.md)
-- [ADR 0003: Continuous Integration and Gate Automation via xtask](file:///mnt/data2/WYRD/docs/adr/0003-xtask-ci-automation.md)
-- [ADR 0004: Strict Sans-IO and Determinism Lints](file:///mnt/data2/WYRD/docs/adr/0004-determinism-lint-enforcement.md)
-- [ADR 0005: Hand-written Binary Codec over Serde](file:///mnt/data2/WYRD/docs/adr/0005-handwritten-binary-codec.md)
-- [ADR 0006: Fuzz Testing Strategy with Seed Corpora](file:///mnt/data2/WYRD/docs/adr/0006-fuzz-testing-strategy.md)
-- [ADR 0007: Event Queue Data Structure Selection](file:///mnt/data2/WYRD/docs/adr/0007-event-queue-data-structure.md)
-- [ADR 0008: Counting Allocator for Zero-Allocation Hot Path Verification](file:///mnt/data2/WYRD/docs/adr/0008-test-counting-allocator.md)
+- [ADR 0001: Sans-IO Core Architecture](../adr/0001-sans-io-core.md)
+- [ADR 0002: Determinism Rules and Forbidden APIs](../adr/0002-determinism-rules.md)
+- [ADR 0003: RNG Discipline and Stream Derivation](../adr/0003-rng-discipline.md)
+- [ADR 0004: Crate Layering and Dependency Direction](../adr/0004-crate-layering.md)
+- [ADR 0005: Assertion Policy and Error Handling](../adr/0005-assertion-policy.md)
+- [ADR 0006: Prior Art and Architecture Differentiators](../adr/0006-prior-art-and-differentiators.md)
+- [ADR 0007: Event Queue Data Structure Selection](../adr/0007-event-queue-data-structure.md)
+- [ADR 0008: Counting Allocator for Zero-Allocation Hot Path Verification](../adr/0008-test-counting-allocator.md)
 
 ---
 

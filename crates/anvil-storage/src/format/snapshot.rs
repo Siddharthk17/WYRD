@@ -186,8 +186,13 @@ pub struct SnapshotChunk {
 
 impl SnapshotChunk {
     /// Encodes chunk header and payload into an output buffer.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn encode(&self, out: &mut Vec<u8>) {
-        let payload_len = u32::try_from(self.payload.len()).unwrap_or(u32::MAX);
+        assert!(
+            u32::try_from(self.payload.len()).is_ok(),
+            "snapshot chunk exceeds u32 range"
+        );
+        let payload_len = self.payload.len() as u32;
         let chunk_crc = crc32c::crc32c(&self.payload);
 
         let mut header = [0u8; SNAPSHOT_CHUNK_HEADER_LEN];

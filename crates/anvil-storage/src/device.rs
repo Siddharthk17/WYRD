@@ -243,6 +243,12 @@ pub struct DeviceCompletion {
 /// Both `SimDevice` (in `anvil-sim`) and `FsDevice` (in `anvil-device-fs`) implement this trait.
 pub trait Device: Send {
     /// Submits an asynchronous operation to the device.
+    ///
+    /// Operations targeting the same file apply in submission order:
+    /// `SimDevice` executes each op synchronously at submit time and only
+    /// delays its completion, while `FsDevice` drains a single FIFO queue on
+    /// its I/O thread. The engine relies on this when it emits `Truncate`
+    /// before the replacement `Write` and `Fdatasync`.
     fn submit(&mut self, op: DeviceOp);
 
     /// Polls for the next completed operation, if any.

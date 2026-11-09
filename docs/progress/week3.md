@@ -9,21 +9,21 @@
 ## 1. What Shipped
 
 ### A. Storage Fault Model & Survivability Invariants (`docs/storage-fault-model.md`)
-- Complete storage fault model in [docs/storage-fault-model.md](file:///mnt/data2/WYRD/docs/storage-fault-model.md) defining ANVIL's disk contracts and survivability rules:
+- Complete storage fault model in [docs/storage-fault-model.md](../storage-fault-model.md) defining ANVIL's disk contracts and survivability rules:
   - Crash fault semantics: unsynced writes in volatile cache are lost, reordered, or partially applied on crash.
   - Torn writes: sector-granularity torn writes (tested at 512-byte and 4096-byte boundaries).
   - Data corruption: bit rot, read/write bit flips, latent sector errors (EIO on read).
   - Storage exhaustion: ENOSPC, directory sync semantics, and fail-fast fsync error handling.
   - Survivability rule: the simulated fault injector never destroys every valid copy of a committed entry on a majority of nodes simultaneously, upholding Raft quorum invariants.
-- Documented in [ADR 0011: Storage Fault Model and Survivability Invariants](file:///mnt/data2/WYRD/docs/adr/0011-storage-fault-model.md).
+- Documented in [ADR 0011: Storage Fault Model and Survivability Invariants](../adr/0011-storage-fault-model.md).
 
 ### B. On-Disk Binary Formats (`docs/formats/` & `anvil-storage`)
 - Sector-aligned, deterministic on-disk format specifications with exact byte layouts:
-  - **WAL Segment Format** ([docs/formats/wal-segment.md](file:///mnt/data2/WYRD/docs/formats/wal-segment.md)): 512/4096-byte header with magic `0x414E56494C5F5741` (`ANVIL_WA`), format version 1, sector size, segment ID, first index, previous term, and chained CRC32C. 25-byte fixed record frame headers with chained CRC32C covering previous CRC, segment ID, file offset, index, term, kind, and payload. Zero padding validated on read to detect misdirected writes and torn sectors.
-  - **Hard State Format** ([docs/formats/hard-state.md](file:///mnt/data2/WYRD/docs/formats/hard-state.md)): Two alternating sector slots (Slot 0 and Slot 1) with monotonically increasing sequence numbers and CRC32C, eliminating file renames for term/vote updates.
-  - **Snapshot Format** ([docs/formats/snapshot.md](file:///mnt/data2/WYRD/docs/formats/snapshot.md)): Temporary file write, per-chunk CRC32C, blake3 whole-file footer, atomic rename, and directory fsync.
+  - **WAL Segment Format** ([docs/formats/wal.md](../formats/wal.md)): 512/4096-byte header with magic `ANVILWAL` (`0x41 0x4E 0x56 0x49 0x4C 0x57 0x41 0x4C`), format version 1, sector size, segment ID, first index, previous term, and chained CRC32C. 25-byte fixed record frame headers with chained CRC32C covering previous CRC, segment ID, file offset, index, term, kind, and payload. Zero padding validated on read to detect misdirected writes and torn sectors.
+  - **Hard State Format** ([docs/formats/hard-state.md](../formats/hard-state.md)): Two alternating sector slots (Slot 0 and Slot 1) with monotonically increasing sequence numbers and CRC32C, eliminating file renames for term/vote updates.
+  - **Snapshot Format** ([docs/formats/snapshot.md](../formats/snapshot.md)): Temporary file write, per-chunk CRC32C, blake3 whole-file footer, atomic rename, and directory fsync.
 - Pure Rust codecs in `crates/anvil-storage/src/format/` strictly adhering to `#![forbid(unsafe_code)]` and `#![deny(clippy::disallowed_methods, clippy::disallowed_types)]`.
-- Documented in [ADR 0012: On-Disk Storage Formats and Atomic State Transitions](file:///mnt/data2/WYRD/docs/adr/0012-on-disk-storage-formats.md).
+- Documented in [ADR 0012: On-Disk Storage Formats and Atomic State Transitions](../adr/0012-on-disk-storage-formats.md).
 
 ### C. Sans-IO Storage Engine (`anvil-storage`)
 - Pure sans-IO storage engine in `crates/anvil-storage/src/engine.rs`:
@@ -33,10 +33,10 @@
   - Automatic segment preallocation and rotation upon reaching capacity bounds.
   - Directory fsyncs enforced after every file create, rename, and unlink.
   - Fail-fast fsync policy: any fsync failure immediately crashes the process to prevent split-brain states.
-- Documented in [ADR 0013: Sans-IO Storage Engine and Fail-Fast Fsync Policy](file:///mnt/data2/WYRD/docs/adr/0013-sans-io-storage-engine.md).
+- Documented in [ADR 0013: Sans-IO Storage Engine and Fail-Fast Fsync Policy](../adr/0013-sans-io-storage-engine.md).
 
 ### D. Crash Recovery with 4-Way Classification
-- Robust crash recovery scanner (`StorageEngine::scan_recovery`):
+- Crash recovery scanner (`StorageEngine::scan_recovery`):
   - **Clean**: All segments and records validate with correct chained CRC32C up to end of file.
   - **TornTail**: A corrupted or unwritten sector at the tail of the active log without subsequent valid records; engine truncates the torn tail and resumes.
   - **MidLogCorruption**: Corrupted record followed by subsequent valid records; node is marked `NeedsRepair`, barred from voting or leading, and awaits peer log repair.
@@ -318,9 +318,9 @@ All 7 fuzz targets compiled and verified with checked-in corpora.
 
 ## 4. Architecture Decisions Taken
 
-- [ADR 0011: Storage Fault Model and Survivability Invariants](file:///mnt/data2/WYRD/docs/adr/0011-storage-fault-model.md)
-- [ADR 0012: On-Disk Storage Formats and Atomic State Transitions](file:///mnt/data2/WYRD/docs/adr/0012-on-disk-storage-formats.md)
-- [ADR 0013: Sans-IO Storage Engine and Fail-Fast Fsync Policy](file:///mnt/data2/WYRD/docs/adr/0013-sans-io-storage-engine.md)
+- [ADR 0011: Storage Fault Model and Survivability Invariants](../adr/0011-storage-fault-model.md)
+- [ADR 0012: On-Disk Storage Formats and Atomic State Transitions](../adr/0012-on-disk-storage-formats.md)
+- [ADR 0013: Sans-IO Storage Engine and Fail-Fast Fsync Policy](../adr/0013-sans-io-storage-engine.md)
 
 ---
 

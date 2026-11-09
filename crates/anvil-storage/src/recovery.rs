@@ -27,6 +27,29 @@ pub enum LogRecoveryClassification {
     },
 }
 
+/// Byte-exact placement of one verified WAL frame, recorded during recovery scan.
+///
+/// The scanner observes the true on-disk layout, so replays never have to
+/// guess it: a later truncation rewinds to these offsets and chained CRC
+/// seeds instead of recomputing them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FramePlacement {
+    /// Log index stored in the frame.
+    pub index: LogIndex,
+    /// Segment file holding the frame.
+    pub seg_id: u64,
+    /// Byte offset of the frame start within the segment.
+    pub offset: u64,
+    /// Chained CRC seed the frame was verified against.
+    pub crc_before: u32,
+    /// Chained CRC seed after the frame.
+    pub crc_after: u32,
+    /// Raft term stored in the frame.
+    pub term: Term,
+    /// Total sector-aligned frame length in bytes.
+    pub frame_len: usize,
+}
+
 /// Recovered log entries and classification status.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveredLog {
@@ -38,6 +61,8 @@ pub struct RecoveredLog {
     pub last_term: Term,
     /// Detailed classification of the recovery scan.
     pub classification: LogRecoveryClassification,
+    /// Byte-exact placement of every recovered frame, in index order.
+    pub placements: Vec<FramePlacement>,
 }
 
 impl RecoveredLog {

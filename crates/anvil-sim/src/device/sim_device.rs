@@ -11,6 +11,11 @@
 //! - Write reordering prior to fsync
 //! - Read/write bit-rot and latent sector errors (EIO)
 //! - Storage Fault Atlas integration enforcing the Quorum Survivability Rule
+//!
+//! Normal `Read` operations observe the volatile page cache, matching
+//! read-your-writes page-cache semantics. `read_durable` bypasses the cache
+//! for crash recovery scans and is the only path where read faults model
+//! media decay discovered at recovery time.
 
 use super::atlas::StorageFaultAtlas;
 use crate::rng::DetRng;

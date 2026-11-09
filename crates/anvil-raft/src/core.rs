@@ -61,6 +61,10 @@ impl RaftCore {
     /// Constructs a new `RaftCore` instance from configuration, recovered state, and a `ChaCha8` RNG.
     #[must_use]
     pub fn new(config: RaftConfig, recovered: RecoveredState, mut rng: ChaCha8Rng) -> Self {
+        assert!(
+            config.validate().is_ok(),
+            "RaftCore requires a valid RaftConfig"
+        );
         let randomized_election_timeout =
             Self::sample_random_timeout(config.election_timeout_ticks, &mut rng);
 
@@ -318,17 +322,22 @@ impl RaftCore {
 
         let last_log_index = self.log.last_index();
         let last_log_term = self.log.last_term();
+        let term = self.term;
+        let candidate_id = self.config.node_id;
+        let peers: Vec<NodeId> = self.config.peers.iter().copied().collect();
 
-        for &peer in &self.config.peers {
-            output.messages.push(OutboundMessage {
+        // Term and vote reach disk before any message reveals them.
+        for peer in peers {
+            let request = OutboundMessage {
                 to: peer,
                 message: Message::RequestVoteRequest {
-                    term: self.term,
-                    candidate_id: self.config.node_id,
+                    term,
+                    candidate_id,
                     last_log_index,
                     last_log_term,
                 },
-            });
+            };
+            self.queue_pending_action(token, PendingAction::SendMessage(request));
         }
     }
 
@@ -341,8 +350,9 @@ impl RaftCore {
         last_log_term: Term,
         output: &mut Output,
     ) {
+        let mut persisted_token: Option<PersistToken> = None;
         if term > self.term {
-            self.transition_to_follower(term, output);
+            persisted_token = self.transition_to_follower(term, output);
         }
 
         let can_vote = self.voted_for.is_none() || self.voted_for == Some(candidate_id);
@@ -360,12 +370,21 @@ impl RaftCore {
                 token,
             });
 
-            // Persistence contract: release vote response only after HardState is synced
             let resp = OutboundMessage {
                 to: from,
                 message: Message::RequestVoteResponse {
                     term: self.term,
                     vote_granted: true,
+                    from: self.config.node_id,
+                },
+            };
+            self.queue_pending_action(token, PendingAction::SendMessage(resp));
+        } else if let Some(token) = persisted_token {
+            let resp = OutboundMessage {
+                to: from,
+                message: Message::RequestVoteResponse {
+                    term: self.term,
+                    vote_granted: false,
                     from: self.config.node_id,
                 },
             };
@@ -546,8 +565,9 @@ impl RaftCore {
         leader_commit: LogIndex,
         output: &mut Output,
     ) {
+        let mut term_persist_token: Option<PersistToken> = None;
         if term > self.term {
-            self.transition_to_follower(term, output);
+            term_persist_token = self.transition_to_follower(term, output);
         }
 
         if term < self.term {
@@ -567,7 +587,8 @@ impl RaftCore {
 
         self.election_elapsed_ticks = 0;
         if self.role != Role::Follower {
-            self.transition_to_follower(term, output);
+            let same_term_token = self.transition_to_follower(term, output);
+            debug_assert!(same_term_token.is_none());
         }
 
         let local_prev_term = self.log.term_at(prev_log_index);
@@ -577,7 +598,6 @@ impl RaftCore {
         };
 
         if !matches {
-            // Compute conflict hint to repair log in 1-RTT
             let (conflict_term, conflict_index) = match local_prev_term {
                 Some(conf_term) => {
                     let first_idx = self
@@ -597,7 +617,7 @@ impl RaftCore {
                 ),
             };
 
-            output.messages.push(OutboundMessage {
+            let rejection = OutboundMessage {
                 to: from,
                 message: Message::AppendEntriesResponse {
                     term: self.term,
@@ -607,8 +627,21 @@ impl RaftCore {
                     conflict_index,
                     from: self.config.node_id,
                 },
-            });
+            };
+            if let Some(token) = term_persist_token {
+                self.queue_pending_action(token, PendingAction::SendMessage(rejection));
+            } else {
+                output.messages.push(rejection);
+            }
             return;
+        }
+
+        if !entries.is_empty() {
+            let expected_first = prev_log_index.next().unwrap_or(prev_log_index);
+            assert!(
+                entries[0].index == expected_first,
+                "AppendEntries gap: first entry index does not follow prev_log_index"
+            );
         }
 
         let mut new_match = prev_log_index;
@@ -668,6 +701,19 @@ impl RaftCore {
                 token,
             });
 
+            let resp = OutboundMessage {
+                to: from,
+                message: Message::AppendEntriesResponse {
+                    term: self.term,
+                    success: true,
+                    match_index: new_match,
+                    conflict_term: None,
+                    conflict_index: None,
+                    from: self.config.node_id,
+                },
+            };
+            self.queue_pending_action(token, PendingAction::SendMessage(resp));
+        } else if let Some(token) = term_persist_token {
             let resp = OutboundMessage {
                 to: from,
                 message: Message::AppendEntriesResponse {
@@ -835,14 +881,16 @@ impl RaftCore {
         read_context: Option<Bytes>,
         output: &mut Output,
     ) {
+        let mut term_persist_token: Option<PersistToken> = None;
         if term > self.term {
-            self.transition_to_follower(term, output);
+            term_persist_token = self.transition_to_follower(term, output);
         }
 
         if term >= self.term {
             self.election_elapsed_ticks = 0;
             if self.role != Role::Follower {
-                self.transition_to_follower(term, output);
+                let same_term_token = self.transition_to_follower(term, output);
+                debug_assert!(same_term_token.is_none());
             }
             if commit_index > self.commit_index {
                 let target = std::cmp::min(commit_index, self.log.last_index());
@@ -852,14 +900,19 @@ impl RaftCore {
             }
         }
 
-        output.messages.push(OutboundMessage {
+        let response = OutboundMessage {
             to: from,
             message: Message::HeartbeatResponse {
                 term: self.term,
                 from: self.config.node_id,
                 read_context,
             },
-        });
+        };
+        if let Some(token) = term_persist_token {
+            self.queue_pending_action(token, PendingAction::SendMessage(response));
+        } else {
+            output.messages.push(response);
+        }
     }
 
     fn handle_heartbeat_response(
@@ -973,25 +1026,42 @@ impl RaftCore {
     }
 
     fn handle_timeout_now(&mut self, term: Term, _leader_id: NodeId, output: &mut Output) {
-        if term >= self.term {
-            self.start_election(output);
+        if term < self.term {
+            return;
         }
+        if term > self.term {
+            self.term = term;
+            self.voted_for = None;
+            self.lead_transferee = None;
+            self.pre_votes_granted.clear();
+            self.votes_granted.clear();
+        }
+        self.start_election(output);
     }
 
     fn handle_persisted(&mut self, token: PersistToken, output: &mut Output) {
-        if let Some(pos) = self.pending_persists.iter().position(|(t, _)| *t == token) {
-            let (_, action) = self.pending_persists.swap_remove(pos);
-            match action {
-                PendingAction::SendMessage(msg) => {
-                    output.messages.push(msg);
-                }
-                PendingAction::LeaderPersisted { entry_index } => {
-                    if entry_index > self.leader_persisted_index {
-                        self.leader_persisted_index = entry_index;
-                        self.maybe_advance_commit(output);
+        let mut i = 0;
+        let mut leader_advanced = false;
+        while i < self.pending_persists.len() {
+            if self.pending_persists[i].0 == token {
+                let (_, action) = self.pending_persists.swap_remove(i);
+                match action {
+                    PendingAction::SendMessage(msg) => {
+                        output.messages.push(msg);
+                    }
+                    PendingAction::LeaderPersisted { entry_index } => {
+                        if entry_index > self.leader_persisted_index {
+                            self.leader_persisted_index = entry_index;
+                            leader_advanced = true;
+                        }
                     }
                 }
+            } else {
+                i += 1;
             }
+        }
+        if leader_advanced {
+            self.maybe_advance_commit(output);
         }
     }
 
@@ -1101,11 +1171,16 @@ impl RaftCore {
         }
     }
 
-    fn transition_to_follower(&mut self, term: Term, output: &mut Output) {
+    fn transition_to_follower(&mut self, term: Term, output: &mut Output) -> Option<PersistToken> {
         let term_changed = term != self.term;
         self.transition_role(Role::Follower, output);
-        self.term = term;
-        self.voted_for = None;
+        // A vote cast in the current term survives a same-term stepdown.
+        // Clearing it would let this node vote twice in one term after a
+        // restart where disk still records the earlier vote.
+        if term_changed {
+            self.term = term;
+            self.voted_for = None;
+        }
         self.lead_transferee = None;
         self.pre_votes_granted.clear();
         self.votes_granted.clear();
@@ -1117,6 +1192,9 @@ impl RaftCore {
                 vote: self.voted_for,
                 token,
             });
+            Some(token)
+        } else {
+            None
         }
     }
 
@@ -1148,16 +1226,15 @@ impl RaftCore {
         });
     }
 
-    /// Draws an unbiased randomized election timeout in `[base_ticks, 2 * base_ticks]`
-    /// using Lemire's nearly divisionless algorithm.
+    /// Draws an unbiased randomized election timeout in `[low, low + base_ticks)`.
     ///
     /// The sampler duplicates `DetRng::gen_range` on purpose: `anvil-raft` sits below
     /// `anvil-sim` in the crate DAG and cannot depend on it (ADR 0004).
     #[allow(clippy::cast_possible_truncation)]
     fn sample_random_timeout(base_ticks: u64, rng: &mut ChaCha8Rng) -> u64 {
         let low = base_ticks;
-        let high = base_ticks.saturating_mul(2).max(low + 1);
-        let span = high - low;
+        let high = base_ticks.saturating_mul(2).max(low.saturating_add(1));
+        let span = high.saturating_sub(low);
         if span <= 1 {
             return low;
         }

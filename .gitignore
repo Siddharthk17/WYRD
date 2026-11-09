@@ -46,6 +46,7 @@ specs/*.jar
 # TLC model checker artifacts & generated states
 states/
 specs/states/
+specs/*TTrace*.bin
 MC.out
 MC.tla
 MC.cfg

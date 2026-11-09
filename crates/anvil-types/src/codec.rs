@@ -268,7 +268,7 @@ pub fn encode_varint_u64(mut value: u64, buf: &mut Vec<u8>) {
 
 /// Decodes an unsigned 64-bit integer from LEB128, advancing the slice past it.
 pub fn decode_varint_u64(buf: &mut &[u8]) -> Result<u64, CodecError> {
-    let mut result: u64 = 0;
+    let mut value: u64 = 0;
     let mut shift = 0;
     let mut bytes_read = 0;
 
@@ -285,11 +285,11 @@ pub fn decode_varint_u64(buf: &mut &[u8]) -> Result<u64, CodecError> {
             return Err(CodecError::VarintOverflow);
         }
 
-        result |= group << shift;
+        value |= group << shift;
         shift += 7;
 
         if (byte & 0x80) == 0 {
-            return Ok(result);
+            return Ok(value);
         }
         if bytes_read == 10 {
             return Err(CodecError::VarintOverflow);
@@ -325,10 +325,12 @@ pub fn decode_varint_i64(buf: &mut &[u8]) -> Result<i64, CodecError> {
     Ok(value)
 }
 
+/// Encodes a `u16` in little-endian byte order.
 pub fn encode_u16_le(value: u16, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&value.to_le_bytes());
 }
 
+/// Decodes a `u16` from little-endian bytes, advancing the slice past it.
 pub fn decode_u16_le(buf: &mut &[u8]) -> Result<u16, CodecError> {
     if buf.len() < 2 {
         return Err(CodecError::UnexpectedEof {
@@ -341,10 +343,12 @@ pub fn decode_u16_le(buf: &mut &[u8]) -> Result<u16, CodecError> {
     Ok(value)
 }
 
+/// Encodes a `u32` in little-endian byte order.
 pub fn encode_u32_le(value: u32, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&value.to_le_bytes());
 }
 
+/// Decodes a `u32` from little-endian bytes, advancing the slice past it.
 pub fn decode_u32_le(buf: &mut &[u8]) -> Result<u32, CodecError> {
     if buf.len() < 4 {
         return Err(CodecError::UnexpectedEof {
@@ -357,10 +361,12 @@ pub fn decode_u32_le(buf: &mut &[u8]) -> Result<u32, CodecError> {
     Ok(value)
 }
 
+/// Encodes a `u64` in little-endian byte order.
 pub fn encode_u64_le(value: u64, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&value.to_le_bytes());
 }
 
+/// Decodes a `u64` from little-endian bytes, advancing the slice past it.
 pub fn decode_u64_le(buf: &mut &[u8]) -> Result<u64, CodecError> {
     if buf.len() < 8 {
         return Err(CodecError::UnexpectedEof {
@@ -378,6 +384,10 @@ pub fn decode_u64_le(buf: &mut &[u8]) -> Result<u64, CodecError> {
 impl Entry {
     /// Encodes an entry into a framed wire buffer.
     pub fn encode(&self, buf: &mut Vec<u8>) {
+        assert!(
+            self.payload.len() + 32 <= MAX_FRAME_PAYLOAD_LEN as usize,
+            "entry payload exceeds maximum frame size"
+        );
         let mut body = Vec::with_capacity(32 + self.payload.len());
         encode_varint_u64(self.index.as_u64(), &mut body);
         encode_varint_u64(self.term.as_u64(), &mut body);
@@ -386,6 +396,15 @@ impl Entry {
 
         assert!(body.len() <= MAX_FRAME_PAYLOAD_LEN as usize);
         Frame::encode(FrameType::Entry, &body, buf);
+    }
+
+    /// Decodes a single entry from a slice, rejecting trailing bytes.
+    pub fn decode_strict(mut input: &[u8]) -> Result<Self, CodecError> {
+        let entry = Self::decode_from_slice(&mut input)?;
+        if !input.is_empty() {
+            return Err(CodecError::TrailingData(input.len()));
+        }
+        Ok(entry)
     }
 
     /// Decodes an entry zero-copy from a `Bytes` buffer.

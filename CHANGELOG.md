@@ -5,11 +5,23 @@ All notable changes to ANVIL will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Raft persistence disclosure: `RequestVoteRequest` and higher-term deny, append-reject, and heartbeat responses are released only after the `HardState` they reveal reaches disk; shared-token completions now drain every gated action instead of one.
+- Same-term stepdowns preserve `voted_for`; `TimeoutNow` campaigns from `max(local, incoming)`; follower appends reject index gaps; `RaftConfig::validate` is enforced by `RaftCore::new` (timeouts of zero stay legal for unit tests).
+- Storage engine rewinds truncations to byte-exact journaled offsets with chained CRCs, emits `Truncate` for rewound durable bytes, unlinks superseded segments, retains pending tokens, and acknowledges WAL syncs strictly in order.
+- `SimDevice` completions advance with the cluster tick; packet delivery drains in FIFO order; the `buggify!` registry is thread-local.
+- Fault schedules and workloads are materialized as serializable `Plan` data executed with no mid-run generator draws; `SimNetwork` owns the packet queue; a greedy shrinker reduces failing plans while preserving the failure (`cargo xtask plan`, `cargo xtask repro`).
+- Toolchain: tokio minimum raised to 1.54.1 (yanked 1.54.0 race advisory); `deny.toml` updated to the cargo-deny 0.20 schema with versioned workspace path dependencies.
+- `cargo xtask ci` now runs nextest, the 60 s-per-target fuzz smoke gate, `cargo deny`, `cargo audit`, per-crate `cargo geiger --forbid-only` checks, `cargo hack --feature-powerset`, and per-crate llvm-cov floors (types/raft/storage 95, sim 90).
+- TLC gate checks the 2-term/2-entry smoke bound that finishes in minutes (`cargo xtask tlc`); the full 3-term/3-entry reference bound runs via `cargo xtask tlc-full` on larger hosts.
+
 ## [3.7.1.9]
 
 ### Added
 - Storage fault model specification in `docs/storage-fault-model.md` and [ADR 0011](docs/adr/0011-storage-fault-model.md) defining crash semantics, sector torn writes, bit rot, latent sector errors, and cluster survivability rules.
-- On-disk binary format specifications in `docs/formats/` for sector-aligned WAL segments (`docs/formats/wal-segment.md`), 2-slot alternating hard state (`docs/formats/hard-state.md`), and snapshot files (`docs/formats/snapshot.md`) under [ADR 0012](docs/adr/0012-on-disk-storage-formats.md).
+- On-disk binary format specifications in `docs/formats/` for sector-aligned WAL segments (`docs/formats/wal.md`), 2-slot alternating hard state (`docs/formats/hard-state.md`), and snapshot files (`docs/formats/snapshot.md`) under [ADR 0012](docs/adr/0012-on-disk-storage-formats.md).
 - Binary codecs in `anvil-storage` with zero-copy decoding, chained CRC32C, zero-padding verification, and CRC validation covering file offsets and segment IDs.
 - Pure sans-IO storage engine (`StorageEngine`) in `anvil-storage` under [ADR 0013](docs/adr/0013-sans-io-storage-engine.md) featuring natural batching group commit, segment preallocation and rotation, completion token feedback to Raft persistence contracts, and fail-fast fsync policy.
 - Crash recovery scanner with 4-way classification (`Clean`, `TornTail`, `MidLogCorruption`, and atomic alternating `HardState`).
@@ -29,7 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Formal TLA+ specification in `specs/anvil_raft.tla` and model check configuration `specs/anvil_raft.cfg` verifying all 7 core Raft invariants.
-- Negative TLC configuration `specs/anvil_raft_figure8_neg.cfg` reproducing the Figure 8 counterexample when current-term commit rule is violated.
+- Negative TLC configuration `specs/anvil_raft_negative.cfg` reproducing the Figure 8 counterexample when current-term commit rule is violated.
 - TLC specification check gate in `xtask` (`cargo xtask tlc`).
 - Architecture Decision Record 0009 documenting the TLA+ formal specification and model-checking strategy.
 - Complete sans-IO Raft consensus core in `anvil-raft` with `step(input, &mut output)`, PreVote, CheckQuorum, leader stickiness, conflict hints for 1-RTT repairs, and optimistic pipelining.

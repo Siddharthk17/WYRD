@@ -46,8 +46,24 @@ enum Commands {
         #[arg(long, default_value_t = 60)]
         duration_secs: u64,
     },
-    /// Run TLC model checker on formal specifications
+    /// Run TLC model checker on formal specifications (smoke bounds)
     Tlc,
+    /// Run TLC model checker on the full reference bounds (nightly only)
+    TlcFull,
+    /// Print the materialized fault plan for a seed
+    Plan {
+        /// Master seed the plan is generated from
+        #[arg(long)]
+        seed: u64,
+        /// Enable storage fault injection in the plan
+        #[arg(long, default_value_t = false)]
+        storage_faults: bool,
+    },
+    /// Replay a plan encoding, shrinking it on failure
+    Repro {
+        /// Plan encoding as printed by `xtask plan`
+        plan: String,
+    },
     /// Build and verify documentation
     Docs,
     /// Validate release readiness, packaging, and reproducibility
@@ -80,6 +96,27 @@ fn run_farm_command(seeds: usize, storage_faults: bool) -> ExitCode {
     } else {
         println!("FARM PASSED: All {seeds} seeds completed with zero invariant violations.");
         ExitCode::SUCCESS
+    }
+}
+
+fn run_repro_command(plan: &str) -> ExitCode {
+    let decoded = match anvil_sim::Plan::decode(plan) {
+        Err(err) => {
+            eprintln!("Repro error: invalid plan encoding: {err}");
+            return ExitCode::FAILURE;
+        }
+        Ok(decoded) => decoded,
+    };
+    if std::panic::catch_unwind(|| anvil_sim::run_plan(&decoded)).is_ok() {
+        println!("REPRO PASSED: plan completed with zero invariant violations.");
+        ExitCode::SUCCESS
+    } else {
+        let shrunk = anvil_sim::shrink_plan(&decoded, &|candidate| {
+            std::panic::catch_unwind(|| anvil_sim::run_plan(candidate)).is_err()
+        });
+        eprintln!("REPRO FAILED: plan reproduced the failure.");
+        eprintln!("Shrunk plan: {}", shrunk.encode());
+        ExitCode::FAILURE
     }
 }
 
@@ -118,6 +155,13 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Commands::TlcFull => match xtask::tlc::run_tlc_check_full() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("TLC full gate error: {err}");
+                ExitCode::FAILURE
+            }
+        },
         Commands::Farm {
             seeds,
             storage_faults,
@@ -138,6 +182,15 @@ fn main() -> ExitCode {
                 _ => ExitCode::FAILURE,
             }
         }
+        Commands::Plan {
+            seed,
+            storage_faults,
+        } => {
+            let plan = anvil_sim::Plan::generate(seed, storage_faults);
+            println!("{}", plan.encode());
+            ExitCode::SUCCESS
+        }
+        Commands::Repro { plan } => run_repro_command(&plan),
         Commands::Fuzz { duration_secs } => match xtask::fuzz::run_fuzz(duration_secs) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {

@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Run Farm
-        run: cargo run --package xtask -- farm --seeds 0
+        run: cargo run --package xtask -- farm --seeds 200000
 
   nightly-fuzz:
     name: Fuzz Smoke
@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Run Fuzz Harness
-        run: cargo run --package xtask -- fuzz --duration-secs 0
+        run: cargo run --package xtask -- fuzz --duration-secs 1800
 
   mutation-report:
     name: Mutation Testing
@@ -28,4 +28,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Mutants Check
-        run: echo "Mutation testing harness active"
+        run: cargo mutants --workspace --min-test-timeout 60

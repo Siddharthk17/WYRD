@@ -201,3 +201,126 @@ fn test_dependency_allowlist() {
         );
     }
 }
+
+#[test]
+fn test_max_frame_payload_len_is_64mib() {
+    assert_eq!(anvil_types::MAX_FRAME_PAYLOAD_LEN, 67_108_864);
+    assert_eq!(anvil_types::MAX_FRAME_PAYLOAD_LEN, 64 * 1024 * 1024);
+}
+
+#[test]
+fn test_frame_header_rejects_over_max_but_accepts_max() {
+    let mut at_max = [0u8; 16];
+    at_max[0..4].copy_from_slice(b"ANVL");
+    at_max[4..6].copy_from_slice(&1u16.to_le_bytes());
+    at_max[6..8].copy_from_slice(&1u16.to_le_bytes());
+    at_max[8..12].copy_from_slice(&anvil_types::MAX_FRAME_PAYLOAD_LEN.to_le_bytes());
+    let mut cursor = &at_max[..];
+    let header = anvil_types::FrameHeader::decode(&mut cursor).expect("max length accepted");
+    assert_eq!(header.payload_len, anvil_types::MAX_FRAME_PAYLOAD_LEN);
+
+    let mut over_max = [0u8; 16];
+    over_max[0..4].copy_from_slice(b"ANVL");
+    over_max[4..6].copy_from_slice(&1u16.to_le_bytes());
+    over_max[6..8].copy_from_slice(&1u16.to_le_bytes());
+    over_max[8..12].copy_from_slice(
+        &anvil_types::MAX_FRAME_PAYLOAD_LEN
+            .wrapping_add(1)
+            .to_le_bytes(),
+    );
+    let mut cursor = &over_max[..];
+    assert!(matches!(
+        anvil_types::FrameHeader::decode(&mut cursor),
+        Err(CodecError::PayloadTooLarge { .. })
+    ));
+}
+
+#[test]
+fn test_frame_decode_from_bytes_exact_length_boundary() {
+    let mut payload = vec![0u8; 8];
+    anvil_types::encode_u64_le(0x0102_0304_0506_0708, &mut payload);
+    let mut framed = Vec::new();
+    Frame::encode(FrameType::Entry, &payload, &mut framed);
+    let total = framed.len();
+    let mut truncated = Bytes::copy_from_slice(&framed[..total - 1]);
+    assert!(matches!(
+        Frame::decode_from_bytes(&mut truncated),
+        Err(CodecError::UnexpectedEof { .. })
+    ));
+    let mut exact = Bytes::copy_from_slice(&framed);
+    assert!(Frame::decode_from_bytes(&mut exact).is_ok());
+
+    let mut empty_framed = Vec::new();
+    Frame::encode(FrameType::Entry, &[], &mut empty_framed);
+    assert_eq!(empty_framed.len(), anvil_types::FrameHeader::HEADER_LEN);
+    let mut exact_empty = Bytes::copy_from_slice(&empty_framed);
+    assert!(Frame::decode_from_bytes(&mut exact_empty).is_ok());
+}
+
+#[test]
+fn test_varint_u64_exact_byte_encoding() {
+    let mut buf = Vec::new();
+    encode_varint_u64(300, &mut buf);
+    assert_eq!(buf, vec![0xAC, 0x02]);
+    let mut buf = Vec::new();
+    encode_varint_u64(0, &mut buf);
+    assert_eq!(buf, vec![0x00]);
+    let mut buf = Vec::new();
+    encode_varint_u64(u64::MAX, &mut buf);
+    assert_eq!(buf.len(), 10);
+}
+
+#[test]
+fn test_fixed_width_decode_rejects_short_inputs() {
+    let mut one = &[0x01u8][..];
+    assert!(anvil_types::decode_u16_le(&mut one).is_err());
+    let mut two = &[0x01u8, 0x02][..];
+    assert_eq!(anvil_types::decode_u16_le(&mut two).unwrap(), 0x0201);
+    let mut three = &[0x01u8, 0x02, 0x03][..];
+    assert!(anvil_types::decode_u32_le(&mut three).is_err());
+    let mut four = &[0x01u8, 0x02, 0x03, 0x04][..];
+    assert_eq!(anvil_types::decode_u32_le(&mut four).unwrap(), 0x0403_0201);
+}
+
+#[test]
+fn test_decode_strict_rejects_trailing_bytes() {
+    let entry = Entry::normal(
+        LogIndex::from_raw(1),
+        Term::from_raw(1),
+        Bytes::from_static(b"x"),
+    );
+    let mut buf = Vec::new();
+    entry.encode(&mut buf);
+    assert!(Entry::decode_strict(&buf).is_ok());
+    let mut trailed = buf.clone();
+    trailed.push(0x00);
+    assert!(matches!(
+        Entry::decode_strict(&trailed),
+        Err(CodecError::TrailingData(1))
+    ));
+}
+
+#[test]
+fn test_is_zero_distinguishes_zero_and_nonzero() {
+    assert!(Term::from_raw(0).is_zero());
+    assert!(!Term::from_raw(7).is_zero());
+    assert!(LogIndex::from_raw(0).is_zero());
+    assert!(!LogIndex::from_raw(7).is_zero());
+}
+
+#[cfg(feature = "arbitrary")]
+#[test]
+fn test_arbitrary_entry_roundtrips_through_codec() {
+    use arbitrary::{Arbitrary, Unstructured};
+    let raw: Vec<u8> = (0u8..=255u8).collect();
+    let mut u = Unstructured::new(&raw);
+    let entry = Entry::arbitrary(&mut u).expect("arbitrary entry");
+    let mut buf = Vec::new();
+    entry.encode(&mut buf);
+    let mut cursor = &buf[..];
+    let decoded = Entry::decode_from_slice(&mut cursor).expect("roundtrip");
+    assert_eq!(decoded.index, entry.index);
+    assert_eq!(decoded.term, entry.term);
+    assert_eq!(decoded.kind, entry.kind);
+    assert_eq!(decoded.payload, entry.payload);
+}

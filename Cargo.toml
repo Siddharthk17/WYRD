@@ -28,7 +28,7 @@ rust-version = "1.99.0"
 
 [workspace.dependencies]
 # Pinned libraries per ANVIL charter
-tokio = { version = "1.53", default-features = false }
+tokio = { version = "1.54.1", default-features = false }
 tonic = "0.14"
 prost = "0.14"
 rustls = "0.23"
@@ -54,15 +54,15 @@ libfuzzer-sys = "0.4"
 rcgen = "0.14"
 
 # Internal workspace crates
-anvil-types = { path = "crates/anvil-types" }
-anvil-raft = { path = "crates/anvil-raft" }
-anvil-kv = { path = "crates/anvil-kv" }
-anvil-storage = { path = "crates/anvil-storage" }
-anvil-node = { path = "crates/anvil-node" }
-anvil-check = { path = "crates/anvil-check" }
-anvil-sim = { path = "crates/anvil-sim" }
-anvil-device-fs = { path = "crates/anvil-device-fs" }
-anvil-client = { path = "crates/anvil-client" }
+anvil-types = { version = "0.1.0", path = "crates/anvil-types" }
+anvil-raft = { version = "0.1.0", path = "crates/anvil-raft" }
+anvil-kv = { version = "0.1.0", path = "crates/anvil-kv" }
+anvil-storage = { version = "0.1.0", path = "crates/anvil-storage" }
+anvil-node = { version = "0.1.0", path = "crates/anvil-node" }
+anvil-check = { version = "0.1.0", path = "crates/anvil-check" }
+anvil-sim = { version = "0.1.0", path = "crates/anvil-sim" }
+anvil-device-fs = { version = "0.1.0", path = "crates/anvil-device-fs" }
+anvil-client = { version = "0.1.0", path = "crates/anvil-client" }
 
 [workspace.lints.rust]
 unused_must_use = "deny"

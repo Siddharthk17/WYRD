@@ -19,8 +19,8 @@
 
 use anvil_sim::{DetRng, SimDevice, SimDeviceConfig, StorageFaultAtlas};
 use anvil_storage::{
-    Device, DeviceOp, FileId, LogRecoveryClassification, SectorSize, StorageEngine, StorageError,
-    WalRecordFrame, WalSegmentHeader,
+    CompletionPayload, Device, DeviceOp, FileId, LogRecoveryClassification, SectorSize,
+    StorageEngine, StorageError, WalRecordFrame, WalSegmentHeader,
 };
 use anvil_types::{Entry, EntryKind, LogIndex, NodeId, Term};
 use bytes::Bytes;
@@ -270,4 +270,382 @@ fn test_sim_device_storage_fault_atlas_quorum_survivability() {
     // Node 2 write corruption was vetoed by Quorum Survivability Rule!
     assert_eq!(dev2.stats().write_corruptions_injected, 0);
     assert_eq!(atlas.vetoed_corruptions(), 1);
+}
+
+#[test]
+fn test_sim_device_latency_defers_completions_until_due() {
+    let rng = DetRng::new(4242, "latency_test");
+    let config = SimDeviceConfig::with_latency(SectorSize::Sector512, 10, 10);
+    let mut device = SimDevice::new(config, rng);
+
+    let file_id = FileId::wal_segment(1);
+    device.submit(DeviceOp::Create {
+        op_id: 1,
+        file_id,
+        preallocate_bytes: 512,
+    });
+    assert!(device.has_pending_completions());
+    assert!(device.poll_completion().is_none());
+
+    device.step_time(9);
+    assert!(device.poll_completion().is_none());
+
+    device.step_time(1);
+    let comp = device.poll_completion().expect("completion due at tick 10");
+    assert_eq!(comp.op_id, 1);
+    assert!(comp.result.is_ok());
+    assert!(!device.has_pending_completions());
+
+    device.set_time(100);
+    assert_eq!(device.current_tick(), 100);
+}
+
+#[test]
+fn test_sim_device_write_path_bitrot_and_read_corruption() {
+    let rng = DetRng::new(777, "rot_test");
+    let mut config = SimDeviceConfig::for_test(SectorSize::Sector512);
+    config.write_corruption_rate_ppm = 1_000_000;
+    let mut device = SimDevice::new(config, rng);
+
+    let file_id = FileId::wal_segment(1);
+    device.submit(DeviceOp::Create {
+        op_id: 1,
+        file_id,
+        preallocate_bytes: 512,
+    });
+    assert!(device.poll_completion().unwrap().result.is_ok());
+
+    device.submit(DeviceOp::Write {
+        op_id: 2,
+        file_id,
+        offset: 0,
+        data: Bytes::from(vec![0xAAu8; 64]),
+    });
+    let comp = device.poll_completion().unwrap();
+    assert!(comp.result.is_ok());
+    assert_eq!(device.stats().write_corruptions_injected, 1);
+
+    let volatile = device
+        .get_file_volatile_bytes(file_id)
+        .expect("volatile bytes");
+    assert_eq!(volatile[0], 0xAA ^ 0x5A);
+
+    let mut config2 = SimDeviceConfig::for_test(SectorSize::Sector512);
+    config2.read_corruption_rate_ppm = 1_000_000;
+    let rng2 = DetRng::new(778, "rot_read");
+    let mut device2 = SimDevice::new(config2, rng2);
+    device2.submit(DeviceOp::Create {
+        op_id: 1,
+        file_id,
+        preallocate_bytes: 512,
+    });
+    assert!(device2.poll_completion().unwrap().result.is_ok());
+    device2.submit(DeviceOp::Write {
+        op_id: 2,
+        file_id,
+        offset: 0,
+        data: Bytes::from(vec![0xBBu8; 64]),
+    });
+    assert!(device2.poll_completion().unwrap().result.is_ok());
+    device2.submit(DeviceOp::Read {
+        op_id: 3,
+        file_id,
+        offset: 0,
+        len: 64,
+    });
+    let comp = device2.poll_completion().unwrap();
+    let CompletionPayload::Read(bytes) = comp.result.expect("read succeeds with corruption") else {
+        panic!("expected read payload");
+    };
+    assert_eq!(bytes[0], 0xBB ^ 0x3C);
+    assert_eq!(device2.stats().read_corruptions_injected, 1);
+}
+
+#[test]
+fn test_sim_device_crash_loses_unsynced_torn_sectors() {
+    let rng = DetRng::new(999, "crash_test");
+    let mut config = SimDeviceConfig::for_test(SectorSize::Sector512);
+    config.unsynced_dir_loss_rate_ppm = 0;
+    config.unsynced_sector_loss_rate_ppm = 1_000_000;
+    config.torn_write_rate_ppm = 0;
+    let mut device = SimDevice::new(config, rng);
+
+    let file_id = FileId::wal_segment(1);
+    device.submit(DeviceOp::Create {
+        op_id: 1,
+        file_id,
+        preallocate_bytes: 1024,
+    });
+    assert!(device.poll_completion().unwrap().result.is_ok());
+    device.submit(DeviceOp::Write {
+        op_id: 2,
+        file_id,
+        offset: 0,
+        data: Bytes::from(vec![0xCCu8; 512]),
+    });
+    assert!(device.poll_completion().unwrap().result.is_ok());
+
+    device.crash();
+    let durable = device
+        .get_file_durable_bytes(file_id)
+        .expect("durable bytes");
+    assert!(durable.iter().all(|&b| b == 0));
+    assert!(device.get_file_volatile_bytes(file_id).is_some());
+}
+
+#[test]
+fn test_sim_device_file_lifecycle_ops_and_listings() {
+    let rng = DetRng::new(111, "lifecycle");
+    let mut device = SimDevice::new(SimDeviceConfig::for_test(SectorSize::Sector512), rng);
+
+    let seg = FileId::wal_segment(1);
+    assert!(!device.file_exists(seg));
+    assert!(!device.is_file_durable(seg));
+    assert!(device.get_file_durable_bytes(seg).is_none());
+    assert!(device.get_file_volatile_bytes(seg).is_none());
+
+    device.submit(DeviceOp::Create {
+        op_id: 1,
+        file_id: seg,
+        preallocate_bytes: 512,
+    });
+    assert!(device.poll_completion().unwrap().result.is_ok());
+    assert!(device.file_exists(seg));
+    assert!(device.list_volatile_files().contains(&seg));
+    assert!(!device.is_file_durable(seg));
+
+    device.submit(DeviceOp::Open {
+        op_id: 2,
+        file_id: seg,
+    });
+    assert!(device.poll_completion().unwrap().result.is_ok());
+    device.submit(DeviceOp::Open {
+        op_id: 3,
+        file_id: FileId::wal_segment(99),
+    });
+    assert!(device.poll_completion().unwrap().result.is_err());
+
+    device.submit(DeviceOp::Write {
+        op_id: 4,
+        file_id: seg,
+        offset: 0,
+        data: Bytes::from(vec![7u8; 100]),
+    });
+    assert!(device.poll_completion().unwrap().result.is_ok());
+
+    device.submit(DeviceOp::Truncate {
+        op_id: 5,
+        file_id: seg,
+        len: 50,
+    });
+    let comp = device.poll_completion().unwrap();
+    assert!(comp.result.is_ok());
+    assert_eq!(device.get_file_volatile_bytes(seg).unwrap().len(), 50);
+
+    device.submit(DeviceOp::Rename {
+        op_id: 6,
+        from: seg,
+        to: FileId::wal_segment(2),
+    });
+    assert!(device.poll_completion().unwrap().result.is_ok());
+    assert!(!device.file_exists(seg));
+    assert!(device.file_exists(FileId::wal_segment(2)));
+
+    device.submit(DeviceOp::Unlink {
+        op_id: 7,
+        file_id: FileId::wal_segment(2),
+    });
+    assert!(device.poll_completion().unwrap().result.is_ok());
+    assert!(!device.file_exists(FileId::wal_segment(2)));
+
+    device.submit(DeviceOp::SyncDir { op_id: 8 });
+    assert!(device.poll_completion().unwrap().result.is_ok());
+    assert!(
+        device.list_durable_files().contains(&FileId::HARD_STATE)
+            || device.list_durable_files().is_empty()
+    );
+
+    let ready = device.drain_ready_completions();
+    assert!(ready.is_empty());
+    let forced = device.drain_all_completions_forcing();
+    assert!(forced.is_empty());
+
+    device.overwrite_durable(FileId::wal_segment(7), 0, &[9u8; 16]);
+    assert!(
+        device
+            .get_file_durable_bytes(FileId::wal_segment(7))
+            .is_none()
+    );
+
+    device.submit(DeviceOp::Create {
+        op_id: 9,
+        file_id: FileId::wal_segment(7),
+        preallocate_bytes: 512,
+    });
+    assert!(device.poll_completion().unwrap().result.is_ok());
+    device.overwrite_durable(FileId::wal_segment(7), 0, &[9u8; 16]);
+    assert_eq!(
+        device
+            .get_file_durable_bytes(FileId::wal_segment(7))
+            .unwrap()
+            .len(),
+        16
+    );
+    assert_eq!(
+        device
+            .get_file_durable_bytes(FileId::wal_segment(7))
+            .unwrap()[0],
+        9
+    );
+
+    let missing = device.read_durable(FileId::wal_segment(12345));
+    assert!(missing.is_err());
+}
+
+#[test]
+fn test_sim_device_enospc_and_syncdir_failure() {
+    let rng = DetRng::new(222, "enospc");
+    let mut config = SimDeviceConfig::for_test(SectorSize::Sector512);
+    config.disk_capacity_bytes = 512;
+    let mut device = SimDevice::new(config, rng);
+
+    device.submit(DeviceOp::Create {
+        op_id: 1,
+        file_id: FileId::wal_segment(1),
+        preallocate_bytes: 4096,
+    });
+    let comp = device.poll_completion().unwrap();
+    assert!(matches!(
+        comp.result,
+        Err(StorageError::DeviceError(ref msg)) if msg.contains("ENOSPC")
+    ));
+
+    let mut config2 = SimDeviceConfig::for_test(SectorSize::Sector512);
+    config2.fsync_failure_rate_ppm = 1_000_000;
+    let mut device2 = SimDevice::new(config2, DetRng::new(223, "syncdir_fail"));
+    device2.submit(DeviceOp::Create {
+        op_id: 1,
+        file_id: FileId::wal_segment(1),
+        preallocate_bytes: 512,
+    });
+    assert!(device2.poll_completion().unwrap().result.is_ok());
+    device2.submit(DeviceOp::SyncDir { op_id: 2 });
+    let comp = device2.poll_completion().unwrap();
+    assert!(matches!(comp.result, Err(StorageError::FsyncFailed { .. })));
+}
+
+#[test]
+fn test_sim_device_crash_torn_write_and_revert_paths() {
+    let rng = DetRng::new(31337, "torn_test");
+    let mut config = SimDeviceConfig::for_test(SectorSize::Sector512);
+    config.unsynced_dir_loss_rate_ppm = 0;
+    config.unsynced_sector_loss_rate_ppm = 0;
+    config.torn_write_rate_ppm = 1_000_000;
+    let mut device = SimDevice::new(config, rng);
+
+    let file_id = FileId::wal_segment(1);
+    device.submit(DeviceOp::Create {
+        op_id: 1,
+        file_id,
+        preallocate_bytes: 1024,
+    });
+    assert!(device.poll_completion().unwrap().result.is_ok());
+    device.submit(DeviceOp::Fdatasync { op_id: 2, file_id });
+    assert!(device.poll_completion().unwrap().result.is_ok());
+
+    device.submit(DeviceOp::Write {
+        op_id: 3,
+        file_id,
+        offset: 0,
+        data: Bytes::from(vec![0xDDu8; 512]),
+    });
+    assert!(device.poll_completion().unwrap().result.is_ok());
+
+    device.crash();
+    let durable = device
+        .get_file_durable_bytes(file_id)
+        .expect("durable bytes");
+    assert_eq!(durable.len(), 1024);
+    assert!(durable[..512].iter().any(|&b| b != 0));
+    assert!(device.stats().crash_count >= 1);
+}
+
+#[test]
+fn test_sim_device_missing_file_operations_error() {
+    let rng = DetRng::new(444, "missing_test");
+    let mut device = SimDevice::new(SimDeviceConfig::for_test(SectorSize::Sector512), rng);
+    let missing = FileId::wal_segment(77);
+
+    device.submit(DeviceOp::Write {
+        op_id: 1,
+        file_id: missing,
+        offset: 0,
+        data: Bytes::from(vec![1u8; 8]),
+    });
+    assert!(device.poll_completion().unwrap().result.is_err());
+
+    device.submit(DeviceOp::Read {
+        op_id: 2,
+        file_id: missing,
+        offset: 0,
+        len: 8,
+    });
+    assert!(device.poll_completion().unwrap().result.is_err());
+
+    device.submit(DeviceOp::Fdatasync {
+        op_id: 3,
+        file_id: missing,
+    });
+    assert!(device.poll_completion().unwrap().result.is_err());
+
+    device.submit(DeviceOp::Truncate {
+        op_id: 4,
+        file_id: missing,
+        len: 0,
+    });
+    assert!(device.poll_completion().unwrap().result.is_err());
+
+    device.submit(DeviceOp::Rename {
+        op_id: 5,
+        from: missing,
+        to: FileId::wal_segment(78),
+    });
+    assert!(device.poll_completion().unwrap().result.is_err());
+
+    device.submit(DeviceOp::Open {
+        op_id: 6,
+        file_id: missing,
+    });
+    assert!(device.poll_completion().unwrap().result.is_err());
+}
+
+#[test]
+fn test_sim_device_read_durable_paths() {
+    let rng = DetRng::new(555, "read_durable");
+    let mut device = SimDevice::new(SimDeviceConfig::for_test(SectorSize::Sector512), rng);
+    let file_id = FileId::wal_segment(1);
+    device.submit(DeviceOp::Create {
+        op_id: 1,
+        file_id,
+        preallocate_bytes: 512,
+    });
+    assert!(device.poll_completion().unwrap().result.is_ok());
+    device.submit(DeviceOp::Write {
+        op_id: 2,
+        file_id,
+        offset: 0,
+        data: Bytes::from(vec![0xEEu8; 64]),
+    });
+    assert!(device.poll_completion().unwrap().result.is_ok());
+    device.submit(DeviceOp::Fdatasync { op_id: 3, file_id });
+    assert!(device.poll_completion().unwrap().result.is_ok());
+
+    let bytes = device.read_durable(file_id).expect("durable read");
+    assert_eq!(&bytes[..64], &vec![0xEEu8; 64][..]);
+
+    let missing_hard = device.read_durable(FileId::HARD_STATE);
+    assert!(missing_hard.is_err());
+
+    let missing = device.read_durable(FileId::wal_segment(999));
+    assert!(missing.is_err());
 }

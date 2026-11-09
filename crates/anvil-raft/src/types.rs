@@ -65,6 +65,29 @@ impl RaftConfig {
     pub fn quorum_size(&self) -> usize {
         (self.cluster_size() / 2) + 1
     }
+
+    /// Rejects configurations that deadlock replication or corrupt identity.
+    ///
+    /// Zero flow-control windows (`max_inflight_messages`, `max_bytes_per_message`)
+    /// stall the leader forever, and listing the local node as its own peer
+    /// breaks quorum math. Timeouts may be zero: a zero election timeout starts
+    /// an election on every tick, which focused unit tests use and which
+    /// `SimCluster` and production startup never select.
+    ///
+    /// # Errors
+    /// Returns a description when a bound would deadlock or corrupt the core.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.max_inflight_messages == 0 {
+            return Err("max_inflight_messages must be non-zero");
+        }
+        if self.max_bytes_per_message == 0 {
+            return Err("max_bytes_per_message must be non-zero");
+        }
+        if self.peers.contains(&self.node_id) {
+            return Err("peers must not contain local node_id");
+        }
+        Ok(())
+    }
 }
 
 /// Recovered persistent state loaded from durable storage during node initialization.
@@ -80,7 +103,11 @@ pub struct RecoveredState {
     pub entries: Vec<Entry>,
 }
 
-/// Projection of Raft state corresponding 1:1 to TLA+ formal specification variables.
+/// Projection of Raft state onto the TLA+ specification variables.
+///
+/// The log is represented by its digest rather than its full contents so that
+/// emitting a projection on every transition stays allocation-free. Trace
+/// validation replays these digests against the spec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpecProjection {
     /// Persistent term variable `currentTerm`.

@@ -14,7 +14,8 @@ The core executes with zero network I/O, zero clock syscalls, and zero backgroun
 
 ## Mapping from TLA+ Formal Specification Actions to Implementation
 
-Every state transition in `specs/anvil_raft.tla` maps 1:1 to an implementation function in `anvil-raft`:
+Every state transition in `specs/anvil_raft.tla` maps to an implementation function in `anvil-raft`.
+`TimeoutNow`, `TransferLeader`, and `ReadIndex` are liveness extensions outside the TLA `Next` action and are listed as such below:
 
 | TLA+ Spec Action | Rust Implementation Function | File & Context |
 | :--- | :--- | :--- |
@@ -29,10 +30,12 @@ Every state transition in `specs/anvil_raft.tla` maps 1:1 to an implementation f
 | `HandleAppendEntriesResp(s, m)` | `RaftCore::handle_append_entries_response` | `crates/anvil-raft/src/core.rs` |
 | `AdvanceCommit(s)` | `RaftCore::maybe_advance_commit` | `crates/anvil-raft/src/core.rs` |
 | `CheckQuorum(s)` | `RaftCore::handle_tick` (CheckQuorum check) | `crates/anvil-raft/src/core.rs` |
-| `ExpireSticky(s)` | `RaftCore::handle_tick` (reset timer) | `crates/anvil-raft/src/core.rs` |
 | `Restart(s)` | `RaftCore::new(config, recovered_state, rng)` | `crates/anvil-raft/src/core.rs` |
-| `DropMessage(m)` | Handled by transport layer (`SimNetwork` drop hooks) | `crates/anvil-sim/src/cluster.rs` |
-| `DuplicateMessage(m)` | Handled by transport layer (`SimNetwork` duplicate hooks) | `crates/anvil-sim/src/cluster.rs` |
+| `TimeoutNow` | `RaftCore::handle_timeout_now` (liveness extension, outside TLA `Next`) | `crates/anvil-raft/src/core.rs` |
+| `TransferLeader` | `RaftCore::handle_transfer_leader` (liveness extension, outside TLA `Next`) | `crates/anvil-raft/src/core.rs` |
+| `ReadIndex` | `RaftCore::handle_read_index` (linearizable read extension, outside TLA `Next`) | `crates/anvil-raft/src/core.rs` |
+| `DropMessage(m)` | Handled by transport layer (`SimCluster` drop hooks) | `crates/anvil-sim/src/cluster.rs` |
+| `DuplicateMessage(m)` | Handled by transport layer (`SimCluster` duplicate hooks) | `crates/anvil-sim/src/cluster.rs` |
 
 ---
 
@@ -55,7 +58,7 @@ The leader immediately bypasses the entire conflicting term or missing suffix, r
 
 ### 5. Peer Progress & Flow Control
 Each peer is tracked with `PeerProgress`:
-- **`Probe` state**: Sends at most one unacknowledged replication message per round trip.
+- **`Probe` state**: Sends one replication message per round trip. A heartbeat response from a live follower resets the in-flight count so a probe lost on an unreliable network is retried; this favors liveness over strict single-flight.
 - **`Replicate` state**: Pipelined replication allowing up to `max_inflight_messages` in flight with optimistic `next_index` advance. On rejection, progress drops back to `Probe` and steps back using conflict hints.
 
 ### 6. Strict Persistence Contract

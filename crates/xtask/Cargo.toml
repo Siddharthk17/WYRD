@@ -7,7 +7,7 @@ authors.workspace = true
 
 [dependencies]
 clap = { workspace = true }
-anvil-sim = { path = "../anvil-sim" }
+anvil-sim = { version = "0.1.0", path = "../anvil-sim" }
 blake3 = { workspace = true }
 
 [lints]

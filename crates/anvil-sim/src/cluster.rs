@@ -10,6 +10,7 @@
 //! - Per-step online invariant verification across all nodes
 
 use crate::device::{SimDevice, SimDeviceConfig, StorageFaultAtlas};
+use crate::network::SimNetwork;
 use crate::raft_invariants::RaftInvariantChecker;
 use crate::rng::{DetRng, derive_component_seed};
 use anvil_raft::{Input, Message, Output, RaftConfig, RaftCore, RecoveredState, Role};
@@ -25,23 +26,17 @@ use rand_chacha::rand_core::SeedableRng;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Hook to drop selected packets `(from, to, message) -> bool`.
-pub type NetworkFilterHook = Box<dyn Fn(NodeId, NodeId, &Message) -> bool>;
+pub use crate::network::NetworkFilterHook;
 
 /// Hook to inject delivery delays `(from, to, message) -> u64 delay_ticks`.
-pub type NetworkDelayHook = Box<dyn Fn(NodeId, NodeId, &Message) -> u64>;
+pub use crate::network::NetworkDelayHook;
 
 /// In-flight network packet queued for discrete logical time delivery.
-#[derive(Debug, Clone)]
-pub struct InFlightPacket {
-    /// Originating sender node ID.
-    pub from: NodeId,
-    /// Destination recipient node ID.
-    pub to: NodeId,
-    /// Consensus message payload.
-    pub message: Message,
-    /// Logical tick at which packet becomes deliverable.
-    pub deliver_at_tick: u64,
-}
+pub use crate::network::InFlightPacket;
+
+/// Network fault parameters for plan execution, applied as pure hash
+/// functions with no generator draws mid-run.
+pub use crate::network::PlanNet;
 
 /// Simulated storage layer for a single Raft node, holding its real `StorageEngine` and `SimDevice`.
 pub struct SimNodeStorage {
@@ -77,10 +72,11 @@ pub struct SimCluster {
     pub master_seed: u64,
     /// Global cluster logical tick counter.
     pub current_tick: u64,
-    /// In-flight message queue.
-    pub in_flight: Vec<InFlightPacket>,
-    /// Network partition pairs `(from, to)` where traffic is unconditionally dropped.
-    pub partitions: BTreeSet<(NodeId, NodeId)>,
+    /// Deterministic packet queue with partitions and fault hooks.
+    pub network: SimNetwork,
+    /// Plan-hash network faults for plan execution. When set, packet faults
+    /// come from pure hash functions instead of installed hooks.
+    pub plan_net: Option<PlanNet>,
     /// Global online invariant checker called after every node transition.
     pub checker: RaftInvariantChecker,
     /// Storage fault atlas enforcing the quorum survivability rule.
@@ -88,12 +84,6 @@ pub struct SimCluster {
     pub fault_atlas: Option<StorageFaultAtlas>,
     /// Scratch output buffer reused across steps to eliminate allocations.
     output_scratch: Output,
-    /// Optional hook to drop selected packets `(from, to, message) -> bool`.
-    pub drop_hook: Option<NetworkFilterHook>,
-    /// Optional hook to duplicate packets `(from, to, message) -> bool`.
-    pub duplicate_hook: Option<NetworkFilterHook>,
-    /// Optional hook to inject delivery delays `(from, to, message) -> u64 delay_ticks`.
-    pub delay_hook: Option<NetworkDelayHook>,
 }
 
 impl SimCluster {
@@ -164,6 +154,10 @@ impl SimCluster {
                 pre_vote_enabled: true,
                 check_quorum: true,
             };
+            assert!(
+                config.validate().is_ok(),
+                "SimCluster builds only valid RaftConfig values"
+            );
 
             let path = format!("cluster/node/{}", id.get());
             let seed = derive_component_seed(master_seed, &path);
@@ -205,14 +199,11 @@ impl SimCluster {
             storage,
             master_seed,
             current_tick: 0,
-            in_flight: Vec::new(),
-            partitions: BTreeSet::new(),
+            network: SimNetwork::new(),
+            plan_net: None,
             checker: RaftInvariantChecker::new(),
             fault_atlas: atlas,
             output_scratch: Output::new(),
-            drop_hook: None,
-            duplicate_hook: None,
-            delay_hook: None,
         }
     }
 
@@ -223,6 +214,12 @@ impl SimCluster {
     /// 3. Evaluates online invariants across all nodes.
     pub fn tick(&mut self) {
         self.current_tick = self.current_tick.saturating_add(1);
+
+        // Device completions are timestamped on each device's own clock, so the
+        // cluster carries the tick forward before any node steps.
+        for storage in self.storage.values_mut() {
+            storage.device.set_time(self.current_tick);
+        }
 
         let node_ids: Vec<NodeId> = self.nodes.keys().copied().collect();
         for id in node_ids {
@@ -521,7 +518,9 @@ impl SimCluster {
             storage.device.crash();
         }
         self.nodes.remove(&id);
-        self.in_flight.retain(|pkt| pkt.to != id && pkt.from != id);
+        self.network
+            .in_flight
+            .retain(|pkt| pkt.to != id && pkt.from != id);
     }
 
     /// Restarts a crashed node: runs `scan_recovery` against the node's `SimDevice`,
@@ -779,53 +778,17 @@ impl SimCluster {
         }
     }
 
-    /// Routes an outbound message through network hooks, partitions, and delay scheduling.
+    /// Routes an outbound message through partitions and fault hooks into the network.
     fn route_message(&mut self, from: NodeId, to: NodeId, message: Message) {
         if self.is_node_crashed(from) || self.is_node_crashed(to) {
             return;
         }
 
-        // 1. Partition filter
-        if self.partitions.contains(&(from, to)) || self.partitions.contains(&(to, from)) {
-            return;
-        }
-
-        // 2. Drop hook
-        if self
-            .drop_hook
-            .as_ref()
-            .is_some_and(|h| h(from, to, &message))
-        {
-            return;
-        }
-
-        // 3. Delay calculation
-        let delay = self
-            .delay_hook
-            .as_ref()
-            .map_or(0, |h| h(from, to, &message));
-        let deliver_at = self.current_tick.saturating_add(delay);
-
-        // 4. Duplicate hook
-        let duplicate = self
-            .duplicate_hook
-            .as_ref()
-            .is_some_and(|h| h(from, to, &message));
-
-        self.in_flight.push(InFlightPacket {
-            from,
-            to,
-            message: message.clone(),
-            deliver_at_tick: deliver_at,
-        });
-
-        if duplicate {
-            self.in_flight.push(InFlightPacket {
-                from,
-                to,
-                message,
-                deliver_at_tick: deliver_at.saturating_add(1),
-            });
+        if let Some(plan_net) = self.plan_net {
+            self.network
+                .schedule_plan(from, to, message, self.current_tick, &plan_net);
+        } else {
+            self.network.schedule(from, to, message, self.current_tick);
         }
     }
 
@@ -839,32 +802,19 @@ impl SimCluster {
                 "message storm detected: delivered over 10,000 messages in one tick"
             );
 
-            let mut due_indices = Vec::new();
-            for (i, pkt) in self.in_flight.iter().enumerate() {
-                if pkt.deliver_at_tick <= self.current_tick {
-                    due_indices.push(i);
-                }
-            }
-
-            if due_indices.is_empty() {
+            if !self.network.has_due(self.current_tick) {
                 break;
             }
 
-            // Extract due packets in FIFO order
-            let mut packets_to_deliver = Vec::new();
-            for &idx in due_indices.iter().rev() {
-                packets_to_deliver.push(self.in_flight.swap_remove(idx));
-            }
-            packets_to_deliver.reverse();
+            // Drain in queue order so surviving packets keep FIFO stability.
+            let packets_to_deliver = self.network.take_due(self.current_tick);
 
             for pkt in packets_to_deliver {
                 if self.is_node_crashed(pkt.to) {
                     continue;
                 }
                 // Drop if partition was created in the interim
-                if self.partitions.contains(&(pkt.from, pkt.to))
-                    || self.partitions.contains(&(pkt.to, pkt.from))
-                {
+                if self.network.is_cut(pkt.from, pkt.to) {
                     continue;
                 }
                 self.step_node_internal(
@@ -878,20 +828,16 @@ impl SimCluster {
         }
     }
 
-    /// Delivers the in-flight packet at `index % in_flight.len()`, removing it from the queue.
-    /// Returns `true` if a packet was delivered, `false` if `in_flight` was empty or partition applied.
+    /// Delivers the in-flight packet at `index % len`, removing it from the queue.
+    /// Returns `true` if a packet was delivered, `false` if empty or partition applied.
     pub fn deliver_packet_at(&mut self, index: usize) -> bool {
-        if self.in_flight.is_empty() {
+        let Some(pkt) = self.network.take_at(index) else {
             return false;
-        }
-        let actual_idx = index % self.in_flight.len();
-        let pkt = self.in_flight.remove(actual_idx);
+        };
         if self.is_node_crashed(pkt.to) {
             return false;
         }
-        if self.partitions.contains(&(pkt.from, pkt.to))
-            || self.partitions.contains(&(pkt.to, pkt.from))
-        {
+        if self.network.is_cut(pkt.from, pkt.to) {
             return false;
         }
         self.step_node_internal(
@@ -904,33 +850,22 @@ impl SimCluster {
         true
     }
 
-    /// Drops the in-flight packet at `index % in_flight.len()`, removing it without delivery.
-    /// Returns `true` if a packet was dropped, `false` if `in_flight` was empty.
+    /// Drops the in-flight packet at `index % len`, removing it without delivery.
+    /// Returns `true` if a packet was dropped, `false` if the queue was empty.
     pub fn drop_packet_at(&mut self, index: usize) -> bool {
-        if self.in_flight.is_empty() {
-            return false;
-        }
-        let actual_idx = index % self.in_flight.len();
-        self.in_flight.remove(actual_idx);
-        true
+        self.network.drop_at(index)
     }
 
-    /// Duplicates the in-flight packet at `index % in_flight.len()`, queuing an extra copy.
-    /// Returns `true` if a packet was duplicated, `false` if `in_flight` was empty or exceeded bounds.
+    /// Duplicates the in-flight packet at `index % len`, queuing an extra copy.
+    /// Returns `true` if a packet was duplicated, `false` if empty or at the bound.
     pub fn duplicate_packet_at(&mut self, index: usize) -> bool {
-        if self.in_flight.is_empty() || self.in_flight.len() >= 512 {
-            return false;
-        }
-        let actual_idx = index % self.in_flight.len();
-        let pkt = self.in_flight[actual_idx].clone();
-        self.in_flight.push(pkt);
-        true
+        self.network.duplicate_at(index)
     }
 
     /// Drains all in-flight messages by advancing logical time until the network is quiescent.
     pub fn drain_network(&mut self, max_ticks: usize) {
         for _ in 0..max_ticks {
-            if self.in_flight.is_empty() {
+            if self.network.is_empty() {
                 break;
             }
             self.tick();
@@ -961,27 +896,18 @@ impl SimCluster {
 
     /// Isolates a node completely by cutting bidirectional network traffic to all peers.
     pub fn isolate_node(&mut self, isolated: NodeId) {
-        for &peer in self.nodes.keys() {
-            if peer != isolated {
-                self.partitions.insert((isolated, peer));
-                self.partitions.insert((peer, isolated));
-            }
-        }
+        let peers: Vec<NodeId> = self.nodes.keys().copied().collect();
+        self.network.isolate(isolated, &peers);
     }
 
     /// Partitions the cluster into two disconnected components.
     pub fn partition(&mut self, group_a: &[NodeId], group_b: &[NodeId]) {
-        for &a in group_a {
-            for &b in group_b {
-                self.partitions.insert((a, b));
-                self.partitions.insert((b, a));
-            }
-        }
+        self.network.partition(group_a, group_b);
     }
 
     /// Heals all network partitions, restoring full peer connectivity.
     pub fn heal_all(&mut self) {
-        self.partitions.clear();
+        self.network.heal_all();
     }
 
     /// Helper to tick the cluster until a leader is elected, up to `max_ticks`.

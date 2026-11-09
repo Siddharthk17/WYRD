@@ -995,6 +995,10 @@ fn test_heartbeat_with_higher_term() {
     );
     assert_eq!(follower.term(), Term::from_raw(6));
     assert_eq!(follower.role(), Role::Follower);
+    for token in persisted_tokens(&output) {
+        output.clear();
+        follower.step(Input::Persisted { token }, &mut output);
+    }
     let echoed = output.messages.iter().any(|m| {
         matches!(
             &m.message,
@@ -1642,7 +1646,7 @@ fn test_candidate_steps_down_on_same_term_heartbeat() {
 }
 
 #[test]
-fn test_divergent_heartbeat_does_not_advance_commit() {
+fn test_heartbeat_does_not_advance_commit_on_term_mismatch() {
     let mut follower = make_core(2, &[1]);
     let mut output = Output::new();
     let leader = NodeId::new(1).expect("leader");
@@ -1653,7 +1657,7 @@ fn test_divergent_heartbeat_does_not_advance_commit() {
             message: Message::AppendEntriesRequest {
                 term: Term::from_raw(2),
                 leader_id: leader,
-                prev_log_index: LogIndex::from_raw(0),
+                prev_log_index: LogIndex::from_raw(1),
                 prev_log_term: Term::from_raw(0),
                 entries: vec![Entry::normal(
                     LogIndex::from_raw(2),
@@ -1687,6 +1691,10 @@ fn test_divergent_heartbeat_does_not_advance_commit() {
         },
         &mut output,
     );
+    for token in persisted_tokens(&output) {
+        output.clear();
+        follower.step(Input::Persisted { token }, &mut output);
+    }
     assert_eq!(follower.commit_index(), LogIndex::from_raw(0));
 }
 

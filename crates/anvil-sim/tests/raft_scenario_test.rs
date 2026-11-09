@@ -171,7 +171,7 @@ fn test_split_vote_and_timeout_resolution() {
     let mut cluster = SimCluster::new(3, 12345);
 
     let drop_votes = true;
-    cluster.drop_hook = Some(Box::new(move |_from, _to, msg| {
+    cluster.network.drop_hook = Some(Box::new(move |_from, _to, msg| {
         if drop_votes
             && matches!(
                 msg,
@@ -189,7 +189,7 @@ fn test_split_vote_and_timeout_resolution() {
         "no leader should win while votes are dropped"
     );
 
-    cluster.drop_hook = None;
+    cluster.network.drop_hook = None;
     let leader = cluster.elect_leader(100);
     assert!(cluster.nodes.contains_key(&leader));
     assert_eq!(cluster.nodes[&leader].role(), Role::Leader);

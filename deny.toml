@@ -1,10 +1,9 @@
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
-notice = "warn"
+yanked = "warn"
+unmaintained = "workspace"
+unsound = "workspace"
 
 [licenses]
-unlicensed = "deny"
 allow = [
     "Apache-2.0",
     "MIT",
@@ -16,6 +15,9 @@ confidence-threshold = 0.8
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Workspace path dependencies carry no version requirement by construction;
+# they resolve to the local crate, never to a floating registry range.
+allow-wildcard-paths = true
 highlight = "all"
 
 [sources]

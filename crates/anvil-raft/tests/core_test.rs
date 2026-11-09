@@ -58,6 +58,28 @@ fn elect_leader(seed: u64) -> (RaftCore, NodeId, Output) {
         },
         &mut output,
     );
+    let hard_state_token = output
+        .persist_ops
+        .iter()
+        .find_map(|op| match op {
+            PersistOp::HardState { token, .. } => Some(*token),
+            _ => None,
+        })
+        .expect("election must persist term and vote");
+    output.clear();
+    leader.step(
+        Input::Persisted {
+            token: hard_state_token,
+        },
+        &mut output,
+    );
+    assert!(
+        output
+            .messages
+            .iter()
+            .any(|m| matches!(&m.message, Message::RequestVoteRequest { .. })),
+        "vote requests release only after term and vote reach disk"
+    );
     output.clear();
     leader.step(
         Input::Recv {
@@ -262,6 +284,9 @@ fn test_conflict_hints_1_rtt_repair() {
         },
         &mut output,
     );
+    for op in output.persist_ops.clone() {
+        follower.step(Input::Persisted { token: op.token() }, &mut output);
+    }
     output.clear();
 
     follower.step(
@@ -282,6 +307,9 @@ fn test_conflict_hints_1_rtt_repair() {
         },
         &mut output,
     );
+    for op in output.persist_ops.clone() {
+        follower.step(Input::Persisted { token: op.token() }, &mut output);
+    }
 
     let rejection = output.messages.first().expect("rejection response");
     match &rejection.message {

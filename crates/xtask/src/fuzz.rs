@@ -73,29 +73,10 @@ pub fn run_fuzz(duration_secs: u64) -> Result<(), String> {
         }
         println!("All {duration_secs}s fuzz runs completed clean!");
     } else {
-        println!(
-            "Notice: `cargo-fuzz` not installed or requires nightly toolchain. Verifying seed corpora..."
-        );
-        let corpus_dir = workspace_root.join("fuzz").join("corpus");
-        for &target in FUZZ_TARGETS {
-            let target_corpus = corpus_dir.join(target);
-            if !target_corpus.exists() || !target_corpus.is_dir() {
-                return Err(format!(
-                    "Corpus directory missing for target `{target}` at {}",
-                    target_corpus.display()
-                ));
-            }
-            let seed_count = std::fs::read_dir(&target_corpus)
-                .map_err(|e| format!("Failed to read {}: {e}", target_corpus.display()))?
-                .count();
-            if seed_count == 0 {
-                return Err(format!("Corpus directory for `{target}` has 0 seed files"));
-            }
-            println!("  [OK] Target `{target}`: {seed_count} seed inputs verified in corpus.");
-        }
-        println!(
-            "All {} fuzz targets compiled and verified with checked-in corpora.",
-            FUZZ_TARGETS.len()
+        return Err(
+            "`cargo-fuzz` not found (requires nightly toolchain + `cargo install cargo-fuzz`). \
+             Fuzz gate not run, not passed. Install and re-run `cargo xtask fuzz --duration-secs 60`."
+                .to_string(),
         );
     }
 

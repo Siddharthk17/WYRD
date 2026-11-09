@@ -12,4 +12,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Run 1M Farm
-        run: cargo run --package xtask -- farm --seeds 0
+        run: cargo run --package xtask -- farm --seeds 1000000

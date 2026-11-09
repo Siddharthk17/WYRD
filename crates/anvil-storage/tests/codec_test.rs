@@ -169,7 +169,7 @@ fn test_hard_state_alternating_slots_recovery() {
             .encode(sector_size, &mut file_buf[sector_len..])
             .unwrap();
 
-            let outcome = recover_hard_state(&file_buf, sector_size).unwrap();
+        let outcome = recover_hard_state(&file_buf, sector_size).unwrap();
         assert_eq!(
             outcome,
             HardStateRecoveryOutcome::BothValid {
@@ -180,7 +180,7 @@ fn test_hard_state_alternating_slots_recovery() {
             }
         );
 
-            let mut corrupt_slot1 = file_buf.clone();
+        let mut corrupt_slot1 = file_buf.clone();
         corrupt_slot1[sector_len + 12] ^= 0xFF; // corrupt slot1 CRC
         let outcome1 = recover_hard_state(&corrupt_slot1, sector_size).unwrap();
         assert_eq!(
@@ -194,7 +194,7 @@ fn test_hard_state_alternating_slots_recovery() {
             }
         );
 
-            let mut corrupt_slot0 = file_buf.clone();
+        let mut corrupt_slot0 = file_buf.clone();
         corrupt_slot0[12] ^= 0xFF; // corrupt slot0 CRC
         let outcome0 = recover_hard_state(&corrupt_slot0, sector_size).unwrap();
         assert_eq!(
@@ -208,7 +208,7 @@ fn test_hard_state_alternating_slots_recovery() {
             }
         );
 
-            let mut both_corrupt = file_buf.clone();
+        let mut both_corrupt = file_buf.clone();
         both_corrupt[12] ^= 0xFF;
         both_corrupt[sector_len + 12] ^= 0xFF;
         let err = recover_hard_state(&both_corrupt, sector_size).unwrap_err();

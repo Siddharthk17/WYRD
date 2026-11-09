@@ -8,9 +8,17 @@
 //! TLC Model Checker automation for ANVIL formal specifications.
 //!
 //! Validates:
-//! 1. `specs/anvil_raft.tla` under `specs/anvil_raft.cfg` (all 7 invariants pass with 0 errors).
-//! 2. `specs/anvil_raft.tla` under `specs/anvil_raft_negative.cfg` (invariant violation occurs,
-//!    confirming the Figure 8 counterexample).
+//! 1. `specs/anvil_raft.tla` under the smoke config `specs/anvil_raft_smoke.cfg`
+//!    via seeded random simulation (no invariant violations on any trace).
+//! 2. `specs/anvil_raft.tla` under `specs/anvil_raft_negative_smoke.cfg`
+//!    via seeded random simulation (invariant violation found, confirming
+//!    the Figure 8 counterexample).
+//!
+//! Exhaustive model checking of the reference 3-server, 3-term, 3-entry
+//! bounds exceeds small machines (measured: 300M+ states, disk exhaustion),
+//! so the per-change gate simulates bounded traces and the reference bounds
+//! run via `cargo xtask tlc-full` on larger hosts. Simulation uses fixed
+//! seeds, so the gate is deterministic for a given spec and tool version.
 
 use crate::determinism::find_workspace_root;
 use std::path::{Path, PathBuf};
@@ -44,11 +52,29 @@ pub fn find_tla2tools_jar(workspace_root: &Path) -> Option<PathBuf> {
 }
 
 /// Runs the TLC model checking gate.
+///
+/// Checks the smoke configs by default. Set `full` to check the reference
+/// 3-server, 3-term, 3-entry bounds instead (nightly only: the state space
+/// exceeds small machines).
 pub fn run_tlc_check() -> Result<(), String> {
+    run_tlc_check_inner(false)
+}
+
+/// Runs the TLC model checking gate against the reference full-bound configs.
+pub fn run_tlc_check_full() -> Result<(), String> {
+    run_tlc_check_inner(true)
+}
+
+fn run_tlc_check_inner(full: bool) -> Result<(), String> {
     let workspace_root = find_workspace_root();
     let spec_path = workspace_root.join("specs").join("anvil_raft.tla");
-    let cfg_path = workspace_root.join("specs").join("anvil_raft.cfg");
-    let neg_cfg_path = workspace_root.join("specs").join("anvil_raft_negative.cfg");
+    let (cfg_name, neg_cfg_name) = if full {
+        ("anvil_raft.cfg", "anvil_raft_negative.cfg")
+    } else {
+        ("anvil_raft_smoke.cfg", "anvil_raft_negative_smoke.cfg")
+    };
+    let cfg_path = workspace_root.join("specs").join(cfg_name);
+    let neg_cfg_path = workspace_root.join("specs").join(neg_cfg_name);
 
     if !spec_path.exists() {
         return Err(format!("Spec file not found at {}", spec_path.display()));
@@ -72,24 +98,148 @@ pub fn run_tlc_check() -> Result<(), String> {
     }
 
     let Some(jar) = find_tla2tools_jar(&workspace_root) else {
-        println!(
-            "Notice: tla2tools.jar not found at tools/tla2tools.jar or in TLA2TOOLS_JAR.\n\
-             Specification files are validated at: {}\n\
-             To run model checker locally, provide tla2tools.jar in tools/ or set TLA2TOOLS_JAR.",
-            spec_path.display()
+        return Err(
+            "TLC gate requires tla2tools.jar (tools/tla2tools.jar or TLA2TOOLS_JAR) and Java 11+. \
+             Download from https://github.com/tlaplus/tlaplus/releases. \
+             Gate not run, not passed."
+                .to_string(),
         );
-        return Ok(());
     };
 
     println!("Running TLC model checking on ANVIL Raft formal specification...");
     let start = Instant::now();
 
-    println!("\n>>> 1. Verifying positive model (specs/anvil_raft.cfg)...");
+    if full {
+        run_exhaustive(
+            &jar,
+            &workspace_root,
+            &spec_path,
+            &cfg_path,
+            &neg_cfg_path,
+            cfg_name,
+            neg_cfg_name,
+        )?;
+    } else {
+        run_simulation_gate(&jar, &workspace_root, &spec_path, &cfg_path, &neg_cfg_path)?;
+    }
+    println!(">>> TLC model check completed in {:.2?}", start.elapsed());
+
+    Ok(())
+}
+
+/// Seeded simulation seeds and depths. Fixed so the gate is deterministic
+/// for a given spec and tool version.
+const SIM_SEEDS: [u64; 3] = [1, 7, 42];
+const SIM_DEPTH: u64 = 500;
+
+/// Runs one seeded simulation, returning TLC's combined output.
+fn run_simulation(
+    jar: &Path,
+    workspace_root: &Path,
+    spec_path: &Path,
+    cfg_path: &Path,
+    seed: u64,
+) -> Result<String, String> {
+    let jar = jar.to_str().unwrap_or_default();
+    let output = Command::new("java")
+        .args([
+            "-XX:+UseParallelGC",
+            "-cp",
+            jar,
+            "tlc2.TLC",
+            "-simulate",
+            "-seed",
+            &seed.to_string(),
+            "-depth",
+            &SIM_DEPTH.to_string(),
+            "-config",
+            cfg_path.to_str().unwrap_or_default(),
+            spec_path.to_str().unwrap_or_default(),
+        ])
+        .current_dir(workspace_root)
+        .output()
+        .map_err(|e| format!("Failed to execute TLC simulation: {e}"))?;
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    for stale in std::fs::read_dir(workspace_root.join("specs"))
+        .map_err(|e| format!("Failed to list specs dir: {e}"))?
+    {
+        let stale = stale.map_err(|e| format!("Failed to read specs entry: {e}"))?;
+        let name = stale.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("anvil_raft_TTrace_") && name.ends_with(".tla") {
+            let _ = std::fs::remove_file(stale.path());
+        }
+    }
+    Ok(combined)
+}
+
+fn simulation_failed(output: &str) -> bool {
+    output.contains("Error: Invariant")
+        || output.contains("is violated")
+        || output.contains("TLC threw an unexpected exception")
+}
+
+fn run_simulation_gate(
+    jar: &Path,
+    workspace_root: &Path,
+    spec_path: &Path,
+    cfg_path: &Path,
+    neg_cfg_path: &Path,
+) -> Result<(), String> {
+    println!("\n>>> 1. Simulating positive model (3 seeds x depth {SIM_DEPTH})...");
+    for seed in SIM_SEEDS {
+        let output = run_simulation(jar, workspace_root, spec_path, cfg_path, seed)?;
+        if simulation_failed(&output) {
+            return Err(format!(
+                "TLC positive simulation FAILED on seed {seed}!\nOUTPUT:\n{output}"
+            ));
+        }
+    }
+    println!(">>> [PASS] Positive simulation: no invariant violations on any trace.");
+
+    println!("\n>>> 2. Simulating negative model counterexample...");
+    let mut violation = None;
+    for seed in SIM_SEEDS {
+        let output = run_simulation(jar, workspace_root, spec_path, neg_cfg_path, seed)?;
+        if simulation_failed(&output)
+            && (output.contains("Error: Invariant") || output.contains("is violated"))
+        {
+            violation = Some(seed);
+            break;
+        }
+    }
+    match violation {
+        Some(seed) => {
+            println!(
+                ">>> [PASS] Negative simulation: Figure 8 counterexample detected (seed {seed})."
+            );
+            Ok(())
+        }
+        None => Err(
+            "TLC negative simulation failed: expected invariant violation (Figure 8) \
+             on every seed, but TLC reported none. The counterexample may need deeper traces."
+                .to_string(),
+        ),
+    }
+}
+
+fn run_exhaustive(
+    jar: &Path,
+    workspace_root: &Path,
+    spec_path: &Path,
+    cfg_path: &Path,
+    neg_cfg_path: &Path,
+    cfg_name: &str,
+    neg_cfg_name: &str,
+) -> Result<(), String> {
+    let jar = jar.to_str().unwrap_or_default();
+    println!("\n>>> 1. Verifying positive model (specs/{cfg_name})...");
     let positive_output = Command::new("java")
         .args([
             "-XX:+UseParallelGC",
             "-cp",
-            jar.to_str().unwrap_or_default(),
+            jar,
             "tlc2.TLC",
             "-workers",
             "auto",
@@ -99,7 +249,7 @@ pub fn run_tlc_check() -> Result<(), String> {
             cfg_path.to_str().unwrap_or_default(),
             spec_path.to_str().unwrap_or_default(),
         ])
-        .current_dir(&workspace_root)
+        .current_dir(workspace_root)
         .output()
         .map_err(|e| format!("Failed to execute TLC: {e}"))?;
 
@@ -116,12 +266,12 @@ pub fn run_tlc_check() -> Result<(), String> {
     }
     println!(">>> [PASS] Positive verification: all invariants held, 0 errors.");
 
-    println!("\n>>> 2. Verifying negative model counterexample (specs/anvil_raft_negative.cfg)...");
+    println!("\n>>> 2. Verifying negative model counterexample (specs/{neg_cfg_name})...");
     let negative_output = Command::new("java")
         .args([
             "-XX:+UseParallelGC",
             "-cp",
-            jar.to_str().unwrap_or_default(),
+            jar,
             "tlc2.TLC",
             "-workers",
             "auto",
@@ -131,7 +281,7 @@ pub fn run_tlc_check() -> Result<(), String> {
             neg_cfg_path.to_str().unwrap_or_default(),
             spec_path.to_str().unwrap_or_default(),
         ])
-        .current_dir(&workspace_root)
+        .current_dir(workspace_root)
         .output()
         .map_err(|e| format!("Failed to execute negative TLC: {e}"))?;
 
@@ -147,7 +297,5 @@ pub fn run_tlc_check() -> Result<(), String> {
     println!(
         ">>> [PASS] Negative verification: Figure 8 counterexample successfully detected by TLC."
     );
-    println!(">>> TLC model check completed in {:.2?}", start.elapsed());
-
     Ok(())
 }

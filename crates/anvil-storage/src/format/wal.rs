@@ -167,6 +167,7 @@ impl WalSegmentHeader {
 
 /// Computes the chained CRC32C checksum for a WAL record frame.
 #[must_use]
+#[allow(clippy::cast_possible_truncation)]
 pub fn compute_wal_record_crc(
     prev_crc: u32,
     segment_id: u64,
@@ -181,7 +182,11 @@ pub fn compute_wal_record_crc(
     meta[8..16].copy_from_slice(&file_offset.to_le_bytes());
     meta[16..24].copy_from_slice(&index.as_u64().to_le_bytes());
     meta[24..32].copy_from_slice(&term.as_u64().to_le_bytes());
-    let payload_len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+    assert!(
+        u32::try_from(payload.len()).is_ok(),
+        "WAL payload exceeds u32 range"
+    );
+    let payload_len = payload.len() as u32;
     meta[32..36].copy_from_slice(&payload_len.to_le_bytes());
     meta[36] = match kind {
         EntryKind::Normal => 0,
@@ -254,9 +259,14 @@ impl WalRecordFrame {
     }
 
     /// Encodes this record frame into the output buffer, appending zero padding.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn encode_frame(&self, sector_size: SectorSize, out: &mut Vec<u8>) {
         let start_len = out.len();
-        let payload_len = u32::try_from(self.payload.len()).unwrap_or(u32::MAX);
+        assert!(
+            u32::try_from(self.payload.len()).is_ok(),
+            "WAL payload exceeds u32 range"
+        );
+        let payload_len = self.payload.len() as u32;
 
         out.reserve(self.frame_size(sector_size));
 
@@ -336,10 +346,8 @@ pub fn decode_wal_frame(
         0 => EntryKind::Normal,
         1 => EntryKind::NoOp,
         _ => {
-            return WalScanResult::Corrupted(StorageError::CrcMismatch {
-                expected: expected_crc,
-                computed: 0,
-                context: "wal_record_kind_invalid",
+            return WalScanResult::Corrupted(StorageError::InvalidField {
+                context: "wal_record_kind",
             });
         }
     };

@@ -212,8 +212,12 @@ HandleRequestVoteResp(s, m) ==
                 THEN
                    \* Server elected Leader: initializes nextIndex, matchIndex, appends no-op
                    /\ role' = [role EXCEPT ![s] = "Leader"]
-                   /\ matchIndex' = [matchIndex EXCEPT ![s] = [p \in Server |-> IF p = s THEN Len(log[s]) + 1 ELSE 0]]
-                   /\ nextIndex' = [nextIndex EXCEPT ![s] = [p \in Server |-> Len(log[s]) + 2]]
+                   /\ matchIndex' = [matchIndex EXCEPT ![s] = [p \in Server |->
+                          IF p = s
+                          THEN IF Len(log[s]) < MaxLogLen THEN Len(log[s]) + 1 ELSE Len(log[s])
+                          ELSE 0]]
+                   /\ nextIndex' = [nextIndex EXCEPT ![s] = [p \in Server |->
+                          IF Len(log[s]) < MaxLogLen THEN Len(log[s]) + 2 ELSE Len(log[s]) + 1]]
                    /\ log' = IF Len(log[s]) < MaxLogLen
                              THEN [log EXCEPT ![s] = Append(log[s], [term |-> currentTerm[s], value |-> 0])]
                              ELSE log

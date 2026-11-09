@@ -8,14 +8,11 @@
 
 //! Deterministic simulation seed farm for ANVIL consensus testing.
 //!
-//! Executes thousands of parallel simulation runs against lossy, duplicating,
-//! and reordering networks on 3, 5, and 7-node clusters with online invariant checking.
+//! Each seed materializes a serializable [`Plan`] before its run starts and
+//! executes it with no generator draws mid-run. Online invariant checking
+//! asserts safety after every transition of every node.
 
-use crate::cluster::SimCluster;
-use crate::device::SimDeviceConfig;
-use anvil_storage::SectorSize;
-use anvil_types::{LogIndex, NodeId};
-use bytes::Bytes;
+use crate::plan::{Plan, run_plan};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
@@ -55,112 +52,16 @@ impl FarmResult {
 
 /// Runs a single deterministic simulation seed.
 ///
-/// Evaluates a 3, 5, or 7-node cluster under network drop, duplicate, and reordering faults.
-/// The online `RaftInvariantChecker` asserts safety after every transition of every node.
+/// Generates the seed's [`Plan`] and executes it.
 pub fn run_farm_seed(seed: u64) {
-    run_farm_seed_inner(seed, false);
+    run_plan(&Plan::generate(seed, false));
 }
 
 /// Runs a single seed with storage fault injection enabled on every node.
 ///
-/// Extends [`run_farm_seed`] with write-path bit rot, read-path bit rot on
-/// recovery, fsync failure crashes, torn writes and unsynced-data loss,
-/// all gated by the shared storage fault atlas.
+/// Generates the seed's storage-fault [`Plan`] and executes it.
 pub fn run_farm_seed_with_storage_faults(seed: u64) {
-    run_farm_seed_inner(seed, true);
-}
-
-/// Runs a single deterministic simulation seed.
-fn run_farm_seed_inner(seed: u64, storage_faults: bool) {
-    let sizes = [3, 5, 7];
-    let cluster_size = sizes[(seed % 3) as usize];
-
-    let mut cluster = if storage_faults {
-        let dev_config = SimDeviceConfig::chaotic(SectorSize::Sector512, 10_000, 5_000, 200);
-        SimCluster::new_with_storage_faults(cluster_size, seed, &dev_config)
-    } else {
-        SimCluster::new(cluster_size, seed)
-    };
-
-    let drop_seed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-
-    cluster.drop_hook = Some(Box::new(move |from, to, _msg| {
-        let draw = (from.get() ^ to.get() ^ drop_seed).wrapping_mul(0x517c_c1b7_2722_0a95);
-        (draw % 100) < 8
-    }));
-
-    cluster.duplicate_hook = Some(Box::new(move |from, to, _msg| {
-        let draw =
-            (from.get().wrapping_add(to.get()) ^ drop_seed).wrapping_mul(0x4b66_f4d9_e213_5a2d);
-        (draw % 100) < 5
-    }));
-
-    cluster.delay_hook = Some(Box::new(move |from, to, _msg| {
-        let draw =
-            (from.get() ^ to.get().rotate_left(16) ^ drop_seed).wrapping_mul(0x6c62_272e_07bb_0142);
-        draw % 4
-    }));
-
-    let node_ids: Vec<NodeId> = cluster.nodes.keys().copied().collect();
-
-    for tick in 1..=30 {
-        cluster.tick();
-
-        if tick % 6 == 0
-            && let Some(leader) = cluster.leader()
-        {
-            let payload = Bytes::from(format!("seed_{seed}_tick_{tick}"));
-            cluster.propose(leader, payload);
-        }
-
-        if tick == 12 && cluster_size > 3 {
-            let isolated = node_ids[cluster_size - 1];
-            cluster.isolate_node(isolated);
-        }
-
-        if tick == 15 {
-            let victim = node_ids[(seed as usize) % cluster_size];
-            if Some(victim) != cluster.leader() {
-                cluster.crash_node(victim);
-                let _ = cluster.restart_node(victim);
-            }
-        }
-
-        if tick == 20 {
-            cluster.heal_all();
-        }
-    }
-
-    cluster.heal_all();
-    cluster.drain_network(20);
-
-    let highest_commit = cluster.highest_commit_index();
-    for (&id, core) in &cluster.nodes {
-        assert!(
-            core.commit_index() <= core.last_log_index(),
-            "commit index exceeds last log index on node {id}"
-        );
-    }
-
-    // Verify all nodes agreeing on committed entries have identical terms
-    for idx in 1..=highest_commit.as_u64() {
-        let log_idx = LogIndex::from_raw(idx);
-        let mut committed_term = None;
-        for core in cluster.nodes.values() {
-            if core.commit_index() >= log_idx
-                && let Some(term) = core.log().term_at(log_idx)
-            {
-                if let Some(first_term) = committed_term {
-                    assert_eq!(
-                        first_term, term,
-                        "seed {seed}: conflicting terms at committed index {idx}"
-                    );
-                } else {
-                    committed_term = Some(term);
-                }
-            }
-        }
-    }
+    run_plan(&Plan::generate(seed, true));
 }
 
 /// Executes `num_seeds` simulation seeds in parallel across worker threads.

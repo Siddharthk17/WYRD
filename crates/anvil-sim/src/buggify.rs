@@ -1,5 +1,5 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 
 /// Metadata and activation statistics for a single buggify injection point.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11,7 +11,7 @@ pub struct BuggifyPoint {
     pub activations: u64,
 }
 
-/// Global registry recording all buggify evaluation points and their activation frequencies.
+/// Registry recording buggify evaluation points and their activation frequencies.
 pub struct BuggifyRegistry {
     enabled: bool,
     points: BTreeMap<String, BuggifyPoint>,
@@ -94,46 +94,36 @@ impl Default for BuggifyRegistry {
     }
 }
 
-static GLOBAL_BUGGIFY: Mutex<BuggifyRegistry> = Mutex::new(BuggifyRegistry::new());
+thread_local! {
+    /// Per-thread buggify registry. Farm worker threads and parallel test
+    /// threads each evaluate points against their own stream, so activation
+    /// order on one thread never perturbs another.
+    static THREAD_BUGGIFY: RefCell<BuggifyRegistry> = const { RefCell::new(BuggifyRegistry::new()) };
+}
 
-/// Evaluates a buggify point against the global registry.
+/// Evaluates a buggify point against the calling thread's registry.
 pub fn record_and_evaluate(name: &str, file: &str, line: u32, probability_ppm: u32) -> bool {
-    let mut reg = GLOBAL_BUGGIFY
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    reg.evaluate(name, file, line, probability_ppm)
+    THREAD_BUGGIFY.with(|reg| reg.borrow_mut().evaluate(name, file, line, probability_ppm))
 }
 
-/// Lists all buggify points recorded so far.
+/// Lists the calling thread's buggify points and their activation statistics.
 pub fn list_registered_points() -> Vec<BuggifyPoint> {
-    let reg = GLOBAL_BUGGIFY
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    reg.list_points()
+    THREAD_BUGGIFY.with(|reg| reg.borrow().list_points())
 }
 
-/// Configures whether buggify points fire.
+/// Configures whether the calling thread's buggify points fire.
 pub fn set_buggify_enabled(enabled: bool) {
-    let mut reg = GLOBAL_BUGGIFY
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    reg.set_enabled(enabled);
+    THREAD_BUGGIFY.with(|reg| reg.borrow_mut().set_enabled(enabled));
 }
 
-/// Sets the master seed for buggify pseudo-random evaluation.
+/// Sets the master seed for the calling thread's buggify pseudo-random evaluation.
 pub fn set_buggify_seed(seed: u64) {
-    let mut reg = GLOBAL_BUGGIFY
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    reg.set_seed(seed);
+    THREAD_BUGGIFY.with(|reg| reg.borrow_mut().set_seed(seed));
 }
 
-/// Resets the global buggify registry.
+/// Resets the calling thread's buggify registry.
 pub fn reset_buggify_registry() {
-    let mut reg = GLOBAL_BUGGIFY
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    reg.reset();
+    THREAD_BUGGIFY.with(|reg| reg.borrow_mut().reset());
 }
 
 /// Buggify macro: injects deterministic pseudo-random faults.

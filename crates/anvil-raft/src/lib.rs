@@ -10,7 +10,8 @@
 //! - Strict persistence contract guaranteeing safety across crashes
 //! - 1-RTT divergent log repair via term conflict hints
 //! - Zero-allocation hot path output buffers
-//! - 1:1 state projection to TLA+ formal specification variables
+//! - `SpecProjection` trace events carrying the TLA+ spec variables, with the
+//!   log represented by its digest so emission stays allocation-free
 
 pub mod core;
 pub mod log;

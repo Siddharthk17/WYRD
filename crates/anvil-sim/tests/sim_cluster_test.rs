@@ -129,19 +129,19 @@ fn test_unreliable_network_drops_duplicates_delays() {
 
     let drop_counter = std::sync::Arc::new(AtomicU64::new(0));
     let drop_clone = drop_counter.clone();
-    cluster.drop_hook = Some(Box::new(move |_from, _to, _msg| {
+    cluster.network.drop_hook = Some(Box::new(move |_from, _to, _msg| {
         let seen = drop_clone.fetch_add(1, Ordering::Relaxed);
         seen.is_multiple_of(5)
     }));
 
     let dup_counter = std::sync::Arc::new(AtomicU64::new(0));
     let dup_clone = dup_counter.clone();
-    cluster.duplicate_hook = Some(Box::new(move |_from, _to, _msg| {
+    cluster.network.duplicate_hook = Some(Box::new(move |_from, _to, _msg| {
         let seen = dup_clone.fetch_add(1, Ordering::Relaxed);
         seen.is_multiple_of(7)
     }));
 
-    cluster.delay_hook = Some(Box::new(|_from, _to, _msg| 2));
+    cluster.network.delay_hook = Some(Box::new(|_from, _to, _msg| 2));
 
     let leader_id = cluster.elect_leader(250);
     cluster.drain_network(60);
