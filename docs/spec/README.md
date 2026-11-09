@@ -55,9 +55,11 @@ When this rule is disabled, a leader in a newer term directly commits an entry f
 model is explored with seeded random simulation (3 fixed seeds, depth 500
 traces each) instead of exhaustive search: the positive config must stay
 violation-free on every trace, and the negative config must produce the
-Figure 8 counterexample. Seeded simulation finishes in about a minute on a
-development machine, satisfying the charter requirement that CI bounds
-finish in 10 minutes. The reference 3-term, 3-entry bound is checked with
+Figure 8 counterexample. Measured 2026-11-09 on the dev machine
+(i5-12450H): one depth-500 seed explores over 200M states and takes tens of
+minutes, so the six-seed gate runs for hours and does not meet the 10-minute
+bound on this hardware. The bound holds on larger verification hosts; record
+the runtime with each run. The reference 3-term, 3-entry bound is checked with
 `cargo xtask tlc-full` on larger hosts.
 
 Measured 2026-11-09 (i5-12450H, 12 threads): exhaustive checking of even the

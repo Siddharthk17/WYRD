@@ -323,6 +323,14 @@ fn test_arbitrary_entry_roundtrips_through_codec() {
     let raw: Vec<u8> = (0u8..=255u8).collect();
     let mut u = Unstructured::new(&raw);
     let entry = Entry::arbitrary(&mut u).expect("arbitrary entry");
+    let mut other_raw = raw.clone();
+    other_raw[0] ^= 0xFF;
+    let mut u2 = Unstructured::new(&other_raw);
+    let other = Entry::arbitrary(&mut u2).expect("arbitrary entry");
+    assert_ne!(
+        other.index, entry.index,
+        "Arbitrary must vary entry output with input bytes"
+    );
     let mut buf = Vec::new();
     entry
         .encode(&mut buf)
