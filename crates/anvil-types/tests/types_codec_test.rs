@@ -129,7 +129,9 @@ fn test_entry_roundtrip_bytes_zero_copy() {
     );
 
     let mut buf = Vec::new();
-    entry.encode(&mut buf);
+    entry
+        .encode(&mut buf)
+        .expect("encode must succeed for test fixture");
 
     let mut bytes_buf = Bytes::from(buf);
     let decoded = Entry::decode_from_bytes(&mut bytes_buf).expect("decode from bytes");
@@ -145,7 +147,9 @@ fn test_entry_roundtrip_bytes_zero_copy() {
 fn test_entry_noop_roundtrip() {
     let entry = Entry::noop(LogIndex::from_raw(42), Term::from_raw(5));
     let mut buf = Vec::new();
-    entry.encode(&mut buf);
+    entry
+        .encode(&mut buf)
+        .expect("encode must succeed for test fixture");
 
     let mut cursor = &buf[..];
     let decoded = Entry::decode_from_slice(&mut cursor).expect("decode from slice");
@@ -161,7 +165,9 @@ fn test_crc_corruption_rejection() {
         Bytes::from_static(b"hello world"),
     );
     let mut buf = Vec::new();
-    entry.encode(&mut buf);
+    entry
+        .encode(&mut buf)
+        .expect("encode must succeed for test fixture");
 
     // Corrupt one payload byte
     let len = buf.len();
@@ -178,7 +184,7 @@ fn test_crc_corruption_rejection() {
 #[test]
 fn test_invalid_magic_rejection() {
     let mut buf = Vec::new();
-    Frame::encode(FrameType::Entry, b"test", &mut buf);
+    Frame::encode(FrameType::Entry, b"test", &mut buf).expect("frame encode must succeed");
     buf[0] = b'X';
 
     let mut cursor = &buf[..];
@@ -240,7 +246,7 @@ fn test_frame_decode_from_bytes_exact_length_boundary() {
     let mut payload = vec![0u8; 8];
     anvil_types::encode_u64_le(0x0102_0304_0506_0708, &mut payload);
     let mut framed = Vec::new();
-    Frame::encode(FrameType::Entry, &payload, &mut framed);
+    Frame::encode(FrameType::Entry, &payload, &mut framed).expect("frame encode must succeed");
     let total = framed.len();
     let mut truncated = Bytes::copy_from_slice(&framed[..total - 1]);
     assert!(matches!(
@@ -251,7 +257,7 @@ fn test_frame_decode_from_bytes_exact_length_boundary() {
     assert!(Frame::decode_from_bytes(&mut exact).is_ok());
 
     let mut empty_framed = Vec::new();
-    Frame::encode(FrameType::Entry, &[], &mut empty_framed);
+    Frame::encode(FrameType::Entry, &[], &mut empty_framed).expect("frame encode must succeed");
     assert_eq!(empty_framed.len(), anvil_types::FrameHeader::HEADER_LEN);
     let mut exact_empty = Bytes::copy_from_slice(&empty_framed);
     assert!(Frame::decode_from_bytes(&mut exact_empty).is_ok());
@@ -290,7 +296,9 @@ fn test_decode_strict_rejects_trailing_bytes() {
         Bytes::from_static(b"x"),
     );
     let mut buf = Vec::new();
-    entry.encode(&mut buf);
+    entry
+        .encode(&mut buf)
+        .expect("encode must succeed for test fixture");
     assert!(Entry::decode_strict(&buf).is_ok());
     let mut trailed = buf.clone();
     trailed.push(0x00);
@@ -316,7 +324,9 @@ fn test_arbitrary_entry_roundtrips_through_codec() {
     let mut u = Unstructured::new(&raw);
     let entry = Entry::arbitrary(&mut u).expect("arbitrary entry");
     let mut buf = Vec::new();
-    entry.encode(&mut buf);
+    entry
+        .encode(&mut buf)
+        .expect("encode must succeed for test fixture");
     let mut cursor = &buf[..];
     let decoded = Entry::decode_from_slice(&mut cursor).expect("roundtrip");
     assert_eq!(decoded.index, entry.index);

@@ -345,7 +345,9 @@ fn test_snapshot_codec_edges() {
         payload: Bytes::from_static(b"snapshot-bytes"),
     };
     let mut chunk_buf = Vec::new();
-    chunk.encode(&mut chunk_buf);
+    chunk
+        .encode(&mut chunk_buf)
+        .expect("encode must succeed for test fixture");
     assert!(matches!(
         SnapshotChunk::decode(&chunk_buf[..8], 0),
         Err(StorageError::BufferTooSmall { .. })
@@ -491,7 +493,7 @@ fn test_engine_empty_and_hard_state_paths() {
         })
         .expect("hard-state sync");
     let write_bytes = match &write_op_clone {
-        DeviceOp::Write { data, .. } => data.clone(),
+        DeviceOp::Write { payload, .. } => payload.clone(),
         _ => unreachable!("checked above"),
     };
     output.clear();
@@ -595,7 +597,7 @@ fn test_device_op_ids_all_variants() {
             op_id: 3,
             file_id: FileId::HARD_STATE,
             offset: 0,
-            data: Bytes::from_static(b"x"),
+            payload: Bytes::from_static(b"x"),
         },
         DeviceOp::Read {
             op_id: 4,

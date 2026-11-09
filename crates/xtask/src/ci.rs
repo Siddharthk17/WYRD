@@ -397,7 +397,23 @@ fn run_coverage_gate(workspace_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Aggregates per-file line counts from an llvm-cov summary table by crate.
+/// Crates the coverage gate enforces floors for.
+fn covered_crates() -> Vec<&'static str> {
+    vec![
+        "anvil-types",
+        "anvil-raft",
+        "anvil-storage",
+        "anvil-sim",
+        "anvil-node",
+        "anvil-kv",
+        "anvil-check",
+        "anvil-device-fs",
+    ]
+}
+
+/// Aggregates per-file line counts from an llvm-cov summary table, keyed by
+/// workspace crate. Accepts absolute paths containing `/crates/<name>/src/`
+/// as well as workspace-relative `<name>/src/` paths.
 fn aggregate_coverage(
     report: &str,
 ) -> Result<std::collections::BTreeMap<String, (u64, u64)>, String> {
@@ -409,15 +425,12 @@ fn aggregate_coverage(
         let Some(path) = fields.first() else {
             continue;
         };
-        let Some(crates_pos) = path.find("/crates/") else {
+        let Some(krate) = covered_crates().into_iter().find(|krate| {
+            path.contains(&format!("/crates/{krate}/src/"))
+                || path.starts_with(&format!("{krate}/src/"))
+        }) else {
             continue;
         };
-        let Some(src_pos) = path.find("/src/") else {
-            continue;
-        };
-        if src_pos < crates_pos {
-            continue;
-        }
         if fields.len() < 11 {
             return Err(format!("Unparseable coverage row: {line}"));
         }
@@ -427,12 +440,7 @@ fn aggregate_coverage(
         let missed: u64 = fields[8]
             .parse()
             .map_err(|_| format!("Unparseable coverage row: {line}"))?;
-        let name = path[crates_pos + "/crates/".len()..]
-            .split('/')
-            .next()
-            .unwrap_or_default()
-            .to_string();
-        let entry = totals.entry(name).or_insert((0, 0));
+        let entry = totals.entry(krate.to_string()).or_insert((0, 0));
         entry.0 += lines;
         entry.1 += missed;
         rows += 1;
@@ -452,6 +460,7 @@ mod coverage_tests {
 Filename Regions Missed Regions Cover Functions Missed Functions Executed Lines Missed Lines Cover Branches Missed Branches Cover
 mnt/data2/WYRD/crates/anvil-types/src/codec.rs 10 1 90.00% 4 0 100.00% 100 10 90.00% 0 0 -
 mnt/data2/WYRD/crates/anvil-raft/src/core.rs 20 2 90.00% 6 0 100.00% 200 10 95.00% 0 0 -
+anvil-storage/src/engine.rs 5 0 100.00% 2 0 100.00% 50 5 90.00% 0 0 -
 /other/path/outside_repo.rs 5 5 0.00% 1 1 0.00% 50 50 0.00% 0 0 -";
 
     #[test]
@@ -459,6 +468,7 @@ mnt/data2/WYRD/crates/anvil-raft/src/core.rs 20 2 90.00% 6 0 100.00% 200 10 95.0
         let totals = aggregate_coverage(FIXTURE).expect("fixture parses");
         assert_eq!(totals.get("anvil-types"), Some(&(100, 10)));
         assert_eq!(totals.get("anvil-raft"), Some(&(200, 10)));
+        assert_eq!(totals.get("anvil-storage"), Some(&(50, 5)));
         assert!(!totals.contains_key("other"));
         assert_eq!(coverage_percent(100, 10), 90.0);
     }

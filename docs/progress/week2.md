@@ -16,7 +16,7 @@
   - PreVote, CheckQuorum, leader stickiness, and current-term commit rule.
   - Seven core Raft safety invariants: `ElectionSafety`, `LeaderAppendOnly`, `LogMatching`, `LeaderCompleteness`, `StateMachineSafety`, `CommittedEntriesNeverLost`, `TermMonotonic`.
 - Negative model configuration `specs/anvil_raft_negative.cfg` modeling Figure 8 of the Raft paper (verifying that removing the current-term commit rule produces the known safety violation).
-- Specification documentation in `docs/spec/README.md` and [ADR 0009: TLA+ Specification and Model-Checking Strategy](../adr/0009-tla-specification-and-model-checking.md).
+- Specification documentation in `docs/spec/README.md` and [ADR 0009: TLA+ Formal Specification and Verification](../adr/0009-tla-formal-specification-and-verification.md).
 - TLC gate runner wired into `xtask` (`cargo xtask tlc`).
 
 ### B. Sans-IO Consensus Core (`anvil-raft`)
@@ -28,7 +28,7 @@
   - Follower progress tracking (`Probe` and `Replicate`), in-flight window cap, byte limits per message, optimistic `next_index` advancement, and 1-RTT conflict hints (`conflict_term`, `conflict_index`).
   - Commit index advancement restricted strictly to quorum matches on entries of the current term.
   - Strict persistence contract: vote/append responses released only after `Persisted` input; leader sends appends in parallel but counts matches and applies only after `Persisted`; terms and votes persisted before outward exposure.
-  - Full design and TLA+ action mapping table documented in [docs/design/raft-core.md](../design/raft-core.md) and [ADR 0010: Sans-IO Raft Core and Persistence Contract](../adr/0010-sans-io-raft-core.md).
+  - Full design and TLA+ action mapping table documented in [docs/design/raft-core.md](../design/raft-core.md) and [ADR 0010: Sans-IO Raft Core and Persistence Contract](../adr/0010-raft-sans-io-and-persistence-contract.md).
 
 ### C. Online Invariant Checker & Multi-Node Simulator Cluster (`anvil-sim`)
 - `RaftInvariantChecker` (`crates/anvil-sim/src/raft_invariants.rs`):
@@ -312,8 +312,8 @@ FARM PASSED: All 100000 seeds completed with zero invariant violations.
 
 ## 4. Architecture Decisions Taken
 
-- [ADR 0009: TLA+ Formal Specification and Model-Checking Strategy](../adr/0009-tla-specification-and-model-checking.md)
-- [ADR 0010: Sans-IO Raft Core Architecture and Persistence Contract](../adr/0010-sans-io-raft-core.md)
+- [ADR 0009: TLA+ Formal Specification and Model-Checking Strategy](../adr/0009-tla-formal-specification-and-verification.md)
+- [ADR 0010: Raft Sans-IO Consensus Core and Persistence Contract](../adr/0010-raft-sans-io-and-persistence-contract.md)
 
 ---
 

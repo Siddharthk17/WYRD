@@ -10,17 +10,22 @@ use thiserror::Error;
 /// Error returned during simulation kernel execution.
 #[derive(Debug, Error)]
 pub enum SimError {
+    /// Watchdog fired: queue emptied early or no progress marker observed.
     #[error("watchdog triggered: {0}")]
     Watchdog(#[from] WatchdogError),
 
+    /// Event targeted an actor id with no registered actor.
     #[error("unknown target actor: {0}")]
     UnknownActor(u64),
 
+    /// Event timestamp moved backward. Times never move backward.
     #[error(
         "simulation time regression: current time {current} advanced to earlier time {attempted}"
     )]
     TimeRegression {
+        /// Time already reached by the kernel.
         current: SimTime,
+        /// Earlier time the popped event carried.
         attempted: SimTime,
     },
 }
@@ -28,9 +33,13 @@ pub enum SimError {
 /// Simulation outcome report containing execution statistics and cryptographic trace hash.
 #[derive(Debug, Clone)]
 pub struct SimReport {
+    /// Virtual time of the last processed event.
     pub final_time: SimTime,
+    /// Total events dispatched.
     pub events_processed: u64,
+    /// Streaming BLAKE3 digest of the full event trace.
     pub trace_hash: blake3::Hash,
+    /// Buggify points evaluated with hit counts.
     pub buggify_points: Vec<BuggifyPoint>,
 }
 

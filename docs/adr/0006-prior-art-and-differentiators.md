@@ -4,7 +4,7 @@
 Accepted
 
 ## Context
-Deterministic simulation testing (DST) has become the gold standard for mission-critical distributed systems. Several notable frameworks and industry implementations exist, including Turmoil, Madsim, Shuttle, Loom, FoundationDB, and TigerBeetle. ANVIL evaluates their architectures and identifies why it takes a distinct approach.
+Deterministic simulation testing is the standard method for validating distributed consensus. Implementations include Turmoil, Madsim, Shuttle, Loom, FoundationDB, and TigerBeetle. ANVIL evaluates their architectures and records why it takes a different approach.
 
 ## Comparison of Prior Art
 

@@ -95,7 +95,7 @@ fn test_sim_device_torn_write_at_sector_granularity_512_and_4096() {
             op_id: 3,
             file_id,
             offset: 0,
-            data: Bytes::from(header_buf),
+            payload: Bytes::from(header_buf),
         });
         assert!(device.poll_completion().unwrap().result.is_ok());
         device.submit(DeviceOp::Fdatasync { op_id: 4, file_id });
@@ -117,7 +117,7 @@ fn test_sim_device_torn_write_at_sector_granularity_512_and_4096() {
             op_id: 5,
             file_id,
             offset: sector_size.as_u64(),
-            data: Bytes::from(frame_buf),
+            payload: Bytes::from(frame_buf),
         });
         assert!(device.poll_completion().unwrap().result.is_ok());
 
@@ -251,7 +251,7 @@ fn test_sim_device_storage_fault_atlas_quorum_survivability() {
         op_id: 2,
         file_id,
         offset: 512,
-        data: Bytes::from(frame_buf.clone()),
+        payload: Bytes::from(frame_buf.clone()),
     });
     let comp1 = dev1.poll_completion().unwrap();
     assert!(comp1.result.is_ok());
@@ -263,7 +263,7 @@ fn test_sim_device_storage_fault_atlas_quorum_survivability() {
         op_id: 3,
         file_id,
         offset: 512,
-        data: Bytes::from(frame_buf),
+        payload: Bytes::from(frame_buf),
     });
     let comp2 = dev2.poll_completion().unwrap();
     assert!(comp2.result.is_ok());
@@ -319,7 +319,7 @@ fn test_sim_device_write_path_bitrot_and_read_corruption() {
         op_id: 2,
         file_id,
         offset: 0,
-        data: Bytes::from(vec![0xAAu8; 64]),
+        payload: Bytes::from(vec![0xAAu8; 64]),
     });
     let comp = device.poll_completion().unwrap();
     assert!(comp.result.is_ok());
@@ -344,7 +344,7 @@ fn test_sim_device_write_path_bitrot_and_read_corruption() {
         op_id: 2,
         file_id,
         offset: 0,
-        data: Bytes::from(vec![0xBBu8; 64]),
+        payload: Bytes::from(vec![0xBBu8; 64]),
     });
     assert!(device2.poll_completion().unwrap().result.is_ok());
     device2.submit(DeviceOp::Read {
@@ -381,7 +381,7 @@ fn test_sim_device_crash_loses_unsynced_torn_sectors() {
         op_id: 2,
         file_id,
         offset: 0,
-        data: Bytes::from(vec![0xCCu8; 512]),
+        payload: Bytes::from(vec![0xCCu8; 512]),
     });
     assert!(device.poll_completion().unwrap().result.is_ok());
 
@@ -429,7 +429,7 @@ fn test_sim_device_file_lifecycle_ops_and_listings() {
         op_id: 4,
         file_id: seg,
         offset: 0,
-        data: Bytes::from(vec![7u8; 100]),
+        payload: Bytes::from(vec![7u8; 100]),
     });
     assert!(device.poll_completion().unwrap().result.is_ok());
 
@@ -557,7 +557,7 @@ fn test_sim_device_crash_torn_write_and_revert_paths() {
         op_id: 3,
         file_id,
         offset: 0,
-        data: Bytes::from(vec![0xDDu8; 512]),
+        payload: Bytes::from(vec![0xDDu8; 512]),
     });
     assert!(device.poll_completion().unwrap().result.is_ok());
 
@@ -580,7 +580,7 @@ fn test_sim_device_missing_file_operations_error() {
         op_id: 1,
         file_id: missing,
         offset: 0,
-        data: Bytes::from(vec![1u8; 8]),
+        payload: Bytes::from(vec![1u8; 8]),
     });
     assert!(device.poll_completion().unwrap().result.is_err());
 
@@ -634,7 +634,7 @@ fn test_sim_device_read_durable_paths() {
         op_id: 2,
         file_id,
         offset: 0,
-        data: Bytes::from(vec![0xEEu8; 64]),
+        payload: Bytes::from(vec![0xEEu8; 64]),
     });
     assert!(device.poll_completion().unwrap().result.is_ok());
     device.submit(DeviceOp::Fdatasync { op_id: 3, file_id });

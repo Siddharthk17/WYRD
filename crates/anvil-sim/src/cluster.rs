@@ -381,7 +381,8 @@ impl SimCluster {
                 }
             }
         } else {
-            // Fallback for standalone nodes without storage configuration
+            // Nodes registered without storage (public maps allow manual insertion)
+            // acknowledge persistence immediately to keep pure-consensus harnesses live.
             let persist_tokens: Vec<_> = self
                 .output_scratch
                 .persist_ops
@@ -725,7 +726,10 @@ impl SimCluster {
                             recovered.log.last_term,
                         );
                         let mut hdr_buf = vec![0u8; sector_len];
-                        let _ = resume_header.encode(&mut hdr_buf);
+                        assert!(
+                            resume_header.encode(&mut hdr_buf).is_ok(),
+                            "resume header buffer is sector sized"
+                        );
                         storage
                             .device
                             .overwrite_durable(FileId::wal_segment(torn_id), 0, &hdr_buf);
@@ -952,12 +956,15 @@ fn init_node_storage(device: &mut SimDevice, config: &StorageConfig) {
     // Write initial slot 0: term 0, seq 0, vote None
     let slot0 = HardStateSlot::new(0, 0, Term::from_raw(0), None);
     let mut slot_buf = vec![0u8; sector_len];
-    let _ = slot0.encode(sector_size, &mut slot_buf);
+    assert!(
+        slot0.encode(sector_size, &mut slot_buf).is_ok(),
+        "initial hard-state slot buffer is sector sized"
+    );
     device.submit(DeviceOp::Write {
         op_id: 2,
         file_id: FileId::HARD_STATE,
         offset: 0,
-        data: Bytes::from(slot_buf),
+        payload: Bytes::from(slot_buf),
     });
     device.submit(DeviceOp::Fdatasync {
         op_id: 3,
@@ -972,12 +979,15 @@ fn init_node_storage(device: &mut SimDevice, config: &StorageConfig) {
     });
     let header = WalSegmentHeader::new(sector_size, 1, LogIndex::from_raw(1), Term::from_raw(0));
     let mut hdr_buf = vec![0u8; sector_len];
-    let _ = header.encode(&mut hdr_buf);
+    assert!(
+        header.encode(&mut hdr_buf).is_ok(),
+        "initial segment header buffer is sector sized"
+    );
     device.submit(DeviceOp::Write {
         op_id: 5,
         file_id: FileId::wal_segment(1),
         offset: 0,
-        data: Bytes::from(hdr_buf),
+        payload: Bytes::from(hdr_buf),
     });
     device.submit(DeviceOp::Fdatasync {
         op_id: 6,

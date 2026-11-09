@@ -136,6 +136,11 @@ impl SnapshotHeader {
 
         let raw_sector_size = u16::from_le_bytes([buf[10], buf[11]]);
         let sector_size = SectorSize::from_u16(raw_sector_size)?;
+        if buf[12..16] != [0, 0, 0, 0] {
+            return Err(StorageError::InvalidField {
+                context: "snapshot_header_reserved",
+            });
+        }
         let last_index = LogIndex::from_raw(u64::from_le_bytes([
             buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
         ]));
@@ -152,6 +157,11 @@ impl SnapshotHeader {
             buf[48], buf[49], buf[50], buf[51], buf[52], buf[53], buf[54], buf[55],
         ]);
         let expected_crc = u32::from_le_bytes([buf[56], buf[57], buf[58], buf[59]]);
+        if buf[60..64] != [0, 0, 0, 0] {
+            return Err(StorageError::InvalidField {
+                context: "snapshot_header_trailing",
+            });
+        }
 
         let computed_crc = crc32c::crc32c(&buf[0..56]);
         if expected_crc != computed_crc {
@@ -186,13 +196,16 @@ pub struct SnapshotChunk {
 
 impl SnapshotChunk {
     /// Encodes chunk header and payload into an output buffer.
-    #[allow(clippy::cast_possible_truncation)]
-    pub fn encode(&self, out: &mut Vec<u8>) {
-        assert!(
-            u32::try_from(self.payload.len()).is_ok(),
-            "snapshot chunk exceeds u32 range"
-        );
-        let payload_len = self.payload.len() as u32;
+    ///
+    /// # Errors
+    /// Returns `StorageError::InvalidField` when the payload does not fit in
+    /// a `u32` length prefix. The bound is checked before reserving so an
+    /// oversized state chunk cannot exhaust memory.
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), StorageError> {
+        let payload_len =
+            u32::try_from(self.payload.len()).map_err(|_| StorageError::InvalidField {
+                context: "snapshot_chunk_payload_too_large",
+            })?;
         let chunk_crc = crc32c::crc32c(&self.payload);
 
         let mut header = [0u8; SNAPSHOT_CHUNK_HEADER_LEN];
@@ -204,6 +217,7 @@ impl SnapshotChunk {
         out.reserve(SNAPSHOT_CHUNK_HEADER_LEN + self.payload.len());
         out.extend_from_slice(&header);
         out.extend_from_slice(&self.payload);
+        Ok(())
     }
 
     /// Decodes a chunk from a buffer, returning the decoded chunk and consumed bytes.
@@ -224,6 +238,11 @@ impl SnapshotChunk {
 
         let payload_len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
         let expected_crc = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        if buf[12..16] != [0, 0, 0, 0] {
+            return Err(StorageError::InvalidField {
+                context: "snapshot_chunk_reserved",
+            });
+        }
 
         let total_len = SNAPSHOT_CHUNK_HEADER_LEN + payload_len;
         if buf.len() < total_len {
@@ -329,6 +348,11 @@ impl SnapshotFooter {
         let mut blake3_digest = [0u8; 32];
         blake3_digest.copy_from_slice(&buf[16..48]);
         let expected_crc = u32::from_le_bytes([buf[48], buf[49], buf[50], buf[51]]);
+        if buf[52..64] != [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] {
+            return Err(StorageError::InvalidField {
+                context: "snapshot_footer_trailing",
+            });
+        }
 
         let computed_crc = crc32c::crc32c(&buf[0..48]);
         if expected_crc != computed_crc {

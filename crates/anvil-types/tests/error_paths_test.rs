@@ -66,7 +66,9 @@ fn test_frame_slice_decode_rejects_truncation() {
 
     let entry = Entry::noop(LogIndex::from_raw(1), Term::from_raw(1));
     let mut buf = Vec::new();
-    entry.encode(&mut buf);
+    entry
+        .encode(&mut buf)
+        .expect("encode must succeed for test fixture");
     let mut clipped = &buf[..buf.len() - 1];
     assert!(Frame::decode_from_slice(&mut clipped).is_err());
 
@@ -81,7 +83,9 @@ fn test_frame_bytes_decode_rejects_truncation() {
 
     let entry = Entry::noop(LogIndex::from_raw(1), Term::from_raw(1));
     let mut buf = Vec::new();
-    entry.encode(&mut buf);
+    entry
+        .encode(&mut buf)
+        .expect("encode must succeed for test fixture");
     let mut clipped = Bytes::from(buf[..buf.len() - 2].to_vec());
     assert!(Frame::decode_from_bytes(&mut clipped).is_err());
 }
@@ -184,7 +188,8 @@ fn test_entry_new_constructor() {
 #[test]
 fn test_entry_slice_decode_rejects_bad_body() {
     let mut heartbeat = Vec::new();
-    Frame::encode(FrameType::Heartbeat, b"ping", &mut heartbeat);
+    Frame::encode(FrameType::Heartbeat, b"ping", &mut heartbeat)
+        .expect("frame encode must succeed");
     let mut cursor = &heartbeat[..];
     assert_eq!(
         Entry::decode_from_slice(&mut cursor),
@@ -196,7 +201,7 @@ fn test_entry_slice_decode_rejects_bad_body() {
     encode_varint_u64(3, &mut body);
     body.push(9);
     let mut framed = Vec::new();
-    Frame::encode(FrameType::Entry, &body, &mut framed);
+    Frame::encode(FrameType::Entry, &body, &mut framed).expect("frame encode must succeed");
     let mut bad_kind = &framed[..];
     assert_eq!(
         Entry::decode_from_slice(&mut bad_kind),
@@ -207,7 +212,8 @@ fn test_entry_slice_decode_rejects_bad_body() {
     encode_varint_u64(7, &mut no_kind_body);
     encode_varint_u64(3, &mut no_kind_body);
     let mut no_kind_framed = Vec::new();
-    Frame::encode(FrameType::Entry, &no_kind_body, &mut no_kind_framed);
+    Frame::encode(FrameType::Entry, &no_kind_body, &mut no_kind_framed)
+        .expect("frame encode must succeed");
     let mut no_kind = &no_kind_framed[..];
     assert!(Entry::decode_from_slice(&mut no_kind).is_err());
 }
@@ -215,7 +221,8 @@ fn test_entry_slice_decode_rejects_bad_body() {
 #[test]
 fn test_entry_bytes_decode_rejects_bad_body() {
     let mut heartbeat = Vec::new();
-    Frame::encode(FrameType::Heartbeat, b"ping", &mut heartbeat);
+    Frame::encode(FrameType::Heartbeat, b"ping", &mut heartbeat)
+        .expect("frame encode must succeed");
     let mut heartbeat_bytes = Bytes::from(heartbeat);
     assert_eq!(
         Entry::decode_from_bytes(&mut heartbeat_bytes),
@@ -226,7 +233,7 @@ fn test_entry_bytes_decode_rejects_bad_body() {
     encode_varint_u64(7, &mut body);
     encode_varint_u64(3, &mut body);
     let mut framed = Vec::new();
-    Frame::encode(FrameType::Entry, &body, &mut framed);
+    Frame::encode(FrameType::Entry, &body, &mut framed).expect("frame encode must succeed");
     let mut framed_bytes = Bytes::from(framed);
     assert!(Entry::decode_from_bytes(&mut framed_bytes).is_err());
 
@@ -236,7 +243,8 @@ fn test_entry_bytes_decode_rejects_bad_body() {
         Term::from_raw(1),
         Bytes::from_static(b"payload"),
     )
-    .encode(&mut entry_buf);
+    .encode(&mut entry_buf)
+    .expect("encode entry");
     let last = entry_buf.len() - 1;
     entry_buf[last] ^= 0xFF;
     let mut corrupt = Bytes::from(entry_buf);

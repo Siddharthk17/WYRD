@@ -85,9 +85,13 @@ impl FrameType {
 /// - `[12..16]`: CRC32C checksum of the header fields and payload (little-endian `u32`)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameHeader {
+    /// Wire protocol version. Must equal `CODEC_VERSION_1`.
     pub version: u16,
+    /// Raw `FrameType` tag in little-endian order.
     pub frame_type: u16,
+    /// Payload length in bytes. Checked against `MAX_FRAME_PAYLOAD_LEN` on decode.
     pub payload_len: u32,
+    /// CRC32C over header fields and payload.
     pub checksum: u32,
 }
 
@@ -149,16 +153,29 @@ impl FrameHeader {
 /// A framed message containing a validated header and an opaque payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
+    /// Validated header. `payload_len` matches `payload.len()`.
     pub header: FrameHeader,
+    /// Opaque payload bytes. Zero-copy sliced from the input buffer on decode.
     pub payload: Bytes,
 }
 
 impl Frame {
     /// Encodes a complete frame (header + payload) with CRC32C verification.
-    #[allow(clippy::cast_possible_truncation)]
-    pub fn encode(frame_type: FrameType, payload: &[u8], buf: &mut Vec<u8>) {
-        assert!(payload.len() <= MAX_FRAME_PAYLOAD_LEN as usize);
-        let payload_len = payload.len() as u32;
+    ///
+    /// # Errors
+    /// Returns `CodecError::PayloadTooLarge` when `payload` exceeds the
+    /// configured maximum frame size. The bound is checked before any
+    /// allocation so a hostile peer cannot force an oversized reservation.
+    pub fn encode(
+        frame_type: FrameType,
+        payload: &[u8],
+        buf: &mut Vec<u8>,
+    ) -> Result<(), CodecError> {
+        let payload_len =
+            u32::try_from(payload.len()).map_err(|_| CodecError::PayloadTooLarge {
+                length: payload.len() as u64,
+                limit: u64::from(MAX_FRAME_PAYLOAD_LEN),
+            })?;
 
         let mut crc = crc32c::crc32c(&FRAME_MAGIC);
         crc = crc32c::crc32c_append(crc, &CODEC_VERSION_1.to_le_bytes());
@@ -175,6 +192,7 @@ impl Frame {
 
         header.encode(buf);
         buf.extend_from_slice(payload);
+        Ok(())
     }
 
     /// Decodes a frame from a byte slice.
@@ -383,19 +401,34 @@ pub fn decode_u64_le(buf: &mut &[u8]) -> Result<u64, CodecError> {
 
 impl Entry {
     /// Encodes an entry into a framed wire buffer.
-    pub fn encode(&self, buf: &mut Vec<u8>) {
-        assert!(
-            self.payload.len() + 32 <= MAX_FRAME_PAYLOAD_LEN as usize,
-            "entry payload exceeds maximum frame size"
-        );
-        let mut body = Vec::with_capacity(32 + self.payload.len());
+    ///
+    /// # Errors
+    /// Returns `CodecError::PayloadTooLarge` when the encoded body would
+    /// exceed the maximum frame size. The check runs before the body buffer
+    /// is reserved so oversized client payloads cannot exhaust memory.
+    pub fn encode(&self, buf: &mut Vec<u8>) -> Result<(), CodecError> {
+        let mut body = Vec::new();
         encode_varint_u64(self.index.as_u64(), &mut body);
         encode_varint_u64(self.term.as_u64(), &mut body);
         body.push(self.kind.as_u8());
+        let body_prefix_len = body.len() as u64;
+        let payload_len = self.payload.len() as u64;
+        let total_len =
+            body_prefix_len
+                .checked_add(payload_len)
+                .ok_or(CodecError::PayloadTooLarge {
+                    length: u64::MAX,
+                    limit: u64::from(MAX_FRAME_PAYLOAD_LEN),
+                })?;
+        if total_len > u64::from(MAX_FRAME_PAYLOAD_LEN) {
+            return Err(CodecError::PayloadTooLarge {
+                length: total_len,
+                limit: u64::from(MAX_FRAME_PAYLOAD_LEN),
+            });
+        }
         body.extend_from_slice(&self.payload);
 
-        assert!(body.len() <= MAX_FRAME_PAYLOAD_LEN as usize);
-        Frame::encode(FrameType::Entry, &body, buf);
+        Frame::encode(FrameType::Entry, &body, buf)
     }
 
     /// Decodes a single entry from a slice, rejecting trailing bytes.
@@ -472,10 +505,16 @@ impl Entry {
 }
 
 impl NodeId {
+    /// Encodes this identifier as LEB128 varint.
     pub fn encode(self, buf: &mut Vec<u8>) {
         encode_varint_u64(self.get(), buf);
     }
 
+    /// Decodes a `NodeId` from LEB128 varint bytes.
+    ///
+    /// # Errors
+    /// Returns `CodecError::ZeroNodeId` for a zero value and forwards
+    /// varint framing errors from the underlying decoder.
     pub fn decode(buf: &mut &[u8]) -> Result<Self, CodecError> {
         let raw = decode_varint_u64(buf)?;
         Self::new(raw).ok_or(CodecError::ZeroNodeId)
@@ -483,10 +522,15 @@ impl NodeId {
 }
 
 impl Term {
+    /// Encodes this term as LEB128 varint.
     pub fn encode(self, buf: &mut Vec<u8>) {
         encode_varint_u64(self.as_u64(), buf);
     }
 
+    /// Decodes a `Term` from LEB128 varint bytes.
+    ///
+    /// # Errors
+    /// Forwards varint framing errors from the underlying decoder.
     pub fn decode(buf: &mut &[u8]) -> Result<Self, CodecError> {
         let raw = decode_varint_u64(buf)?;
         Ok(Self::from_raw(raw))
@@ -494,10 +538,15 @@ impl Term {
 }
 
 impl LogIndex {
+    /// Encodes this index as LEB128 varint.
     pub fn encode(self, buf: &mut Vec<u8>) {
         encode_varint_u64(self.as_u64(), buf);
     }
 
+    /// Decodes a `LogIndex` from LEB128 varint bytes.
+    ///
+    /// # Errors
+    /// Forwards varint framing errors from the underlying decoder.
     pub fn decode(buf: &mut &[u8]) -> Result<Self, CodecError> {
         let raw = decode_varint_u64(buf)?;
         Ok(Self::from_raw(raw))
@@ -505,10 +554,15 @@ impl LogIndex {
 }
 
 impl GroupId {
+    /// Encodes this group identifier as LEB128 varint.
     pub fn encode(self, buf: &mut Vec<u8>) {
         encode_varint_u64(self.as_u64(), buf);
     }
 
+    /// Decodes a `GroupId` from LEB128 varint bytes.
+    ///
+    /// # Errors
+    /// Forwards varint framing errors from the underlying decoder.
     pub fn decode(buf: &mut &[u8]) -> Result<Self, CodecError> {
         let raw = decode_varint_u64(buf)?;
         Ok(Self::from_raw(raw))
@@ -516,10 +570,15 @@ impl GroupId {
 }
 
 impl ClusterId {
+    /// Encodes this cluster identifier as LEB128 varint.
     pub fn encode(self, buf: &mut Vec<u8>) {
         encode_varint_u64(self.as_u64(), buf);
     }
 
+    /// Decodes a `ClusterId` from LEB128 varint bytes.
+    ///
+    /// # Errors
+    /// Forwards varint framing errors from the underlying decoder.
     pub fn decode(buf: &mut &[u8]) -> Result<Self, CodecError> {
         let raw = decode_varint_u64(buf)?;
         Ok(Self::from_raw(raw))
@@ -527,10 +586,15 @@ impl ClusterId {
 }
 
 impl SessionId {
+    /// Encodes this session identifier as LEB128 varint.
     pub fn encode(self, buf: &mut Vec<u8>) {
         encode_varint_u64(self.as_u64(), buf);
     }
 
+    /// Decodes a `SessionId` from LEB128 varint bytes.
+    ///
+    /// # Errors
+    /// Forwards varint framing errors from the underlying decoder.
     pub fn decode(buf: &mut &[u8]) -> Result<Self, CodecError> {
         let raw = decode_varint_u64(buf)?;
         Ok(Self::from_raw(raw))
@@ -538,10 +602,15 @@ impl SessionId {
 }
 
 impl SeqNo {
+    /// Encodes this sequence number as LEB128 varint.
     pub fn encode(self, buf: &mut Vec<u8>) {
         encode_varint_u64(self.as_u64(), buf);
     }
 
+    /// Decodes a `SeqNo` from LEB128 varint bytes.
+    ///
+    /// # Errors
+    /// Forwards varint framing errors from the underlying decoder.
     pub fn decode(buf: &mut &[u8]) -> Result<Self, CodecError> {
         let raw = decode_varint_u64(buf)?;
         Ok(Self::from_raw(raw))

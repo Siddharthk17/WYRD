@@ -40,7 +40,7 @@ fn test_generate_and_verify_seed_corpus() {
     // Entry seeds
     let entry_noop = Entry::noop(LogIndex::from_raw(1), Term::from_raw(1));
     let mut noop_buf = Vec::new();
-    entry_noop.encode(&mut noop_buf);
+    entry_noop.encode(&mut noop_buf).expect("encode noop");
     fs::write(entry_dir.join("seed_noop"), &noop_buf).expect("write noop seed");
 
     let entry_normal = Entry::normal(
@@ -49,6 +49,6 @@ fn test_generate_and_verify_seed_corpus() {
         Bytes::from_static(b"seed payload command"),
     );
     let mut normal_buf = Vec::new();
-    entry_normal.encode(&mut normal_buf);
+    entry_normal.encode(&mut normal_buf).expect("encode normal");
     fs::write(entry_dir.join("seed_normal"), &normal_buf).expect("write normal seed");
 }

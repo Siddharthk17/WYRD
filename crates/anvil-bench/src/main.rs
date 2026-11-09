@@ -90,7 +90,9 @@ fn measure_codec_decode_1kib() -> (f64, usize) {
     };
 
     let mut single_encoded = Vec::new();
-    entry.encode(&mut single_encoded);
+    entry
+        .encode(&mut single_encoded)
+        .expect("encode must succeed for test fixture");
 
     let mut stream_buf = Vec::with_capacity(single_encoded.len() * (ENTRIES + 1));
     for _ in 0..=ENTRIES {
@@ -500,7 +502,7 @@ fn measure_wal_append_throughput(batch_size: usize) -> (f64, f64, usize) {
         op_id: 3,
         file_id: FileId::wal_segment(1),
         offset: 0,
-        data: Bytes::from(hdr_bytes),
+        payload: Bytes::from(hdr_bytes),
     });
     while let Some(comp) = device.wait_for_completion() {
         if comp.op_id == 3 {

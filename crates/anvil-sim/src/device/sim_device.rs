@@ -119,17 +119,29 @@ impl SimDeviceConfig {
 /// Execution statistics and fault counters for `SimDevice`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SimDeviceStats {
+    /// Total operations submitted.
     pub ops_submitted: u64,
+    /// Write operations completed.
     pub writes_completed: u64,
+    /// Read operations completed.
     pub reads_completed: u64,
+    /// Fdatasync operations completed.
     pub syncs_completed: u64,
+    /// Directory sync operations completed.
     pub sync_dirs_completed: u64,
+    /// Fsync failures injected.
     pub fsync_failures_injected: u64,
+    /// Read-path corruptions injected.
     pub read_corruptions_injected: u64,
+    /// Write-path corruptions injected.
     pub write_corruptions_injected: u64,
+    /// Latent sector errors injected on read.
     pub read_eios_injected: u64,
+    /// Torn sectors persisted across crash.
     pub torn_sectors_persisted: u64,
+    /// Unsynced sectors lost across crash.
     pub lost_sectors_discarded: u64,
+    /// Crash events processed.
     pub crash_count: u64,
 }
 
@@ -281,21 +293,21 @@ impl SimDevice {
     /// Writes straight through to durable storage (as if synced) and keeps the
     /// volatile page cache coherent. Recovery uses this to rewrite a torn
     /// segment header after classifying the segment as a torn tail.
-    pub fn overwrite_durable(&mut self, file_id: FileId, offset: u64, data: &[u8]) {
-        let end = (offset as usize) + data.len();
+    pub fn overwrite_durable(&mut self, file_id: FileId, offset: u64, payload: &[u8]) {
+        let end = (offset as usize) + payload.len();
         if let Some(state) = self.files.get_mut(&file_id) {
             if state.durable_data.len() < end {
                 state.durable_data.resize(end, 0);
             }
-            state.durable_data[offset as usize..end].copy_from_slice(data);
+            state.durable_data[offset as usize..end].copy_from_slice(payload);
             if state.volatile_data.len() < end {
                 state.volatile_data.resize(end, 0);
             }
-            state.volatile_data[offset as usize..end].copy_from_slice(data);
+            state.volatile_data[offset as usize..end].copy_from_slice(payload);
 
             let sector_size = self.config.sector_size.as_u64();
             let first_sector = offset / sector_size;
-            let last_sector = (offset + data.len() as u64).saturating_sub(1) / sector_size;
+            let last_sector = (offset + payload.len() as u64).saturating_sub(1) / sector_size;
             for sector in first_sector..=last_sector {
                 state.dirty_sectors.remove(&sector);
             }
@@ -507,12 +519,12 @@ impl SimDevice {
     }
 
     /// Extracts the WAL record index from the head of a frame buffer.
-    fn frame_index_at(data: &[u8]) -> Option<LogIndex> {
-        if data.len() < 8 {
+    fn frame_index_at(buf: &[u8]) -> Option<LogIndex> {
+        if buf.len() < 8 {
             return None;
         }
         let mut index_bytes = [0u8; 8];
-        index_bytes.copy_from_slice(&data[0..8]);
+        index_bytes.copy_from_slice(&buf[0..8]);
         let raw_index = u64::from_le_bytes(index_bytes);
         if raw_index > 0 {
             Some(LogIndex::from_raw(raw_index))
@@ -522,11 +534,11 @@ impl SimDevice {
     }
 
     /// Internal helper to check if a corruption of a WAL frame is permitted by the atlas.
-    fn can_corrupt_wal_frame(&self, file_id: FileId, offset: u64, data: &[u8]) -> bool {
+    fn can_corrupt_wal_frame(&self, file_id: FileId, offset: u64, buf: &[u8]) -> bool {
         if let (Some(atlas), Some(node_id)) = (&self.atlas, self.node_id)
             && file_id.is_wal_segment()
             && offset >= self.config.sector_size.as_u64()
-            && let Some(index) = Self::frame_index_at(data)
+            && let Some(index) = Self::frame_index_at(buf)
         {
             return atlas.can_corrupt_entry(node_id, index);
         }
@@ -544,7 +556,7 @@ impl SimDevice {
     }
 
     /// Computes asynchronous latency for an operation.
-    fn calculate_latency(&mut self, is_sync_op: bool) -> u64 {
+    fn op_latency(&mut self, is_sync_op: bool) -> u64 {
         let base_latency = if self.config.max_latency_ticks > self.config.min_latency_ticks {
             self.rng
                 .gen_range_inclusive(self.config.min_latency_ticks..=self.config.max_latency_ticks)
@@ -560,7 +572,7 @@ impl SimDevice {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn execute_op(&mut self, op: DeviceOp) -> (bool, Result<CompletionPayload, StorageError>) {
+    fn run_fs_op(&mut self, op: DeviceOp) -> (bool, Result<CompletionPayload, StorageError>) {
         match op {
             DeviceOp::Create {
                 file_id,
@@ -627,7 +639,7 @@ impl SimDevice {
             DeviceOp::Write {
                 file_id,
                 offset,
-                data,
+                payload,
                 ..
             } => {
                 if !self.volatile_files.contains(&file_id) {
@@ -639,7 +651,7 @@ impl SimDevice {
                     );
                 }
 
-                let mut write_bytes = data.to_vec();
+                let mut write_bytes = payload.to_vec();
 
                 // Inject write corruption if configured and permitted by atlas
                 if self.config.write_corruption_rate_ppm > 0
@@ -855,8 +867,8 @@ impl Device for SimDevice {
     fn submit(&mut self, op: DeviceOp) {
         self.stats.ops_submitted += 1;
         let op_id = op.op_id();
-        let (is_sync, result) = self.execute_op(op);
-        let latency = self.calculate_latency(is_sync);
+        let (is_sync, result) = self.run_fs_op(op);
+        let latency = self.op_latency(is_sync);
         let completion_tick = self.current_tick.wrapping_add(latency);
 
         self.pending_completions.push(PendingCompletion {
@@ -910,7 +922,7 @@ mod tests {
             op_id: 2,
             file_id,
             offset: 0,
-            data: payload.clone(),
+            payload: payload.clone(),
         });
         let comp = device.poll_completion().expect("write completion");
         assert_eq!(comp.op_id, 2);
@@ -978,7 +990,7 @@ mod tests {
             op_id: 4,
             file_id,
             offset: 0,
-            data: dirty_payload.clone(),
+            payload: dirty_payload.clone(),
         });
         let _ = device.poll_completion();
 

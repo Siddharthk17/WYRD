@@ -332,19 +332,32 @@ impl RaftInvariantChecker {
             let commit = core.commit_index().as_u64();
             for idx in 1..=commit {
                 let log_idx = LogIndex::from_raw(idx);
-                if let Some(entry) = core.log().entry_at(log_idx) {
-                    if let Some(oracle_entry) = self.committed_oracle.get(&log_idx) {
-                        if oracle_entry.term != entry.term {
-                            return Err(InvariantViolation::CommittedEntriesNeverLost {
-                                node: id,
-                                index: log_idx,
-                                actual_term: entry.term,
-                                expected_term: oracle_entry.term,
-                            });
+                match core.log().entry_at(log_idx) {
+                    Some(entry) => {
+                        if let Some(oracle_entry) = self.committed_oracle.get(&log_idx) {
+                            if oracle_entry.term != entry.term {
+                                return Err(InvariantViolation::CommittedEntriesNeverLost {
+                                    node: id,
+                                    index: log_idx,
+                                    actual_term: entry.term,
+                                    expected_term: oracle_entry.term,
+                                });
+                            }
+                        } else {
+                            self.committed_oracle.insert(log_idx, entry.clone());
+                            self.committed_terms.insert(log_idx, entry.term);
                         }
-                    } else {
-                        self.committed_oracle.insert(log_idx, entry.clone());
-                        self.committed_terms.insert(log_idx, entry.term);
+                    }
+                    None => {
+                        return Err(InvariantViolation::CommittedEntriesNeverLost {
+                            node: id,
+                            index: log_idx,
+                            actual_term: Term::from_raw(0),
+                            expected_term: self
+                                .committed_oracle
+                                .get(&log_idx)
+                                .map_or(Term::from_raw(0), |entry| entry.term),
+                        });
                     }
                 }
             }
@@ -474,19 +487,23 @@ impl RaftInvariantChecker {
         Ok(())
     }
 
-    /// Verifies that all entries in the global committed oracle are preserved or not contradicted
-    /// by the recovered log.
+    /// Verifies that a recovered log does not contradict the global committed oracle.
+    ///
+    /// A restarted node may lag behind the cluster commit index; entries it never
+    /// held are absent from its log and will arrive via replication. Absence alone
+    /// is not a violation. Presence with a different term means the node forgot
+    /// a committed entry it once held, which breaks safety.
     ///
     /// # Errors
-    /// Returns `InvariantViolation::CommittedNeverLostAcrossCrashes` if a committed entry is contradicted.
+    /// Returns `InvariantViolation::CommittedNeverLostAcrossCrashes` if a recovered entry contradicts the oracle term.
     pub fn check_recovered_log_against_oracle(
         &self,
         _node: NodeId,
         recovered_entries: &[Entry],
     ) -> Result<(), InvariantViolation> {
         let mut map = BTreeMap::new();
-        for e in recovered_entries {
-            map.insert(e.index, e.term);
+        for entry in recovered_entries {
+            map.insert(entry.index, entry.term);
         }
         for (&idx, oracle_entry) in &self.committed_oracle {
             if let Some(&term) = map.get(&idx)

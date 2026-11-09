@@ -455,7 +455,10 @@ impl StorageEngine {
         let slot = HardStateSlot::new(target_slot_u16, self.hard_state_seq, term, vote);
         let sector_size = self.config.sector_size;
         let mut slot_buf = vec![0u8; sector_size.as_usize()];
-        let _ = slot.encode(sector_size, &mut slot_buf);
+        assert!(
+            slot.encode(sector_size, &mut slot_buf).is_ok(),
+            "hard-state slot buffer is sector sized"
+        );
 
         let target_offset = (target_slot as u64) * sector_size.as_u64();
         let write_op_id = self.next_op_id();
@@ -463,7 +466,7 @@ impl StorageEngine {
             op_id: write_op_id,
             file_id: FileId::HARD_STATE,
             offset: target_offset,
-            data: Bytes::from(slot_buf),
+            payload: Bytes::from(slot_buf),
         });
 
         self.active_hard_state_slot = target_slot;
@@ -794,14 +797,17 @@ impl StorageEngine {
         );
 
         let mut header_buf = vec![0u8; sector_size.as_usize()];
-        let _ = header.encode(&mut header_buf);
+        assert!(
+            header.encode(&mut header_buf).is_ok(),
+            "segment header buffer is sector sized"
+        );
 
         let write_hdr_op_id = self.next_op_id();
         output.device_ops.push(DeviceOp::Write {
             op_id: write_hdr_op_id,
             file_id: self.active_segment_file_id,
             offset: 0,
-            data: Bytes::from(header_buf),
+            payload: Bytes::from(header_buf),
         });
 
         self.segment_write_offset = sector_size.as_u64();
@@ -818,7 +824,7 @@ impl StorageEngine {
 
     fn flush_pending_batch(&mut self, output: &mut EngineOutput) {
         // Callers guarantee a non-empty batch: staged appends always carry
-        // data or tokens, so an empty flush would only emit a useless sync.
+        // payload bytes or tokens, so an empty flush would only emit a useless sync.
         if !self.pending_write_buffer.is_empty() {
             let write_op_id = self.next_op_id();
             let batch_bytes = Bytes::copy_from_slice(&self.pending_write_buffer);
@@ -826,7 +832,7 @@ impl StorageEngine {
                 op_id: write_op_id,
                 file_id: self.active_segment_file_id,
                 offset: self.pending_write_start_offset,
-                data: batch_bytes,
+                payload: batch_bytes,
             });
             self.pending_write_buffer.clear();
             self.pending_frame_lens.clear();

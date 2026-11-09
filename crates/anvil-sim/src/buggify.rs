@@ -4,10 +4,15 @@ use std::collections::BTreeMap;
 /// Metadata and activation statistics for a single buggify injection point.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuggifyPoint {
+    /// Short point name passed to `buggify!`.
     pub name: String,
+    /// Source location `file:line` where the point was evaluated.
     pub location: String,
+    /// Firing probability in parts per million.
     pub probability_ppm: u32,
+    /// Total evaluations observed.
     pub evaluations: u64,
+    /// Evaluations that fired.
     pub activations: u64,
 }
 

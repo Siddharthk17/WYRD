@@ -167,7 +167,7 @@ fn test_crash_with_torn_tail_recovery() {
         op_id: 9991,
         file_id: seg1_id,
         offset: corrupt_offset as u64,
-        data: Bytes::from(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+        payload: Bytes::from(vec![0xDE, 0xAD, 0xBE, 0xEF]),
     });
     storage.device.submit(DeviceOp::Fdatasync {
         op_id: 9992,
@@ -224,7 +224,7 @@ fn test_crash_with_mid_log_corruption_needs_repair() {
         op_id: 8881,
         file_id: seg1_id,
         offset: mid_offset,
-        data: Bytes::from(vec![0xFF; 64]), // corrupt record header/CRC
+        payload: Bytes::from(vec![0xFF; 64]), // corrupt record header/CRC
     });
     storage.device.submit(DeviceOp::Fdatasync {
         op_id: 8882,
@@ -282,13 +282,13 @@ fn test_crash_with_both_hard_state_slots_corrupted_refuses_start() {
         op_id: 7771,
         file_id: FileId::HARD_STATE,
         offset: 0,
-        data: Bytes::from(vec![0xBA, 0xAD, 0xF0, 0x0D]),
+        payload: Bytes::from(vec![0xBA, 0xAD, 0xF0, 0x0D]),
     });
     storage.device.submit(DeviceOp::Write {
         op_id: 7772,
         file_id: FileId::HARD_STATE,
         offset: sector_size,
-        data: Bytes::from(vec![0xBA, 0xAD, 0xF0, 0x0D]),
+        payload: Bytes::from(vec![0xBA, 0xAD, 0xF0, 0x0D]),
     });
     storage.device.submit(DeviceOp::Fdatasync {
         op_id: 7773,

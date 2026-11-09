@@ -13,7 +13,7 @@ pub struct HierarchicalTimingWheel {
     overflow: Vec<ScheduledEvent>,
     current_time: SimTime,
     next_seq: u64,
-    count: usize,
+    pending: usize,
 }
 
 impl Default for HierarchicalTimingWheel {
@@ -26,11 +26,11 @@ impl HierarchicalTimingWheel {
     /// Creates a new empty hierarchical timing wheel.
     pub fn new() -> Self {
         let levels = std::array::from_fn(|_| {
-            let mut v = Vec::with_capacity(WHEEL_SIZE);
+            let mut slots = Vec::with_capacity(WHEEL_SIZE);
             for _ in 0..WHEEL_SIZE {
-                v.push(Vec::new());
+                slots.push(Vec::new());
             }
-            v
+            slots
         });
 
         Self {
@@ -38,7 +38,7 @@ impl HierarchicalTimingWheel {
             overflow: Vec::new(),
             current_time: SimTime::ZERO,
             next_seq: 0,
-            count: 0,
+            pending: 0,
         }
     }
 
@@ -88,12 +88,12 @@ impl EventQueue for HierarchicalTimingWheel {
         };
 
         self.insert_event(event);
-        self.count += 1;
+        self.pending += 1;
         seq
     }
 
     fn pop(&mut self) -> Option<ScheduledEvent> {
-        if self.count == 0 {
+        if self.pending == 0 {
             return None;
         }
 
@@ -109,7 +109,7 @@ impl EventQueue for HierarchicalTimingWheel {
                     }
                 }
                 let event = bucket.swap_remove(best_idx);
-                self.count -= 1;
+                self.pending -= 1;
                 self.current_time = event.time;
                 return Some(event);
             }
@@ -153,7 +153,7 @@ impl EventQueue for HierarchicalTimingWheel {
     }
 
     fn peek(&self) -> Option<&ScheduledEvent> {
-        if self.count == 0 {
+        if self.pending == 0 {
             return None;
         }
 
@@ -180,6 +180,6 @@ impl EventQueue for HierarchicalTimingWheel {
     }
 
     fn len(&self) -> usize {
-        self.count
+        self.pending
     }
 }

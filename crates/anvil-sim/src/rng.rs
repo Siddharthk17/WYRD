@@ -137,6 +137,11 @@ impl DetRng {
         if high == u64::MAX && low == 0 {
             return self.next_u64();
         }
+        if high == u64::MAX {
+            let head = self.gen_range(low..high);
+            let tail_bit = u64::from(self.next_u32() & 1);
+            return if tail_bit == 1 { high } else { head };
+        }
         let span = (high - low) + 1;
         self.gen_range(low..(low + span))
     }

@@ -93,14 +93,14 @@ fn test_restart_refused_start_when_both_slots_corrupt() {
         op_id: 9001,
         file_id: file,
         offset: 0,
-        data: Bytes::from(vec![0x5Au8; 64]),
+        payload: Bytes::from(vec![0x5Au8; 64]),
     });
     while storage.device.poll_completion().is_some() {}
     storage.device.submit(DeviceOp::Write {
         op_id: 9002,
         file_id: file,
         offset: sector as u64,
-        data: Bytes::from(vec![0x5Au8; 64]),
+        payload: Bytes::from(vec![0x5Au8; 64]),
     });
     while storage.device.poll_completion().is_some() {}
     storage.device.submit(DeviceOp::Fdatasync {

@@ -245,8 +245,12 @@ fn test_snapshot_header_chunk_and_footer() {
 
     let mut file_data = Vec::new();
     file_data.extend_from_slice(&header_buf);
-    chunk0.encode(&mut file_data);
-    chunk1.encode(&mut file_data);
+    chunk0
+        .encode(&mut file_data)
+        .expect("encode must succeed for test fixture");
+    chunk1
+        .encode(&mut file_data)
+        .expect("encode must succeed for test fixture");
 
     // Compute whole-file BLAKE3 digest over all bytes before footer
     let digest = blake3::hash(&file_data);
@@ -359,7 +363,9 @@ fn test_fuzz_corpora_generation() {
         payload: Bytes::from_static(b"k1:v1,k2:v2,snapshot_data"),
     };
     let mut chunk_buf = Vec::new();
-    chunk.encode(&mut chunk_buf);
+    chunk
+        .encode(&mut chunk_buf)
+        .expect("encode must succeed for test fixture");
     let _ = std::fs::write(snp_dir.join("seed_chunk"), chunk_buf);
 
     let footer = SnapshotFooter::new(1024, [0xAA; 32]);

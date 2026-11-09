@@ -73,7 +73,11 @@ impl RaftCore {
             .entries
             .last()
             .map_or(LogIndex::from_raw(0), |entry| entry.index);
-        let initial_next = last_log_idx.next().unwrap_or(last_log_idx);
+        assert!(
+            last_log_idx.next().is_some(),
+            "recovered log ends at maximum index"
+        );
+        let initial_next = last_log_idx.next().unwrap_or(LogIndex::from_raw(0));
 
         for &peer in &config.peers {
             progress.insert(
@@ -237,6 +241,7 @@ impl RaftCore {
         self.pre_votes_granted.clear();
         self.pre_votes_granted.insert(self.config.node_id);
 
+        assert!(self.term.next().is_some(), "term overflow on pre-vote");
         let prospective_term = self.term.next().unwrap_or(self.term);
         let last_log_index = self.log.last_index();
         let last_log_term = self.log.last_term();
@@ -301,6 +306,7 @@ impl RaftCore {
     }
 
     fn start_election(&mut self, output: &mut Output) {
+        assert!(self.term.next().is_some(), "term overflow on election");
         let new_term = self.term.next().unwrap_or(self.term);
         self.term = new_term;
         self.voted_for = Some(self.config.node_id);
@@ -472,6 +478,10 @@ impl RaftCore {
             return;
         }
 
+        assert!(
+            self.log.last_index().next().is_some(),
+            "log index overflow on propose"
+        );
         let entry_index = self
             .log
             .last_index()
@@ -534,15 +544,15 @@ impl RaftCore {
 
         if self.config.peers.len() < 16 {
             let mut peers = [NodeId::from_nonzero(core::num::NonZeroU64::MIN); 16];
-            let mut count = 0usize;
+            let mut peer_len = 0usize;
             for &peer in &self.config.peers {
-                if count < peers.len() {
-                    peers[count] = peer;
-                    count += 1;
+                if peer_len < peers.len() {
+                    peers[peer_len] = peer;
+                    peer_len += 1;
                 }
             }
 
-            for &peer in &peers[..count] {
+            for &peer in &peers[..peer_len] {
                 self.send_append_entries(peer, output);
             }
         } else {
@@ -588,7 +598,10 @@ impl RaftCore {
         self.election_elapsed_ticks = 0;
         if self.role != Role::Follower {
             let same_term_token = self.transition_to_follower(term, output);
-            debug_assert!(same_term_token.is_none());
+            assert!(
+                same_term_token.is_none(),
+                "same-term follower transition must not require persistence"
+            );
         }
 
         let local_prev_term = self.log.term_at(prev_log_index);
@@ -637,11 +650,30 @@ impl RaftCore {
         }
 
         if !entries.is_empty() {
-            let expected_first = prev_log_index.next().unwrap_or(prev_log_index);
-            assert!(
-                entries[0].index == expected_first,
-                "AppendEntries gap: first entry index does not follow prev_log_index"
-            );
+            let contiguous = match prev_log_index.next() {
+                Some(expected_first) => entries[0].index == expected_first,
+                None => false,
+            };
+            if !contiguous {
+                let hint = prev_log_index.next().unwrap_or(prev_log_index);
+                let rejection = OutboundMessage {
+                    to: from,
+                    message: Message::AppendEntriesResponse {
+                        term: self.term,
+                        success: false,
+                        match_index: self.log.last_index(),
+                        conflict_term: None,
+                        conflict_index: Some(hint),
+                        from: self.config.node_id,
+                    },
+                };
+                if let Some(token) = term_persist_token {
+                    self.queue_pending_action(token, PendingAction::SendMessage(rejection));
+                } else {
+                    output.messages.push(rejection);
+                }
+                return;
+            }
         }
 
         let mut new_match = prev_log_index;

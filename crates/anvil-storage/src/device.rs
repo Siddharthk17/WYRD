@@ -44,7 +44,7 @@ impl SectorSize {
     #[must_use]
     pub const fn align_up(self, len: usize) -> usize {
         let mask = self.as_usize() - 1;
-        (len + mask) & !mask
+        (len.saturating_add(mask)) & !mask
     }
 
     /// Parses a raw `u16` into a known `SectorSize`.
@@ -59,7 +59,10 @@ impl SectorSize {
 
 /// Abstract identifier for a managed file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct FileId(pub u64);
+pub struct FileId(
+    /// Raw file identifier. `0` is hard state, high bit set is snapshot.
+    pub u64,
+);
 
 impl FileId {
     /// Reserved `FileId` for the active Hard State file (`hardstate.bin`).
@@ -146,8 +149,8 @@ pub enum DeviceOp {
         file_id: FileId,
         /// Byte offset in file.
         offset: u64,
-        /// Payload data to persist.
-        data: Bytes,
+        /// Payload bytes to persist.
+        payload: Bytes,
     },
     /// Synchronize data and metadata to durable physical media.
     Fdatasync {

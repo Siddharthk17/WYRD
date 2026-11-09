@@ -132,20 +132,28 @@ fn run_tlc_check_inner(full: bool) -> Result<(), String> {
 const SIM_SEEDS: [u64; 3] = [1, 7, 42];
 const SIM_DEPTH: u64 = 500;
 
-/// Runs one seeded simulation, returning TLC's combined output.
+/// Runs one seeded simulation, returning TLC's combined output and exit status.
 fn run_simulation(
     jar: &Path,
     workspace_root: &Path,
     spec_path: &Path,
     cfg_path: &Path,
     seed: u64,
-) -> Result<String, String> {
-    let jar = jar.to_str().unwrap_or_default();
+) -> Result<(String, bool), String> {
+    let jar_text = jar
+        .to_str()
+        .ok_or_else(|| format!("Non-UTF8 tla2tools jar path: {}", jar.display()))?;
+    let spec_text = spec_path
+        .to_str()
+        .ok_or_else(|| format!("Non-UTF8 spec path: {}", spec_path.display()))?;
+    let cfg_text = cfg_path
+        .to_str()
+        .ok_or_else(|| format!("Non-UTF8 config path: {}", cfg_path.display()))?;
     let output = Command::new("java")
         .args([
             "-XX:+UseParallelGC",
             "-cp",
-            jar,
+            jar_text,
             "tlc2.TLC",
             "-simulate",
             "-seed",
@@ -153,12 +161,13 @@ fn run_simulation(
             "-depth",
             &SIM_DEPTH.to_string(),
             "-config",
-            cfg_path.to_str().unwrap_or_default(),
-            spec_path.to_str().unwrap_or_default(),
+            cfg_text,
+            spec_text,
         ])
         .current_dir(workspace_root)
         .output()
         .map_err(|e| format!("Failed to execute TLC simulation: {e}"))?;
+    let success = output.status.success();
     let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
     combined.push_str(&String::from_utf8_lossy(&output.stderr));
     for stale in std::fs::read_dir(workspace_root.join("specs"))
@@ -167,11 +176,14 @@ fn run_simulation(
         let stale = stale.map_err(|e| format!("Failed to read specs entry: {e}"))?;
         let name = stale.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with("anvil_raft_TTrace_") && name.ends_with(".tla") {
-            let _ = std::fs::remove_file(stale.path());
+        if name.starts_with("anvil_raft_TTrace_")
+            && name.ends_with(".tla")
+            && let Err(e) = std::fs::remove_file(stale.path())
+        {
+            return Err(format!("Failed to remove stale TLC trace: {e}"));
         }
     }
-    Ok(combined)
+    Ok((combined, success))
 }
 
 fn simulation_failed(output: &str) -> bool {
@@ -189,8 +201,8 @@ fn run_simulation_gate(
 ) -> Result<(), String> {
     println!("\n>>> 1. Simulating positive model (3 seeds x depth {SIM_DEPTH})...");
     for seed in SIM_SEEDS {
-        let output = run_simulation(jar, workspace_root, spec_path, cfg_path, seed)?;
-        if simulation_failed(&output) {
+        let (output, success) = run_simulation(jar, workspace_root, spec_path, cfg_path, seed)?;
+        if !success || simulation_failed(&output) {
             return Err(format!(
                 "TLC positive simulation FAILED on seed {seed}!\nOUTPUT:\n{output}"
             ));
@@ -201,8 +213,13 @@ fn run_simulation_gate(
     println!("\n>>> 2. Simulating negative model counterexample...");
     let mut violation = None;
     for seed in SIM_SEEDS {
-        let output = run_simulation(jar, workspace_root, spec_path, neg_cfg_path, seed)?;
-        if simulation_failed(&output)
+        let (output, success) = run_simulation(jar, workspace_root, spec_path, neg_cfg_path, seed)?;
+        if !success && (output.contains("Error: Invariant") || output.contains("is violated")) {
+            violation = Some(seed);
+            break;
+        }
+        if success
+            && simulation_failed(&output)
             && (output.contains("Error: Invariant") || output.contains("is violated"))
         {
             violation = Some(seed);
@@ -233,21 +250,32 @@ fn run_exhaustive(
     cfg_name: &str,
     neg_cfg_name: &str,
 ) -> Result<(), String> {
-    let jar = jar.to_str().unwrap_or_default();
+    let jar_text = jar
+        .to_str()
+        .ok_or_else(|| format!("Non-UTF8 tla2tools jar path: {}", jar.display()))?;
+    let cfg_text = cfg_path
+        .to_str()
+        .ok_or_else(|| format!("Non-UTF8 config path: {}", cfg_path.display()))?;
+    let spec_text = spec_path
+        .to_str()
+        .ok_or_else(|| format!("Non-UTF8 spec path: {}", spec_path.display()))?;
+    let neg_cfg_text = neg_cfg_path
+        .to_str()
+        .ok_or_else(|| format!("Non-UTF8 negative config path: {}", neg_cfg_path.display()))?;
     println!("\n>>> 1. Verifying positive model (specs/{cfg_name})...");
     let positive_output = Command::new("java")
         .args([
             "-XX:+UseParallelGC",
             "-cp",
-            jar,
+            jar_text,
             "tlc2.TLC",
             "-workers",
             "auto",
             "-deadlock",
             "-cleanup",
             "-config",
-            cfg_path.to_str().unwrap_or_default(),
-            spec_path.to_str().unwrap_or_default(),
+            cfg_text,
+            spec_text,
         ])
         .current_dir(workspace_root)
         .output()
@@ -271,15 +299,15 @@ fn run_exhaustive(
         .args([
             "-XX:+UseParallelGC",
             "-cp",
-            jar,
+            jar_text,
             "tlc2.TLC",
             "-workers",
             "auto",
             "-deadlock",
             "-cleanup",
             "-config",
-            neg_cfg_path.to_str().unwrap_or_default(),
-            spec_path.to_str().unwrap_or_default(),
+            neg_cfg_text,
+            spec_text,
         ])
         .current_dir(workspace_root)
         .output()

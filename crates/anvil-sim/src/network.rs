@@ -43,6 +43,9 @@ pub struct InFlightPacket {
     pub deliver_at_tick: u64,
 }
 
+/// Maximum in-flight packets retained by `duplicate_at` before it refuses.
+pub const MAX_IN_FLIGHT_PACKETS: usize = 512;
+
 /// Deterministic packet queue with partitions and fault hooks.
 pub struct SimNetwork {
     /// In-flight message queue in send order.
@@ -113,18 +116,25 @@ impl SimNetwork {
             .duplicate_hook
             .as_ref()
             .is_some_and(|hook| hook(from, to, &message));
-        self.in_flight.push(InFlightPacket {
-            from,
-            to,
-            message: message.clone(),
-            deliver_at_tick: deliver_at,
-        });
         if duplicate {
+            self.in_flight.push(InFlightPacket {
+                from,
+                to,
+                message: message.clone(),
+                deliver_at_tick: deliver_at,
+            });
             self.in_flight.push(InFlightPacket {
                 from,
                 to,
                 message,
                 deliver_at_tick: deliver_at.saturating_add(1),
+            });
+        } else {
+            self.in_flight.push(InFlightPacket {
+                from,
+                to,
+                message,
+                deliver_at_tick: deliver_at,
             });
         }
         true
@@ -235,14 +245,15 @@ impl SimNetwork {
         true
     }
 
-    /// Duplicates the packet at `index % len`, bounding the queue at 512.
+    /// Duplicates the packet at `index % len`, bounding the queue.
     /// Returns false when empty or at the bound.
     pub fn duplicate_at(&mut self, index: usize) -> bool {
-        if self.in_flight.is_empty() || self.in_flight.len() >= 512 {
+        if self.in_flight.is_empty() || self.in_flight.len() >= MAX_IN_FLIGHT_PACKETS {
             return false;
         }
         let actual = index % self.in_flight.len();
-        let packet = self.in_flight[actual].clone();
+        let mut packet = self.in_flight[actual].clone();
+        packet.deliver_at_tick = packet.deliver_at_tick.saturating_add(1);
         self.in_flight.push(packet);
         true
     }
@@ -270,6 +281,12 @@ impl SimNetwork {
     /// Heals every partition.
     pub fn heal_all(&mut self) {
         self.partitions.clear();
+    }
+
+    /// Heals the partition between one pair, keeping other partitions intact.
+    pub fn heal_pair(&mut self, first: NodeId, second: NodeId) {
+        self.partitions.remove(&(first, second));
+        self.partitions.remove(&(second, first));
     }
 }
 

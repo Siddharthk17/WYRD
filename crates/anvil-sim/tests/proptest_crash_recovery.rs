@@ -58,7 +58,7 @@ fn init_test_device(device: &mut SimDevice, config: &StorageConfig) {
         op_id: 2,
         file_id: FileId::HARD_STATE,
         offset: 0,
-        data: Bytes::from(slot_buf),
+        payload: Bytes::from(slot_buf),
     });
     device.submit(DeviceOp::Fdatasync {
         op_id: 3,
@@ -77,7 +77,7 @@ fn init_test_device(device: &mut SimDevice, config: &StorageConfig) {
         op_id: 5,
         file_id: FileId::wal_segment(1),
         offset: 0,
-        data: Bytes::from(hdr_buf),
+        payload: Bytes::from(hdr_buf),
     });
     device.submit(DeviceOp::Fdatasync {
         op_id: 6,

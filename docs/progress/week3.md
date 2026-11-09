@@ -15,7 +15,7 @@
   - Data corruption: bit rot, read/write bit flips, latent sector errors (EIO on read).
   - Storage exhaustion: ENOSPC, directory sync semantics, and fail-fast fsync error handling.
   - Survivability rule: the simulated fault injector never destroys every valid copy of a committed entry on a majority of nodes simultaneously, upholding Raft quorum invariants.
-- Documented in [ADR 0011: Storage Fault Model and Survivability Invariants](../adr/0011-storage-fault-model.md).
+- Documented in [ADR 0011: Storage Fault Model and the Survivability Rule](../adr/0011-storage-fault-model-and-survivability.md).
 
 ### B. On-Disk Binary Formats (`docs/formats/` & `anvil-storage`)
 - Sector-aligned, deterministic on-disk format specifications with exact byte layouts:
@@ -23,7 +23,7 @@
   - **Hard State Format** ([docs/formats/hard-state.md](../formats/hard-state.md)): Two alternating sector slots (Slot 0 and Slot 1) with monotonically increasing sequence numbers and CRC32C, eliminating file renames for term/vote updates.
   - **Snapshot Format** ([docs/formats/snapshot.md](../formats/snapshot.md)): Temporary file write, per-chunk CRC32C, blake3 whole-file footer, atomic rename, and directory fsync.
 - Pure Rust codecs in `crates/anvil-storage/src/format/` strictly adhering to `#![forbid(unsafe_code)]` and `#![deny(clippy::disallowed_methods, clippy::disallowed_types)]`.
-- Documented in [ADR 0012: On-Disk Storage Formats and Atomic State Transitions](../adr/0012-on-disk-storage-formats.md).
+- Documented in [ADR 0012: On-Disk Formats and Recovery Classification](../adr/0012-on-disk-formats-and-recovery-classification.md).
 
 ### C. Sans-IO Storage Engine (`anvil-storage`)
 - Pure sans-IO storage engine in `crates/anvil-storage/src/engine.rs`:
@@ -33,7 +33,7 @@
   - Automatic segment preallocation and rotation upon reaching capacity bounds.
   - Directory fsyncs enforced after every file create, rename, and unlink.
   - Fail-fast fsync policy: any fsync failure immediately crashes the process to prevent split-brain states.
-- Documented in [ADR 0013: Sans-IO Storage Engine and Fail-Fast Fsync Policy](../adr/0013-sans-io-storage-engine.md).
+- Documented in [ADR 0013: Fsync Failure and No-Retry Policy](../adr/0013-fsync-failure-and-no-retry-policy.md).
 
 ### D. Crash Recovery with 4-Way Classification
 - Crash recovery scanner (`StorageEngine::scan_recovery`):
@@ -42,7 +42,7 @@
   - **MidLogCorruption**: Corrupted record followed by subsequent valid records; node is marked `NeedsRepair`, barred from voting or leading, and awaits peer log repair.
   - **HardState Recovery**: If one slot is corrupted, recovers atomically from the surviving valid slot. If both slots are corrupted, refuses to start to prevent voting twice in the same term.
 
-### E. Simulated Device with Comprehensive Fault Injection (`anvil-sim`)
+### E. Simulated Device with Fault Injection (`anvil-sim`)
 - `SimDevice` in `crates/anvil-sim/src/sim_device.rs`:
   - In-memory volatile page cache per file backed by durable committed images.
   - Crash injection: unsynced sectors independently persisted, dropped, or reverted to stale states.
@@ -318,9 +318,9 @@ All 7 fuzz targets compiled and verified with checked-in corpora.
 
 ## 4. Architecture Decisions Taken
 
-- [ADR 0011: Storage Fault Model and Survivability Invariants](../adr/0011-storage-fault-model.md)
-- [ADR 0012: On-Disk Storage Formats and Atomic State Transitions](../adr/0012-on-disk-storage-formats.md)
-- [ADR 0013: Sans-IO Storage Engine and Fail-Fast Fsync Policy](../adr/0013-sans-io-storage-engine.md)
+- [ADR 0011: Storage Fault Model and the Survivability Rule](../adr/0011-storage-fault-model-and-survivability.md)
+- [ADR 0012: On-Disk Formats and Recovery Classification](../adr/0012-on-disk-formats-and-recovery-classification.md)
+- [ADR 0013: Fsync Failure and No-Retry Policy](../adr/0013-fsync-failure-and-no-retry-policy.md)
 
 ---
 

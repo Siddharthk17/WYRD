@@ -3,7 +3,7 @@ use crate::time::SimTime;
 use core::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-/// Deterministic event queue backed by a 4-ary or standard binary min-heap.
+/// Deterministic event queue backed by a standard binary min-heap.
 #[derive(Debug, Default, Clone)]
 pub struct BinaryHeapEventQueue {
     heap: BinaryHeap<Reverse<ScheduledEvent>>,

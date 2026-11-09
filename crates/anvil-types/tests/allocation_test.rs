@@ -78,7 +78,9 @@ fn test_codec_decode_1kib_entry_zero_allocations() {
     };
 
     let mut single_encoded = Vec::new();
-    entry.encode(&mut single_encoded);
+    entry
+        .encode(&mut single_encoded)
+        .expect("encode must succeed for test fixture");
 
     // Stream buffer containing two 1 KiB entries
     let mut stream_buf = Vec::new();
@@ -121,7 +123,9 @@ fn test_codec_decode_batch_1000_entries_zero_allocations() {
     };
 
     let mut single_encoded = Vec::new();
-    entry.encode(&mut single_encoded);
+    entry
+        .encode(&mut single_encoded)
+        .expect("encode must succeed for test fixture");
 
     let mut stream_buf = Vec::with_capacity(single_encoded.len() * 1001);
     for _ in 0..1001 {
@@ -156,7 +160,8 @@ fn test_frame_decode_zero_allocations() {
     let _guard = ALLOC_TEST_LOCK.lock().unwrap();
     let payload = vec![0x42u8; 1024];
     let mut single_frame = Vec::new();
-    Frame::encode(FrameType::Entry, &payload, &mut single_frame);
+    Frame::encode(FrameType::Entry, &payload, &mut single_frame)
+        .expect("frame encode must succeed");
 
     // Stream containing two frames
     let mut stream_buf = Vec::new();

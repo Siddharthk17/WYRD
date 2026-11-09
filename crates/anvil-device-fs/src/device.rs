@@ -1,5 +1,4 @@
 #![forbid(unsafe_code)]
-#![allow(clippy::cast_possible_truncation)]
 
 //! Physical filesystem storage device (`FsDevice`) backed by a dedicated I/O thread.
 //!
@@ -110,7 +109,10 @@ impl FsDevice {
 impl Device for FsDevice {
     fn submit(&mut self, op: DeviceOp) {
         if let Some(ref sender) = self.op_sender {
-            let _ = sender.send(IoRequest::Op(op));
+            assert!(
+                sender.send(IoRequest::Op(op)).is_ok(),
+                "I/O worker thread is gone; submit after worker death"
+            );
         }
     }
 
@@ -122,10 +124,15 @@ impl Device for FsDevice {
 impl Drop for FsDevice {
     fn drop(&mut self) {
         if let Some(sender) = self.op_sender.take() {
-            let _ = sender.send(IoRequest::Shutdown);
+            assert!(
+                sender.send(IoRequest::Shutdown).is_ok(),
+                "I/O worker thread is gone during shutdown"
+            );
         }
-        if let Some(handle) = self.io_thread_handle.take() {
-            let _ = handle.join();
+        if let Some(handle) = self.io_thread_handle.take()
+            && let Err(err) = handle.join()
+        {
+            std::panic::resume_unwind(err);
         }
     }
 }
@@ -142,7 +149,7 @@ fn io_worker_loop(
         match req {
             IoRequest::Op(op) => {
                 let op_id = op.op_id();
-                let result = execute_fs_op(base_dir, &mut open_files, op);
+                let result = run_fs_op(base_dir, &mut open_files, op);
                 let _ = completion_tx.send(DeviceCompletion { op_id, result });
             }
             IoRequest::Shutdown => break,
@@ -152,7 +159,7 @@ fn io_worker_loop(
 
 /// Executes a single `DeviceOp` against the physical filesystem.
 #[allow(clippy::too_many_lines)]
-fn execute_fs_op(
+fn run_fs_op(
     base_dir: &Path,
     open_files: &mut BTreeMap<FileId, File>,
     op: DeviceOp,
@@ -221,14 +228,14 @@ fn execute_fs_op(
         DeviceOp::Write {
             file_id,
             offset,
-            data,
+            payload,
             ..
         } => {
             let file = get_or_open_file(base_dir, open_files, file_id)?;
-            file.write_all_at(&data, offset).map_err(|e| {
+            file.write_all_at(&payload, offset).map_err(|e| {
                 StorageError::DeviceError(format!("write failed at offset {offset}: {e}"))
             })?;
-            Ok(CompletionPayload::Written(data.len()))
+            Ok(CompletionPayload::Written(payload.len()))
         }
 
         DeviceOp::Read {
@@ -247,7 +254,12 @@ fn execute_fs_op(
                 return Ok(CompletionPayload::Read(Bytes::new()));
             }
 
-            let available = (file_len - offset).min(len as u64) as usize;
+            let available_u64 = (file_len - offset).min(u64::try_from(len).unwrap_or(u64::MAX));
+            let available = usize::try_from(available_u64).map_err(|_| {
+                StorageError::DeviceError(format!(
+                    "read length {available_u64} exceeds address space"
+                ))
+            })?;
             let mut buf = vec![0u8; available];
             file.read_exact_at(&mut buf, offset).map_err(|e| {
                 StorageError::DeviceError(format!("read_exact_at failed at offset {offset}: {e}"))
@@ -275,9 +287,6 @@ fn execute_fs_op(
         }
 
         DeviceOp::Rename { from, to, .. } => {
-            open_files.remove(&from);
-            open_files.remove(&to);
-
             let from_path = file_id_to_path(base_dir, from);
             let to_path = file_id_to_path(base_dir, to);
 
@@ -288,6 +297,8 @@ fn execute_fs_op(
                     to_path.display()
                 ))
             })?;
+            open_files.remove(&from);
+            open_files.remove(&to);
             Ok(CompletionPayload::Renamed)
         }
 

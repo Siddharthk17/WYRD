@@ -159,17 +159,15 @@ impl StorageFaultAtlas {
             return true;
         }
 
-        // For committed entries, ensure at least Q nodes retain valid copies after this corruption
-        let current_copies = state.valid_copies.get(&index).map_or(0, |nodes| {
-            if nodes.contains(&node_id) {
-                nodes.len()
-            } else {
-                nodes.len() + 1
-            }
-        });
-
-        let copies_after = current_copies.saturating_sub(1);
-        if copies_after >= state.quorum_size {
+        // For committed entries, ensure a quorum of *other* nodes retains
+        // valid copies after this node's copy is corrupted. Counting only
+        // recorded copies besides the target is exactly the survivability
+        // rule: some majority must keep a valid copy.
+        let others_valid = state
+            .valid_copies
+            .get(&index)
+            .map_or(0, |nodes| nodes.iter().filter(|&&n| n != node_id).count());
+        if others_valid >= state.quorum_size {
             state.allowed_corruptions += 1;
             true
         } else {

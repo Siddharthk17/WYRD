@@ -34,8 +34,8 @@ Every state transition in `specs/anvil_raft.tla` maps to an implementation funct
 | `TimeoutNow` | `RaftCore::handle_timeout_now` (liveness extension, outside TLA `Next`) | `crates/anvil-raft/src/core.rs` |
 | `TransferLeader` | `RaftCore::handle_transfer_leader` (liveness extension, outside TLA `Next`) | `crates/anvil-raft/src/core.rs` |
 | `ReadIndex` | `RaftCore::handle_read_index` (linearizable read extension, outside TLA `Next`) | `crates/anvil-raft/src/core.rs` |
-| `DropMessage(m)` | Handled by transport layer (`SimCluster` drop hooks) | `crates/anvil-sim/src/cluster.rs` |
-| `DuplicateMessage(m)` | Handled by transport layer (`SimCluster` duplicate hooks) | `crates/anvil-sim/src/cluster.rs` |
+| `DropMessage(m)` | Handled by the transport layer (`SimNetwork` drop hooks, driven by `SimCluster`) | `crates/anvil-sim/src/network.rs` |
+| `DuplicateMessage(m)` | Handled by the transport layer (`SimNetwork` duplicate hooks, driven by `SimCluster`) | `crates/anvil-sim/src/network.rs` |
 
 ---
 
@@ -62,7 +62,7 @@ Each peer is tracked with `PeerProgress`:
 - **`Replicate` state**: Pipelined replication allowing up to `max_inflight_messages` in flight with optimistic `next_index` advance. On rejection, progress drops back to `Probe` and steps back using conflict hints.
 
 ### 6. Strict Persistence Contract
-ANVIL enforces a strict storage contract to ensure safety across crashes:
+ANVIL enforces a strict storage contract to keep safety across crashes:
 - Follower append responses and vote responses are placed into `pending_persists` and released into `output.messages` **only after** storage emits `Input::Persisted` for the relevant token.
 - Leaders persist new proposals in parallel with broadcasting `AppendEntriesRequest` to followers; however, the leader does **not** count its own match towards quorum until its own persist token is acknowledged.
 - Term and vote updates are always persisted via `PersistOp::HardState` before releasing any message that reveals them.

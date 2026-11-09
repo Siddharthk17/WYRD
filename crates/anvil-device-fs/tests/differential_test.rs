@@ -63,13 +63,13 @@ fn test_differential_basic_operations() {
             op_id: 3,
             file_id: file1,
             offset: 0,
-            data: Bytes::from(vec![0xAAu8; 512]),
+            payload: Bytes::from(vec![0xAAu8; 512]),
         },
         DeviceOp::Write {
             op_id: 4,
             file_id: file1,
             offset: 1024,
-            data: Bytes::from(vec![0xBBu8; 256]),
+            payload: Bytes::from(vec![0xBBu8; 256]),
         },
         DeviceOp::Read {
             op_id: 5,
@@ -96,7 +96,7 @@ fn test_differential_basic_operations() {
             op_id: 9,
             file_id: file2,
             offset: 0,
-            data: Bytes::from(vec![0x55u8; 512]),
+            payload: Bytes::from(vec![0x55u8; 512]),
         },
         DeviceOp::Fdatasync {
             op_id: 10,
@@ -182,7 +182,7 @@ fn test_differential_rename_truncate_unlink() {
             op_id: 3,
             file_id: from_file,
             offset: 0,
-            data: Bytes::from_static(b"original data before rename"),
+            payload: Bytes::from_static(b"original data before rename"),
         },
         DeviceOp::Fdatasync {
             op_id: 4,
@@ -278,7 +278,7 @@ fn test_differential_randomized_workload() {
             op_id,
             file_id,
             offset: current_offset,
-            data: Bytes::from(payload.clone()),
+            payload: Bytes::from(payload.clone()),
         };
         op_id += 1;
         sim_dev.submit(write_op.clone());

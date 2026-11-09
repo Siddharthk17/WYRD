@@ -82,7 +82,9 @@ fn bench_codec(c: &mut Criterion) {
     };
 
     let mut single_encoded = Vec::new();
-    entry.encode(&mut single_encoded);
+    entry
+        .encode(&mut single_encoded)
+        .expect("encode must succeed for test fixture");
 
     // Create a 100-entry shared buffer
     let mut stream_buf = Vec::with_capacity(single_encoded.len() * 100);

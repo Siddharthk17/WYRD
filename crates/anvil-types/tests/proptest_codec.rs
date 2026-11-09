@@ -82,7 +82,7 @@ proptest! {
         };
 
         let mut buf = Vec::new();
-        entry.encode(&mut buf);
+        entry.encode(&mut buf).expect("encode must succeed for test fixture");
 
         // Test slice decode
         let mut slice_cursor = &buf[..];

@@ -21,7 +21,7 @@
   - 16-byte fixed `FrameHeader` with magic bytes (`0x41 0x4E 0x56 0x4C`), versioning, frame types, and CRC32C integrity checksum.
   - Variable-length LEB128 unsigned (`u64`) and Zigzag-encoded signed (`i64`) varint encoders and decoders.
   - Zero-copy entry decoding directly slicing payload `bytes::Bytes` from shared buffers.
-- Comprehensive property tests (`proptest`) verifying varint roundtrips, newtype serialization, entry encode/decode fidelity, and panics-free handling of arbitrary byte sequences.
+- Property tests (`proptest`) verifying varint roundtrips, newtype serialization, entry encode/decode fidelity, and panics-free handling of arbitrary byte sequences.
 - Three `cargo-fuzz` targets (`fuzz_varint`, `fuzz_frame_header`, `fuzz_entry`) with checked-in seed corpora.
 
 ### C. Simulation Kernel Foundation (`anvil-sim`)

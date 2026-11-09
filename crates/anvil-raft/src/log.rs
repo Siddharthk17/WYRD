@@ -22,11 +22,7 @@ impl RaftLog {
     fn hash_entry(hasher: &mut blake3::Hasher, entry: &Entry) {
         hasher.update(&entry.index.as_u64().to_le_bytes());
         hasher.update(&entry.term.as_u64().to_le_bytes());
-        let kind_byte = match entry.kind {
-            anvil_types::EntryKind::Normal => 0u8,
-            anvil_types::EntryKind::NoOp => 1u8,
-        };
-        hasher.update(&[kind_byte]);
+        hasher.update(&[entry.kind.as_u8()]);
         hasher.update(&(entry.payload.len() as u64).to_le_bytes());
         hasher.update(&entry.payload);
     }

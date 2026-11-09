@@ -23,11 +23,12 @@ fuzz_target!(|data: &[u8]| {
     if let Ok((chunk, consumed)) = SnapshotChunk::decode(data, 0) {
         assert!(consumed <= data.len(), "consumed {consumed} > len {}", data.len());
         let mut out = Vec::new();
-        chunk.encode(&mut out);
-        let (re_chunk, re_consumed) = SnapshotChunk::decode(&out, 0)
-            .expect("re-decoding encoded valid snapshot chunk must succeed");
-        assert_eq!(chunk, re_chunk);
-        assert_eq!(out.len(), re_consumed);
+        if chunk.encode(&mut out).is_ok() {
+            let (re_chunk, re_consumed) = SnapshotChunk::decode(&out, 0)
+                .expect("re-decoding encoded valid snapshot chunk must succeed");
+            assert_eq!(chunk, re_chunk);
+            assert_eq!(out.len(), re_consumed);
+        }
     }
 
     // 3. Snapshot Footer

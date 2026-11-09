@@ -197,7 +197,7 @@ proptest! {
             payload: Bytes::copy_from_slice(&payload),
         };
         let mut chunk_buf = Vec::new();
-        chunk.encode(&mut chunk_buf);
+        chunk.encode(&mut chunk_buf).expect("encode must succeed for test fixture");
         let (decoded_chunk, consumed) = SnapshotChunk::decode(&chunk_buf, chunk_idx).unwrap();
         prop_assert_eq!(chunk, decoded_chunk);
         prop_assert_eq!(chunk_buf.len(), consumed);
