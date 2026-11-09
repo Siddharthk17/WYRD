@@ -4,7 +4,7 @@
 Accepted
 
 ## Context
-Circular dependencies or leaky abstractions between consensus, storage, state machine, and simulator create untestable spaghetti architectures. A clean DAG allows each layer to be verified, fuzzed, and benchmarked independently.
+Circular dependencies or leaky abstractions between consensus, storage, state machine, and simulator prevent independent verification. A clean DAG allows each layer to be verified, fuzzed, and benchmarked independently.
 
 ## Options Considered
 1. **Monolithic Crate**: Single crate with feature flags separating simulator and production server.

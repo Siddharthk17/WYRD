@@ -40,7 +40,7 @@ impl ProtocolMsg {
 }
 
 struct NodeActor {
-    id: u8,
+    node_id: u8,
     peers: Vec<u64>,
     is_leader: bool,
     counter: u32,
@@ -52,9 +52,9 @@ struct NodeActor {
 }
 
 impl NodeActor {
-    fn new(id: u8, peers: Vec<u64>, is_leader: bool, seed: u64) -> Self {
+    fn new(node_id: u8, peers: Vec<u64>, is_leader: bool, seed: u64) -> Self {
         Self {
-            id,
+            node_id,
             peers,
             is_leader,
             counter: 0,
@@ -62,7 +62,7 @@ impl NodeActor {
             commit_index: 0,
             proposal_values: BTreeMap::new(),
             acks: BTreeMap::new(),
-            rng: DetRng::new(seed, &format!("node_{id}")),
+            rng: DetRng::new(seed, &format!("node_{node_id}")),
         }
     }
 }
@@ -82,14 +82,14 @@ impl Actor for NodeActor {
                 self.proposal_values.insert(idx, msg.value);
 
                 let mut self_acks = BTreeSet::new();
-                self_acks.insert(self.id);
+                self_acks.insert(self.node_id);
                 self.acks.insert(idx, self_acks);
 
                 for &peer in &self.peers {
                     let delay_nanos = self.rng.gen_range(5_000_000..15_000_000);
                     let replicate_msg = ProtocolMsg {
                         kind: MSG_REPLICATE,
-                        sender: self.id,
+                        sender: self.node_id,
                         id_or_idx: idx,
                         value: msg.value,
                     };
@@ -107,7 +107,7 @@ impl Actor for NodeActor {
                 let reply_delay = self.rng.gen_range(2_000_000..8_000_000);
                 let ack_msg = ProtocolMsg {
                     kind: MSG_REPLICATE_ACK,
-                    sender: self.id,
+                    sender: self.node_id,
                     id_or_idx: msg.id_or_idx,
                     value: msg.value,
                 };
@@ -136,7 +136,7 @@ impl Actor for NodeActor {
                         let delay = self.rng.gen_range(2_000_000..5_000_000);
                         let commit_msg = ProtocolMsg {
                             kind: MSG_COMMIT,
-                            sender: self.id,
+                            sender: self.node_id,
                             id_or_idx: idx,
                             value: self.counter,
                         };
@@ -146,7 +146,7 @@ impl Actor for NodeActor {
                     let client_delay = self.rng.gen_range(1_000_000..3_000_000);
                     let resp = ProtocolMsg {
                         kind: MSG_CLIENT_RESPONSE,
-                        sender: self.id,
+                        sender: self.node_id,
                         id_or_idx: idx,
                         value: self.counter,
                     };

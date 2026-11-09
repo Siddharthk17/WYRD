@@ -374,3 +374,21 @@ fn test_rolling_crashes_and_restarts_quorum_survivability() {
         }
     }
 }
+
+#[test]
+fn test_crash_restart_with_unsynced_term_resets_checker() {
+    let plan = anvil_sim::Plan::decode(
+        "anvil-plan/1;seed=1356;size=3;ticks=30;net=8,5,3;salt=13238494235546435847;storage=1;propose=6,12,18,24,30;crash=15-15:0",
+    )
+    .expect("seed 1356 plan decodes");
+    anvil_sim::run_plan(&plan);
+}
+
+#[test]
+fn test_crash_restart_with_unsynced_vote_resets_checker() {
+    let plan = anvil_sim::Plan::decode(
+        "anvil-plan/1;seed=75467;size=7;ticks=30;net=8,5,3;salt=1701680025282171642;storage=1;propose=6,12,18,24,30;part=12-20:6;crash=15-15:0",
+    )
+    .expect("seed 75467 plan decodes");
+    anvil_sim::run_plan(&plan);
+}

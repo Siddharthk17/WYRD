@@ -10,7 +10,7 @@
 
 ### A. Formal TLA+ Specification & Verification (`specs/anvil_raft.tla`)
 - Hand-written formal TLA+ specification in `specs/anvil_raft.tla` and configuration `specs/anvil_raft.cfg`:
-  - Models servers with persistent state (`currentTerm`, `votedFor`, `log`), volatile role (`Follower`, `PreCandidate`, `Candidate`, `Leader`), volatile indices (`commitIndex`, `appliedIndex`), and per-peer progress (`nextIndex`, `matchIndex`).
+  - Models servers with persistent state (`currentTerm`, `votedFor`, `log`), volatile role (`Follower`, `PreCandidate`, `Candidate`, `Leader`), volatile index (`commitIndex`), and per-peer progress (`nextIndex`, `matchIndex`).
   - Network modeling messages (`PreVoteRequest`, `PreVoteResponse`, `RequestVoteRequest`, `RequestVoteResponse`, `AppendEntriesRequest`, `AppendEntriesResponse`) subject to arbitrary drops, duplicates, and reorderings.
   - Crash-restart transitions preserving persistent state while resetting volatile state.
   - PreVote, CheckQuorum, leader stickiness, and current-term commit rule.

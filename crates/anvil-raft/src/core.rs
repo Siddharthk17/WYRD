@@ -833,20 +833,20 @@ impl RaftCore {
         if self.progress.len() < 16 {
             // Fixed-size stack buffer avoiding heap allocation for cluster sizes <= 16
             let mut matches = [LogIndex::from_raw(0); 16];
-            let mut count = 0usize;
+            let mut match_len = 0usize;
 
             for peer_progress in self.progress.values() {
-                if count < matches.len() {
-                    matches[count] = peer_progress.match_index;
-                    count += 1;
+                if match_len < matches.len() {
+                    matches[match_len] = peer_progress.match_index;
+                    match_len += 1;
                 }
             }
-            if count < matches.len() {
-                matches[count] = self.leader_persisted_index;
-                count += 1;
+            if match_len < matches.len() {
+                matches[match_len] = self.leader_persisted_index;
+                match_len += 1;
             }
 
-            let active_matches = &mut matches[..count];
+            let active_matches = &mut matches[..match_len];
             active_matches.sort_unstable();
             self.commit_from_sorted_matches(active_matches, output);
         } else {
@@ -863,9 +863,9 @@ impl RaftCore {
 
     fn commit_from_sorted_matches(&mut self, active_matches: &mut [LogIndex], output: &mut Output) {
         let quorum = self.config.quorum_size();
-        let count = active_matches.len();
-        if count >= quorum {
-            let median_pos = count - quorum;
+        let match_total = active_matches.len();
+        if match_total >= quorum {
+            let median_pos = match_total - quorum;
             let median_commit = active_matches[median_pos];
 
             if median_commit > self.commit_index {
@@ -979,8 +979,8 @@ impl RaftCore {
         }
 
         if let Some(ctx) = read_context {
-            let mut satisfied_indices = Vec::new();
-            for (i, pending) in self.pending_reads.iter_mut().enumerate() {
+            let mut ready = 0usize;
+            for pending in &mut self.pending_reads {
                 if pending.context == ctx {
                     pending.acks.insert(from);
                     if pending.acks.len() >= self.config.quorum_size() {
@@ -988,12 +988,14 @@ impl RaftCore {
                             context: pending.context.clone(),
                             read_index: pending.read_index,
                         });
-                        satisfied_indices.push(i);
+                        ready += 1;
                     }
                 }
             }
-            for i in satisfied_indices.into_iter().rev() {
-                self.pending_reads.swap_remove(i);
+            if ready > 0 {
+                let quorum = self.config.quorum_size();
+                self.pending_reads
+                    .retain(|pending| pending.context != ctx || pending.acks.len() < quorum);
             }
         }
     }
@@ -1271,19 +1273,19 @@ impl RaftCore {
             return low;
         }
 
-        let mut x = rng.next_u64();
-        let mut m = u128::from(x) * u128::from(span);
-        let mut l = m as u64;
+        let mut sample = rng.next_u64();
+        let mut product = u128::from(sample) * u128::from(span);
+        let mut low_bits = product as u64;
 
-        if l < span {
+        if low_bits < span {
             let threshold = span.wrapping_neg() % span;
-            while l < threshold {
-                x = rng.next_u64();
-                m = u128::from(x) * u128::from(span);
-                l = m as u64;
+            while low_bits < threshold {
+                sample = rng.next_u64();
+                product = u128::from(sample) * u128::from(span);
+                low_bits = product as u64;
             }
         }
 
-        low + (m >> 64) as u64
+        low + (product >> 64) as u64
     }
 }

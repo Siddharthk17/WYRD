@@ -164,6 +164,50 @@ impl RaftInvariantChecker {
         );
     }
 
+    /// Resets per-node term and vote history after a crash restart.
+    ///
+    /// A crash discards volatile state that never reached disk. Terms entered
+    /// in memory but never persisted (no `Persisted` completion, no gated
+    /// message released) never left the node, so resuming from the recovered
+    /// durable term is safe. Without this reset the checker would compare the
+    /// pre-crash volatile term against the post-restart durable term and flag
+    /// a regression that no other node could have observed.
+    ///
+    /// Votes need the same treatment within the recovered term: the checker
+    /// records a vote when the core casts it in memory, but the vote only
+    /// becomes real once its gated response is released after persistence. If
+    /// the tracked vote differs from the recovered vote and the tracked vote
+    /// was never acknowledged (absent from `acked`), the vote never left the
+    /// node and the checker adopts the recovered vote. If the tracked vote was
+    /// acknowledged, losing it is a safety failure and the method returns the
+    /// mismatch so the caller can refuse to restart.
+    pub fn reset_for_restart(
+        &mut self,
+        node_id: NodeId,
+        recovered_term: Term,
+        recovered_vote: Option<NodeId>,
+        acked: &BTreeMap<Term, Option<NodeId>>,
+    ) -> Result<(), (Option<NodeId>, Option<NodeId>)> {
+        self.node_terms.insert(node_id, recovered_term);
+        self.node_votes
+            .retain(|(voter, term), _| *voter != node_id || *term <= recovered_term);
+        let tracked = self.node_votes.get(&(node_id, recovered_term)).copied();
+        if tracked != recovered_vote {
+            let tracked_acked = acked
+                .get(&recovered_term)
+                .is_some_and(|vote| *vote == tracked);
+            if tracked_acked {
+                return Err((tracked, recovered_vote));
+            }
+            if let Some(vote) = recovered_vote {
+                self.node_votes.insert((node_id, recovered_term), vote);
+            } else {
+                self.node_votes.remove(&(node_id, recovered_term));
+            }
+        }
+        Ok(())
+    }
+
     /// Internal evaluation returning a `Result` for testing or error propagation.
     pub fn try_check_invariants(
         &mut self,
@@ -184,19 +228,19 @@ impl RaftInvariantChecker {
     /// 1. Election Safety: At most one leader in any term.
     fn check_election_safety(nodes: &BTreeMap<NodeId, RaftCore>) -> Result<(), InvariantViolation> {
         let mut leaders_by_term: BTreeMap<Term, NodeId> = BTreeMap::new();
-        for (&id, core) in nodes {
+        for (&node_id, core) in nodes {
             if core.role() == Role::Leader {
                 let term = core.term();
                 if let Some(&existing_leader) = leaders_by_term.get(&term) {
-                    if existing_leader != id {
+                    if existing_leader != node_id {
                         return Err(InvariantViolation::ElectionSafety {
                             term,
                             leader1: existing_leader,
-                            leader2: id,
+                            leader2: node_id,
                         });
                     }
                 } else {
-                    leaders_by_term.insert(term, id);
+                    leaders_by_term.insert(term, node_id);
                 }
             }
         }
@@ -207,13 +251,13 @@ impl RaftInvariantChecker {
     fn check_applied_commit_bounds(
         nodes: &BTreeMap<NodeId, RaftCore>,
     ) -> Result<(), InvariantViolation> {
-        for (&id, core) in nodes {
+        for (&node_id, core) in nodes {
             let applied = core.applied_index();
             let commit = core.commit_index();
             let last = core.last_log_index();
             if applied > commit || commit > last {
                 return Err(InvariantViolation::AppliedLeqCommittedLeqLastIndex {
-                    node: id,
+                    node: node_id,
                     applied,
                     commit,
                     last,
@@ -228,31 +272,31 @@ impl RaftInvariantChecker {
         &mut self,
         nodes: &BTreeMap<NodeId, RaftCore>,
     ) -> Result<(), InvariantViolation> {
-        for (&id, core) in nodes {
+        for (&node_id, core) in nodes {
             let current_term = core.term();
-            if let Some(&prev_term) = self.node_terms.get(&id)
+            if let Some(&prev_term) = self.node_terms.get(&node_id)
                 && current_term < prev_term
             {
                 return Err(InvariantViolation::TermMonotonic {
-                    node: id,
+                    node: node_id,
                     previous_term: prev_term,
                     current_term,
                 });
             }
-            self.node_terms.insert(id, current_term);
+            self.node_terms.insert(node_id, current_term);
 
             if let Some(vote) = core.voted_for() {
-                if let Some(&prev_vote) = self.node_votes.get(&(id, current_term)) {
+                if let Some(&prev_vote) = self.node_votes.get(&(node_id, current_term)) {
                     if prev_vote != vote {
                         return Err(InvariantViolation::VoteNeverChangesWithinTerm {
-                            node: id,
+                            node: node_id,
                             term: current_term,
                             previous_vote: Some(prev_vote),
                             new_vote: Some(vote),
                         });
                     }
                 } else {
-                    self.node_votes.insert((id, current_term), vote);
+                    self.node_votes.insert((node_id, current_term), vote);
                 }
             }
         }
@@ -263,13 +307,13 @@ impl RaftInvariantChecker {
     fn check_leader_append_only(
         nodes: &BTreeMap<NodeId, RaftCore>,
     ) -> Result<(), InvariantViolation> {
-        for (&id, core) in nodes {
+        for (&node_id, core) in nodes {
             if core.role() == Role::Leader {
                 let current_term = core.term();
                 for entry in core.log().entries() {
                     if entry.term > current_term {
                         return Err(InvariantViolation::LeaderAppendOnly {
-                            leader: id,
+                            leader: node_id,
                             index: entry.index,
                             entry_term: entry.term,
                             current_term,
@@ -328,7 +372,7 @@ impl RaftInvariantChecker {
         &mut self,
         nodes: &BTreeMap<NodeId, RaftCore>,
     ) -> Result<(), InvariantViolation> {
-        for (&id, core) in nodes {
+        for (&node_id, core) in nodes {
             let commit = core.commit_index().as_u64();
             for idx in 1..=commit {
                 let log_idx = LogIndex::from_raw(idx);
@@ -337,7 +381,7 @@ impl RaftInvariantChecker {
                         if let Some(oracle_entry) = self.committed_oracle.get(&log_idx) {
                             if oracle_entry.term != entry.term {
                                 return Err(InvariantViolation::CommittedEntriesNeverLost {
-                                    node: id,
+                                    node: node_id,
                                     index: log_idx,
                                     actual_term: entry.term,
                                     expected_term: oracle_entry.term,
@@ -350,7 +394,7 @@ impl RaftInvariantChecker {
                     }
                     None => {
                         return Err(InvariantViolation::CommittedEntriesNeverLost {
-                            node: id,
+                            node: node_id,
                             index: log_idx,
                             actual_term: Term::from_raw(0),
                             expected_term: self
@@ -405,7 +449,7 @@ impl RaftInvariantChecker {
         &self,
         nodes: &BTreeMap<NodeId, RaftCore>,
     ) -> Result<(), InvariantViolation> {
-        for (&id, core) in nodes {
+        for (&node_id, core) in nodes {
             if core.role() == Role::Leader {
                 let leader_term = core.term();
                 for (&idx, &committed_term) in &self.committed_terms {
@@ -413,7 +457,7 @@ impl RaftInvariantChecker {
                         let leader_entry_term = core.log().term_at(idx);
                         if leader_entry_term != Some(committed_term) {
                             return Err(InvariantViolation::LeaderCompleteness {
-                                leader: id,
+                                leader: node_id,
                                 leader_term,
                                 index: idx,
                                 committed_term,
@@ -431,7 +475,7 @@ impl RaftInvariantChecker {
         &self,
         nodes: &BTreeMap<NodeId, RaftCore>,
     ) -> Result<(), InvariantViolation> {
-        for (&id, core) in nodes {
+        for (&node_id, core) in nodes {
             let commit = core.commit_index().as_u64();
             for idx in 1..=commit {
                 let log_idx = LogIndex::from_raw(idx);
@@ -441,7 +485,7 @@ impl RaftInvariantChecker {
                 ) && node_entry.term != oracle_entry.term
                 {
                     return Err(InvariantViolation::CommittedEntriesNeverLost {
-                        node: id,
+                        node: node_id,
                         index: log_idx,
                         actual_term: node_entry.term,
                         expected_term: oracle_entry.term,

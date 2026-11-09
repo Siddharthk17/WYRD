@@ -134,13 +134,13 @@ fn measure_raft_replication() -> (f64, usize) {
     let node2 = NodeId::new(2).expect("id 2");
     let node3 = NodeId::new(3).expect("id 3");
 
-    let make_node = |id: NodeId, peers: &[NodeId]| -> RaftCore {
+    let make_node = |node_id: NodeId, peers: &[NodeId]| -> RaftCore {
         let mut peer_set = std::collections::BTreeSet::new();
         for &p in peers {
             peer_set.insert(p);
         }
         let config = RaftConfig {
-            node_id: id,
+            node_id,
             peers: peer_set,
             election_timeout_ticks: 1_000_000,
             heartbeat_interval_ticks: 1_000_000,
@@ -149,7 +149,7 @@ fn measure_raft_replication() -> (f64, usize) {
             pre_vote_enabled: true,
             check_quorum: false,
         };
-        let rng = rand_chacha::ChaCha8Rng::seed_from_u64(id.get());
+        let rng = rand_chacha::ChaCha8Rng::seed_from_u64(node_id.get());
         RaftCore::new(config, RecoveredState::default(), rng)
     };
 

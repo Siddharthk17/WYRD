@@ -408,10 +408,10 @@ pub fn run_plan(plan: &Plan) {
     cluster.drain_network(20);
 
     let highest_commit = cluster.highest_commit_index();
-    for (&id, core) in &cluster.nodes {
+    for (&node_id, core) in &cluster.nodes {
         assert!(
             core.commit_index() <= core.last_log_index(),
-            "commit index exceeds last log index on node {id}"
+            "commit index exceeds last log index on node {node_id}"
         );
     }
 

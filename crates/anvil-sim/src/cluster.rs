@@ -127,8 +127,8 @@ impl SimCluster {
         let mut node_ids = Vec::with_capacity(size);
         for i in 1..=size {
             let id_raw = u64::try_from(i).unwrap_or(1);
-            if let Some(id) = NodeId::new(id_raw) {
-                node_ids.push(id);
+            if let Some(node_id) = NodeId::new(id_raw) {
+                node_ids.push(node_id);
             }
         }
 
@@ -136,16 +136,16 @@ impl SimCluster {
         let mut configs = BTreeMap::new();
         let mut storage = BTreeMap::new();
 
-        for &id in &node_ids {
+        for &node_id in &node_ids {
             let mut peers = BTreeSet::new();
             for &peer_id in &node_ids {
-                if peer_id != id {
+                if peer_id != node_id {
                     peers.insert(peer_id);
                 }
             }
 
             let config = RaftConfig {
-                node_id: id,
+                node_id,
                 peers,
                 election_timeout_ticks: 10,
                 heartbeat_interval_ticks: 3,
@@ -159,26 +159,26 @@ impl SimCluster {
                 "SimCluster builds only valid RaftConfig values"
             );
 
-            let path = format!("cluster/node/{}", id.get());
+            let path = format!("cluster/node/{}", node_id.get());
             let seed = derive_component_seed(master_seed, &path);
             let rng = ChaCha8Rng::from_seed(seed);
 
             let core = RaftCore::new(config.clone(), RecoveredState::default(), rng);
-            nodes.insert(id, core);
-            configs.insert(id, config);
+            nodes.insert(node_id, core);
+            configs.insert(node_id, config);
 
             // Initialize storage layer with real SimDevice and StorageEngine
             let storage_config = StorageConfig::for_test(SectorSize::Sector512, 64 * 1024);
-            let dev_rng = DetRng::new(master_seed, &format!("cluster/storage/{}", id.get()));
+            let dev_rng = DetRng::new(master_seed, &format!("cluster/storage/{}", node_id.get()));
             let mut sim_dev = SimDevice::new(dev_config.clone(), dev_rng);
             if let Some(shared_atlas) = &atlas {
-                sim_dev = sim_dev.with_atlas(shared_atlas.clone(), id);
+                sim_dev = sim_dev.with_atlas(shared_atlas.clone(), node_id);
             }
             init_node_storage(&mut sim_dev, &storage_config);
             let engine = StorageEngine::new_empty(storage_config.clone());
 
             storage.insert(
-                id,
+                node_id,
                 SimNodeStorage {
                     device: sim_dev,
                     engine,
@@ -222,9 +222,9 @@ impl SimCluster {
         }
 
         let node_ids: Vec<NodeId> = self.nodes.keys().copied().collect();
-        for id in node_ids {
-            if !self.is_node_crashed(id) {
-                self.step_node_internal(id, Input::Tick);
+        for node_id in node_ids {
+            if !self.is_node_crashed(node_id) {
+                self.step_node_internal(node_id, Input::Tick);
             }
         }
 
@@ -240,32 +240,34 @@ impl SimCluster {
 
     /// Steps a specific node with an `Input` event, processes all emitted side-effects,
     /// and immediately validates online invariants.
-    pub fn step_node(&mut self, id: NodeId, input: Input) {
-        self.step_node_internal(id, input);
+    pub fn step_node(&mut self, node_id: NodeId, input: Input) {
+        self.step_node_internal(node_id, input);
     }
 
     /// Returns whether the specified node is currently crashed.
     #[must_use]
-    pub fn is_node_crashed(&self, id: NodeId) -> bool {
-        self.storage.get(&id).is_some_and(|s| s.crashed)
+    pub fn is_node_crashed(&self, node_id: NodeId) -> bool {
+        self.storage.get(&node_id).is_some_and(|s| s.crashed)
     }
 
     /// Returns whether the specified node is marked `NeedsRepair` (mid-log corruption).
     #[must_use]
-    pub fn is_node_needs_repair(&self, id: NodeId) -> bool {
-        self.storage.get(&id).is_some_and(|s| s.needs_repair)
+    pub fn is_node_needs_repair(&self, node_id: NodeId) -> bool {
+        self.storage.get(&node_id).is_some_and(|s| s.needs_repair)
     }
 
     /// Returns whether the node refused to start (both hard state slots corrupt).
     #[must_use]
-    pub fn is_node_refused_start(&self, id: NodeId) -> bool {
-        self.storage.get(&id).is_some_and(|s| s.refused_start)
+    pub fn is_node_refused_start(&self, node_id: NodeId) -> bool {
+        self.storage.get(&node_id).is_some_and(|s| s.refused_start)
     }
 
     /// Synchronizes pre-existing entries in `RaftCore` into `StorageEngine` and `SimDevice`
     /// if the node's core was replaced or pre-populated in a test scenario.
-    pub fn sync_node_storage_with_core(&mut self, id: NodeId) {
-        if let (Some(core), Some(storage)) = (self.nodes.get(&id), self.storage.get_mut(&id)) {
+    pub fn sync_node_storage_with_core(&mut self, node_id: NodeId) {
+        if let (Some(core), Some(storage)) =
+            (self.nodes.get(&node_id), self.storage.get_mut(&node_id))
+        {
             let core_last = core.last_log_index();
             let engine_last = storage.engine.last_entry_index();
             if core_last > engine_last {
@@ -309,30 +311,30 @@ impl SimCluster {
         }
     }
 
-    fn step_node_internal(&mut self, id: NodeId, input: Input) {
-        if self.is_node_crashed(id)
-            || self.is_node_refused_start(id)
-            || self.is_node_needs_repair(id)
+    fn step_node_internal(&mut self, node_id: NodeId, input: Input) {
+        if self.is_node_crashed(node_id)
+            || self.is_node_refused_start(node_id)
+            || self.is_node_needs_repair(node_id)
         {
             return;
         }
 
-        self.sync_node_storage_with_core(id);
+        self.sync_node_storage_with_core(node_id);
         self.output_scratch.clear();
 
-        if let Some(core) = self.nodes.get_mut(&id) {
+        if let Some(core) = self.nodes.get_mut(&node_id) {
             core.step(input, &mut self.output_scratch);
         }
 
         let outbound = std::mem::take(&mut self.output_scratch.messages);
         for msg in outbound {
-            self.route_message(id, msg.to, msg.message);
+            self.route_message(node_id, msg.to, msg.message);
         }
 
         self.checker.check_invariants(&self.nodes);
 
         // Process persistence operations through real StorageEngine and SimDevice
-        if let Some(storage) = self.storage.get_mut(&id) {
+        if let Some(storage) = self.storage.get_mut(&node_id) {
             if !self.output_scratch.persist_ops.is_empty() {
                 let persist_ops = std::mem::take(&mut self.output_scratch.persist_ops);
                 storage.engine_output.clear();
@@ -391,12 +393,12 @@ impl SimCluster {
                 .collect();
             for token in persist_tokens {
                 self.output_scratch.clear();
-                if let Some(core) = self.nodes.get_mut(&id) {
+                if let Some(core) = self.nodes.get_mut(&node_id) {
                     core.step(Input::Persisted { token }, &mut self.output_scratch);
                 }
                 let follow_up = std::mem::take(&mut self.output_scratch.messages);
                 for msg in follow_up {
-                    self.route_message(id, msg.to, msg.message);
+                    self.route_message(node_id, msg.to, msg.message);
                 }
                 self.checker.check_invariants(&self.nodes);
             }
@@ -405,12 +407,12 @@ impl SimCluster {
         // Drive pending storage work to quiescence (including completions that
         // became ready while the node was idle) and collect acknowledgements.
         let mut completed_tokens = Vec::new();
-        if self.storage.contains_key(&id) {
-            if self.drive_storage(id) {
-                self.crash_node(id);
+        if self.storage.contains_key(&node_id) {
+            if self.drive_storage(node_id) {
+                self.crash_node(node_id);
                 return;
             }
-            if let Some(storage) = self.storage.get_mut(&id) {
+            if let Some(storage) = self.storage.get_mut(&node_id) {
                 completed_tokens = std::mem::take(&mut storage.engine_output.persisted_tokens);
             }
         }
@@ -422,7 +424,7 @@ impl SimCluster {
             for token_val in completed_tokens {
                 let token = anvil_raft::PersistToken(token_val);
                 self.output_scratch.clear();
-                if let Some(core) = self.nodes.get_mut(&id) {
+                if let Some(core) = self.nodes.get_mut(&node_id) {
                     core.step(Input::Persisted { token }, &mut self.output_scratch);
                     latest_log_and_vote = Some((
                         core.log()
@@ -438,7 +440,7 @@ impl SimCluster {
             }
 
             if let (Some((entries, term, vote)), Some(storage)) =
-                (latest_log_and_vote, self.storage.get_mut(&id))
+                (latest_log_and_vote, self.storage.get_mut(&node_id))
             {
                 storage.acknowledged_entries = entries;
                 if let Some(cand) = vote {
@@ -447,16 +449,16 @@ impl SimCluster {
             }
 
             if let Some(atlas) = &self.fault_atlas
-                && let Some(node_storage) = self.storage.get(&id)
+                && let Some(node_storage) = self.storage.get(&node_id)
             {
                 for &(idx, _) in &node_storage.acknowledged_entries {
-                    atlas.record_persisted(id, idx);
+                    atlas.record_persisted(node_id, idx);
                 }
                 atlas.advance_commit_index(self.highest_commit_index());
             }
 
             for msg in all_follow_ups {
-                self.route_message(id, msg.to, msg.message);
+                self.route_message(node_id, msg.to, msg.message);
             }
             self.checker.check_invariants(&self.nodes);
         }
@@ -470,10 +472,10 @@ impl SimCluster {
     ///
     /// Returns true if the engine latched a fatal error, in which case the
     /// caller must crash the node.
-    fn drive_storage(&mut self, id: NodeId) -> bool {
+    fn drive_storage(&mut self, node_id: NodeId) -> bool {
         loop {
             let mut submitted = false;
-            if let Some(storage) = self.storage.get_mut(&id) {
+            if let Some(storage) = self.storage.get_mut(&node_id) {
                 for dev_op in std::mem::take(&mut storage.engine_output.device_ops) {
                     storage.device.submit(dev_op);
                     submitted = true;
@@ -486,13 +488,13 @@ impl SimCluster {
             loop {
                 let completion = self
                     .storage
-                    .get_mut(&id)
+                    .get_mut(&node_id)
                     .and_then(|storage| storage.device.poll_completion());
                 match completion {
                     None => break,
                     Some(comp) => {
                         drained = true;
-                        if let Some(storage) = self.storage.get_mut(&id) {
+                        if let Some(storage) = self.storage.get_mut(&node_id) {
                             storage
                                 .engine
                                 .step(EngineInput::Completion(comp), &mut storage.engine_output);
@@ -513,15 +515,15 @@ impl SimCluster {
 
     /// Crashes a specific node: invokes `SimDevice::crash()`, removes volatile `RaftCore`,
     /// and drops all in-flight network messages to/from this node.
-    pub fn crash_node(&mut self, id: NodeId) {
-        if let Some(storage) = self.storage.get_mut(&id) {
+    pub fn crash_node(&mut self, node_id: NodeId) {
+        if let Some(storage) = self.storage.get_mut(&node_id) {
             storage.crashed = true;
             storage.device.crash();
         }
-        self.nodes.remove(&id);
+        self.nodes.remove(&node_id);
         self.network
             .in_flight
-            .retain(|pkt| pkt.to != id && pkt.from != id);
+            .retain(|pkt| pkt.to != node_id && pkt.from != node_id);
     }
 
     /// Restarts a crashed node: runs `scan_recovery` against the node's `SimDevice`,
@@ -530,9 +532,9 @@ impl SimCluster {
     ///
     /// # Errors
     /// Returns `StorageError` if hard-state recovery fails (both slots corrupted).
-    pub fn restart_node(&mut self, id: NodeId) -> Result<RecoveredStorageState, StorageError> {
-        let storage = self.storage.get_mut(&id).ok_or_else(|| {
-            StorageError::DeviceError(format!("node {id} not found in cluster storage"))
+    pub fn restart_node(&mut self, node_id: NodeId) -> Result<RecoveredStorageState, StorageError> {
+        let storage = self.storage.get_mut(&node_id).ok_or_else(|| {
+            StorageError::DeviceError(format!("node {node_id} not found in cluster storage"))
         })?;
 
         let sector_size = storage.config.sector_size;
@@ -665,14 +667,14 @@ impl SimCluster {
                     let entry_opt = recovered.log.entries.iter().find(|e| e.index == ack_idx);
                     assert!(
                         entry_opt.is_some_and(|e| e.term == ack_term),
-                        "RecoveredLogMissingAcknowledgedEntry: node {id} missing acknowledged entry ({ack_idx}, {ack_term})"
+                        "RecoveredLogMissingAcknowledgedEntry: node {node_id} missing acknowledged entry ({ack_idx}, {ack_term})"
                     );
                 }
 
                 // Invariant 3: CommittedNeverLostAcrossCrashes
                 let commit_res = self
                     .checker
-                    .check_recovered_log_against_oracle(id, &recovered.log.entries);
+                    .check_recovered_log_against_oracle(node_id, &recovered.log.entries);
                 assert!(
                     commit_res.is_ok(),
                     "CommittedNeverLostAcrossCrashes invariant failed: {:?}",
@@ -680,17 +682,22 @@ impl SimCluster {
                 );
 
                 // Re-initialize RaftCore
-                let path = format!("cluster/node/{}", id.get());
+                let path = format!("cluster/node/{}", node_id.get());
                 let seed = derive_component_seed(self.master_seed, &path);
                 let rng = ChaCha8Rng::from_seed(seed);
 
                 let config = self
                     .configs
-                    .get(&id)
+                    .get(&node_id)
                     .cloned()
                     .unwrap_or_else(|| RaftConfig {
-                        node_id: id,
-                        peers: self.configs.keys().copied().filter(|&p| p != id).collect(),
+                        node_id,
+                        peers: self
+                            .configs
+                            .keys()
+                            .copied()
+                            .filter(|&p| p != node_id)
+                            .collect(),
                         election_timeout_ticks: 10,
                         heartbeat_interval_ticks: 3,
                         max_inflight_messages: 256,
@@ -706,7 +713,29 @@ impl SimCluster {
                     entries: recovered.log.entries.clone(),
                 };
                 let core = RaftCore::new(config, recovered_state, rng);
-                self.nodes.insert(id, core);
+                self.nodes.insert(node_id, core);
+
+                // Crash discarded volatile terms/votes that never reached disk.
+                // Reset checker history to the recovered durable state before
+                // validating, or pre-crash in-memory values would read as
+                // regressions no other node could have observed. A mismatch
+                // against an acknowledged vote means durable state lost a real
+                // vote, so the node must not resume.
+                if let Err((tracked, durable)) = self.checker.reset_for_restart(
+                    node_id,
+                    recovered.current_term,
+                    recovered.voted_for,
+                    &storage.persisted_votes,
+                ) {
+                    storage.refused_start = true;
+                    storage.crashed = false;
+                    return Err(StorageError::StaleHardState {
+                        recovered_term: recovered.current_term,
+                        recovered_vote: recovered.voted_for,
+                        acked_term: recovered.current_term,
+                        acked_vote: tracked.or(durable),
+                    });
+                }
 
                 // Re-initialize StorageEngine from recovered state.
                 // Only entries at or after the active segment's first index are
@@ -887,12 +916,12 @@ impl SimCluster {
     #[must_use]
     pub fn leader(&self) -> Option<NodeId> {
         let mut leader = None;
-        for (&id, core) in &self.nodes {
-            if !self.is_node_crashed(id) && core.role() == Role::Leader {
+        for (&node_id, core) in &self.nodes {
+            if !self.is_node_crashed(node_id) && core.role() == Role::Leader {
                 if leader.is_some() {
                     return None;
                 }
-                leader = Some(id);
+                leader = Some(node_id);
             }
         }
         leader
@@ -935,7 +964,7 @@ impl SimCluster {
     pub fn highest_commit_index(&self) -> LogIndex {
         self.nodes
             .iter()
-            .filter(|&(id, _)| !self.is_node_crashed(*id))
+            .filter(|&(node_id, _)| !self.is_node_crashed(*node_id))
             .map(|(_, core)| core.commit_index())
             .max()
             .unwrap_or(LogIndex::from_raw(0))
