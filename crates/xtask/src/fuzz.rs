@@ -16,6 +16,17 @@ pub const FUZZ_TARGETS: &[&str] = &[
     "fuzz_snapshot",
 ];
 
+/// Detects the native host target triple via `rustc -vV`.
+fn native_target() -> Option<String> {
+    let output = Command::new("rustc").arg("-vV").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .find_map(|line| line.strip_prefix("host: ").map(str::to_string))
+}
+
 /// Runs cargo-fuzz targets if `cargo-fuzz` is installed, or verifies fuzz target
 /// compilation and corpus integrity if running in a non-nightly environment.
 ///
@@ -52,18 +63,19 @@ pub fn run_fuzz(duration_secs: u64) -> Result<(), String> {
     if has_cargo_fuzz {
         println!("Running libfuzzer on all targets for {duration_secs}s per target...");
         println!("(libfuzzer requires nightly sanitizers; invoking via nightly toolchain)");
+        // cargo-fuzz defaults to a musl target that sanitizers reject, so pin
+        // the native host target explicitly (works on x86_64 and aarch64).
+        let native_target = native_target();
         for &target in FUZZ_TARGETS {
             println!("  -> Fuzzing target `{target}`...");
             let mut run_cmd = Command::new("cargo");
             run_cmd.current_dir(workspace_root.join("fuzz"));
             run_cmd.env("RUSTUP_TOOLCHAIN", "nightly");
-            run_cmd.args([
-                "fuzz",
-                "run",
-                target,
-                "--",
-                &format!("-max_total_time={duration_secs}"),
-            ]);
+            run_cmd.args(["fuzz", "run", target]);
+            if let Some(native) = &native_target {
+                run_cmd.args(["--target", native]);
+            }
+            run_cmd.args(["--", &format!("-max_total_time={duration_secs}")]);
             let status = run_cmd
                 .status()
                 .map_err(|e| format!("Failed to run fuzz target {target}: {e}"))?;

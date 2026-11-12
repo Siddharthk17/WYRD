@@ -373,7 +373,13 @@ fn run_coverage_gate(workspace_root: &Path) -> Result<(), String> {
         .output()
         .map_err(|e| format!("Failed to launch coverage: {e}"))?;
     if !probe.status.success() {
-        return Err("Coverage run failed".to_string());
+        let stderr = String::from_utf8_lossy(&probe.stderr);
+        let tail: Vec<&str> = stderr.lines().rev().take(20).collect();
+        let tail = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
+        return Err(format!(
+            "Coverage run failed with status {}:\n{tail}",
+            probe.status
+        ));
     }
     let report = String::from_utf8_lossy(&probe.stdout);
     let totals = aggregate_coverage(&report)?;

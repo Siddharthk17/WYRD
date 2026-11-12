@@ -15,9 +15,10 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install --profile minimal --component rustfmt,clippy
+          TOOLCHAIN=$(grep '^channel' rust-toolchain.toml | cut -d'"' -f2)
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,llvm-tools-preview
           rustup toolchain install nightly --profile minimal
-          rustup component add llvm-tools-preview
+          rustup default "$TOOLCHAIN"
           rustup show
 
       - name: Install Java for TLC
@@ -47,9 +48,10 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install --profile minimal --component rustfmt,clippy
+          TOOLCHAIN=$(grep '^channel' rust-toolchain.toml | cut -d'"' -f2)
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,llvm-tools-preview
           rustup toolchain install nightly --profile minimal
-          rustup component add llvm-tools-preview
+          rustup default "$TOOLCHAIN"
           rustup show
 
       - name: Install Java for TLC
