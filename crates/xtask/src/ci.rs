@@ -359,17 +359,21 @@ fn coverage_percent(lines: u64, missed: u64) -> f64 {
 fn run_coverage_gate(workspace_root: &Path) -> Result<(), String> {
     println!("\n>>> Running Gate: Coverage (`cargo llvm-cov`)...");
     let start = Instant::now();
-    let probe = Command::new("cargo")
-        .current_dir(workspace_root)
-        .args(["llvm-cov", "nextest", "--workspace", "--summary-only"])
-        .env(
-            "LLVM_COV",
-            std::env::var("LLVM_COV").unwrap_or_else(|_| "llvm-cov".to_string()),
-        )
-        .env(
-            "LLVM_PROFDATA",
-            std::env::var("LLVM_PROFDATA").unwrap_or_else(|_| "llvm-profdata".to_string()),
-        )
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(workspace_root);
+    cmd.args(["llvm-cov", "nextest", "--workspace", "--summary-only"]);
+    // Only forward explicit LLVM tool overrides. When unset, cargo-llvm-cov
+    // resolves llvm-cov/llvm-profdata from the active toolchain sysroot,
+    // which is where the CI toolchain step installs them. Defaulting to
+    // bare names here would force a PATH lookup that fails on machines
+    // without system LLVM installed.
+    if let Ok(llvm_cov) = std::env::var("LLVM_COV") {
+        cmd.env("LLVM_COV", llvm_cov);
+    }
+    if let Ok(llvm_profdata) = std::env::var("LLVM_PROFDATA") {
+        cmd.env("LLVM_PROFDATA", llvm_profdata);
+    }
+    let probe = cmd
         .output()
         .map_err(|e| format!("Failed to launch coverage: {e}"))?;
     if !probe.status.success() {

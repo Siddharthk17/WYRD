@@ -138,7 +138,14 @@ impl HardStateSlot {
         let has_vote = buf[40];
 
         let voted_for = match has_vote {
-            0 => None,
+            0 => {
+                if raw_voted_for != 0 {
+                    return Err(StorageError::InvalidField {
+                        context: "hard_state_vote_bytes_must_be_zero",
+                    });
+                }
+                None
+            }
             1 => Some(
                 NodeId::new(raw_voted_for).ok_or(StorageError::InvalidField {
                     context: "hard_state_zero_node_id",

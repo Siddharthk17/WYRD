@@ -273,6 +273,20 @@ fn test_hard_state_slot_edges() {
         Err(StorageError::InvalidField { .. })
     ));
 
+    let mut nonzero_vote_bytes = vec![0u8; sector_len];
+    no_vote
+        .encode(sector(), &mut nonzero_vote_bytes)
+        .expect("encode");
+    nonzero_vote_bytes[32..40].copy_from_slice(&0xDEADBEEFu64.to_le_bytes());
+    let repaired = crc32c::crc32c(&nonzero_vote_bytes[16..41]);
+    nonzero_vote_bytes[12..16].copy_from_slice(&repaired.to_le_bytes());
+    assert!(matches!(
+        HardStateSlot::decode(&nonzero_vote_bytes, 1, sector()),
+        Err(StorageError::InvalidField {
+            context: "hard_state_vote_bytes_must_be_zero"
+        })
+    ));
+
     let mut bad_crc = buf.clone();
     bad_crc[16] ^= 0xFF;
     assert!(matches!(
