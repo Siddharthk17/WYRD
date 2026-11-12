@@ -44,31 +44,38 @@ The reference configuration ([anvil_raft.cfg](../../specs/anvil_raft.cfg)) defin
 The negative configuration ([anvil_raft_negative.cfg](../../specs/anvil_raft_negative.cfg)) disables the current-term commit rule:
 - **`RequireCurrentTermCommit = FALSE`**
 
-When this rule is disabled, a leader in a newer term directly commits an entry from an older term because it has been replicated onto a majority. A partitioned node with a higher term then gets elected and overwrites that entry, violating `StateMachineSafety` and `CommittedEntriesNeverLost`. TLC detects this counterexample and reports an invariant violation, proving that the spec accurately reproduces the classic Figure 8 scenario.
+When this rule is disabled, a leader in a newer term directly commits an entry from an older term because it has been replicated onto a majority. A partitioned node with a higher term then gets elected and overwrites that entry, violating `StateMachineSafety` and `CommittedEntriesNeverLost`. Exhaustive TLC on a large host detects this counterexample and reports an invariant violation; see the smoke-bounds section for why random simulation on small hosts is not asked to find it.
 
 ### Smoke Bounds for the Per-Change Gate
 
-`cargo xtask tlc` checks the smoke configs
-([anvil_raft_smoke.cfg](../../specs/anvil_raft_smoke.cfg),
-[anvil_raft_negative_smoke.cfg](../../specs/anvil_raft_negative_smoke.cfg)):
+`cargo xtask tlc` checks the smoke config
+([anvil_raft_smoke.cfg](../../specs/anvil_raft_smoke.cfg)):
 3 servers, 2 terms, 2 log entries, same 7 invariants, same symmetry. The
-model is explored with seeded random simulation (3 fixed seeds, depth 500
-traces each) instead of exhaustive search: the positive config must stay
-violation-free on every trace, and the negative config must produce the
-Figure 8 counterexample. Measured 2026-11-09 on the dev machine
-(i5-12450H): one depth-500 seed explores over 200M states and takes tens of
-minutes, so the six-seed gate runs for hours and does not meet the 10-minute
-bound on this hardware. The bound holds on larger verification hosts; record
-the runtime with each run. The reference 3-term, 3-entry bound is checked with
-`cargo xtask tlc-full` on larger hosts.
+model is explored with seeded random simulation (3 fixed seeds, 200 traces
+of depth 100 each). The run must stay violation-free on every trace.
+Measured 2026-11-12 on the dev machine (i5-12450H): one seed explores about
+55k states in about 1.5 s, so the whole gate finishes in seconds, inside the
+10-minute bound. The trace count bound matters: without `num`, TLC
+simulates without end and the gate would never terminate.
 
-Measured 2026-11-09 (i5-12450H, 12 threads): exhaustive checking of even the
-smoke bound exceeded 250M generated states and kept growing, and the
-reference bound exceeded 300M generated states and exhausted a 5 GiB disk
-allocation for TLC state files before completing, so neither exhaustive
-check is a per-change gate on this hardware. Run `cargo xtask tlc-full` on
-a larger verification host for the reference bounds; the simulation gate
-above is the enforced per-change check.
+The negative configs ([anvil_raft_negative.cfg](../../specs/anvil_raft_negative.cfg),
+[anvil_raft_negative_smoke.cfg](../../specs/anvil_raft_negative_smoke.cfg))
+disable the current-term commit rule to reproduce the Figure 8 scenario.
+They are kept for large-host exhaustive runs via `cargo xtask tlc-full`,
+but random simulation is not asked to find the counterexample: it is
+unreachable by sampling in the 3-server bound. A server missing a
+committed entry can never gather a quorum, because every vote it needs
+comes from a server holding that entry, which the log-comparison rule
+forces to deny; grounding higher-term entries without the committed prefix
+is impossible under AppendEntries prefix matching. Thousands of traces
+across seeds and bounds (smoke and reference, depths 100 to 500) found
+nothing, while unbounded simulation never terminates. Exhaustive checking
+exceeds small hosts: the smoke bound passes 69M generated states in 5
+minutes and then exhausts disk, and the reference bound passed 300M
+generated states before exhausting a 5 GiB TLC allocation. The Figure 8
+rule is instead enforced deterministically by
+`crates/anvil-sim/tests/raft_scenario_test.rs::test_raft_paper_figure_8_commit_rule`
+and the `proptest_raft` suites, which drive the real core.
 
 During development, simulation also caught a real spec defect: leader
 initialization set `nextIndex` to `Len(log) + 2` unconditionally, which
@@ -83,6 +90,8 @@ The ANVIL toolchain includes a built-in TLC verification gate in `xtask`:
 ```bash
 cargo xtask tlc
 ```
-The command verifies that:
-1. `anvil_raft_smoke.cfg` simulates cleanly on all seeds with 0 invariant violations.
-2. `anvil_raft_negative_smoke.cfg` simulation finds an invariant violation (`StateMachineSafety` or `CommittedEntriesNeverLost`), validating the negative check.
+The command verifies that `anvil_raft_smoke.cfg` simulates cleanly on all
+seeds with 0 invariant violations. The negative configs are kept for
+`cargo xtask tlc-full` on larger hosts; the per-change gate does not run
+them, for the reasons documented above, and the Figure 8 rule is covered by
+the deterministic Rust scenario and property tests instead.

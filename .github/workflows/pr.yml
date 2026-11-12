@@ -26,6 +26,11 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      - name: Download tla2tools.jar
+        run: |
+          mkdir -p tools
+          curl -sSL -o tools/tla2tools.jar https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+
       - name: Install CI tools
         uses: taiki-e/install-action@v2
         with:
@@ -52,6 +57,11 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+
+      - name: Download tla2tools.jar
+        run: |
+          mkdir -p tools
+          curl -sSL -o tools/tla2tools.jar https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
 
       - name: Install CI tools
         uses: taiki-e/install-action@v2
