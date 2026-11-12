@@ -15,7 +15,21 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
+          rustup toolchain install --profile minimal --component rustfmt,clippy
+          rustup toolchain install nightly --profile minimal
+          rustup component add llvm-tools-preview
           rustup show
+
+      - name: Install Java for TLC
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install CI tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9,cargo-hack@0.6,cargo-deny@0.20,cargo-audit@0.22,cargo-geiger@0.14,cargo-llvm-cov@0.9,cargo-fuzz@0.13
 
       - name: ANVIL Quality Gates (xtask ci)
         run: cargo xtask ci
@@ -28,7 +42,21 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
+          rustup toolchain install --profile minimal --component rustfmt,clippy
+          rustup toolchain install nightly --profile minimal
+          rustup component add llvm-tools-preview
           rustup show
+
+      - name: Install Java for TLC
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install CI tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9,cargo-hack@0.6,cargo-deny@0.20,cargo-audit@0.22,cargo-geiger@0.14,cargo-llvm-cov@0.9,cargo-fuzz@0.13
 
       - name: ANVIL Quality Gates (xtask ci)
         run: cargo xtask ci

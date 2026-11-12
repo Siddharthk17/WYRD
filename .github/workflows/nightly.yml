@@ -11,6 +11,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install --profile minimal
+          rustup show
       - name: Run Farm
         run: cargo run --package xtask -- farm --seeds 200000
 
@@ -19,6 +23,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install --profile minimal
+          rustup toolchain install nightly --profile minimal
+          rustup show
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.13
       - name: Run Fuzz Harness
         run: cargo run --package xtask -- fuzz --duration-secs 1800
 
@@ -27,5 +40,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install --profile minimal
+          rustup show
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants@27
       - name: Mutants Check
         run: cargo mutants --workspace --min-test-timeout 60
