@@ -19,7 +19,10 @@ jobs:
           rustup toolchain install "$TOOLCHAIN" --profile minimal
           rustup toolchain install nightly --profile minimal
           rustup default "$TOOLCHAIN"
-          rustup component add rustfmt clippy llvm-tools-preview --toolchain "$TOOLCHAIN"
+          df -h "$HOME"
+          rustup component add rustfmt --toolchain "$TOOLCHAIN"
+          rustup component add clippy --toolchain "$TOOLCHAIN"
+          rustup component add llvm-tools-preview --toolchain "$TOOLCHAIN"
           test -x "$(rustc --print sysroot)/bin/llvm-profdata"
           rustup show
 
@@ -54,7 +57,10 @@ jobs:
           rustup toolchain install "$TOOLCHAIN" --profile minimal
           rustup toolchain install nightly --profile minimal
           rustup default "$TOOLCHAIN"
-          rustup component add rustfmt clippy llvm-tools-preview --toolchain "$TOOLCHAIN"
+          df -h "$HOME"
+          rustup component add rustfmt --toolchain "$TOOLCHAIN"
+          rustup component add clippy --toolchain "$TOOLCHAIN"
+          rustup component add llvm-tools-preview --toolchain "$TOOLCHAIN"
           test -x "$(rustc --print sysroot)/bin/llvm-profdata"
           rustup show
 
