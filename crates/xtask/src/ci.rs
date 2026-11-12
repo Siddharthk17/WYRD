@@ -118,7 +118,7 @@ fn audit_unsafe_code(workspace_root: &Path) -> Result<(), String> {
                         continue;
                     }
                     return Err(format!(
-                        "Forbidden unsafe block detected in production code: {}:{}: {}",
+                        "Forbidden `unsafe` block detected in production code: {}:{}: {}",
                         file.display(),
                         line_no + 1,
                         line
@@ -131,7 +131,7 @@ fn audit_unsafe_code(workspace_root: &Path) -> Result<(), String> {
 
     let elapsed = start.elapsed();
     println!(
-        ">>> [PASS] Zero-Unsafe Code Audit ({audited_crates} crates audited, 0 unsafe blocks) ({elapsed:.2?})"
+        ">>> [PASS] Zero-Unsafe Code Audit ({audited_crates} crates audited, 0 `unsafe` blocks) ({elapsed:.2?})"
     );
     Ok(())
 }
