@@ -124,6 +124,11 @@ impl WalSegmentHeader {
                 found: raw_sector_size,
             });
         }
+        if buf[12..16] != [0, 0, 0, 0] {
+            return Err(StorageError::InvalidField {
+                context: "wal_header_reserved",
+            });
+        }
 
         let segment_id = u64::from_le_bytes([
             buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],

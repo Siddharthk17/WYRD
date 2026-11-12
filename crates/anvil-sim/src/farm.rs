@@ -14,7 +14,7 @@
 
 use crate::plan::{Plan, run_plan};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -80,7 +80,6 @@ fn run_seed_farm_inner(num_seeds: usize, num_threads: usize, storage_faults: boo
     let start = Instant::now();
     let passed = Arc::new(AtomicUsize::new(0));
     let failed_seed = Arc::new(std::sync::Mutex::new(None));
-    let aborted = Arc::new(AtomicBool::new(false));
 
     let threads_count = num_threads.max(1);
     let chunk_size = num_seeds.div_ceil(threads_count);
@@ -92,13 +91,11 @@ fn run_seed_farm_inner(num_seeds: usize, num_threads: usize, storage_faults: boo
         let end_seed = (start_seed + chunk_size).min(num_seeds);
         let passed_clone = Arc::clone(&passed);
         let failed_clone = Arc::clone(&failed_seed);
-        let aborted_clone = Arc::clone(&aborted);
 
         let handle = thread::spawn(move || {
+            let mut local_passed = 0usize;
+            let mut local_failed: Option<u64> = None;
             for seed in start_seed..end_seed {
-                if aborted_clone.load(Ordering::Relaxed) {
-                    break;
-                }
                 let seed_u64 = seed as u64;
                 let outcome = std::panic::catch_unwind(|| {
                     if storage_faults {
@@ -109,16 +106,18 @@ fn run_seed_farm_inner(num_seeds: usize, num_threads: usize, storage_faults: boo
                 });
 
                 if outcome.is_ok() {
-                    passed_clone.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    let mut lock = failed_clone
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if lock.is_none() {
-                        *lock = Some(seed_u64);
-                    }
-                    aborted_clone.store(true, Ordering::Relaxed);
-                    break;
+                    local_passed += 1;
+                } else if local_failed.is_none() {
+                    local_failed = Some(seed_u64);
+                }
+            }
+            passed_clone.fetch_add(local_passed, Ordering::Relaxed);
+            if let Some(failed) = local_failed {
+                let mut lock = failed_clone
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if lock.is_none_or(|current| failed < current) {
+                    *lock = Some(failed);
                 }
             }
         });

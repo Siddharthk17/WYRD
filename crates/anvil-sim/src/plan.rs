@@ -94,7 +94,8 @@ impl Plan {
     pub fn generate(seed: u64, storage_faults: bool) -> Self {
         let mut rng = DetRng::new(seed, "sim/plan");
         let sizes = [3, 5, 7];
-        let cluster_size = sizes[(seed % 3) as usize];
+        let size_idx = usize::try_from(rng.gen_range(0..3)).unwrap_or(0);
+        let cluster_size = sizes[size_idx % sizes.len()];
         let ticks = 30;
         let mut proposals = Vec::new();
         let mut tick = 6;
@@ -104,18 +105,26 @@ impl Plan {
         }
         let mut partitions = Vec::new();
         if cluster_size > 3 {
+            let member_raw = rng.gen_range(0..cluster_size as u64);
+            let member = usize::try_from(member_raw).unwrap_or(0) % cluster_size;
             partitions.push(PlanPartition {
                 start: 12,
                 end: 20,
-                member: cluster_size - 1,
+                member,
             });
         }
-        let victim = usize::try_from(seed % cluster_size as u64).unwrap_or(0);
+        let victim_raw = rng.gen_range(0..cluster_size as u64);
+        let victim = usize::try_from(victim_raw).unwrap_or(0) % cluster_size;
+        let crash_tick = rng.gen_range(10..16);
+        let restart_tick = crash_tick + rng.gen_range(2..6);
         let crashes = vec![PlanCrash {
-            crash_tick: 15,
-            restart_tick: 15,
+            crash_tick,
+            restart_tick,
             node_idx: victim,
         }];
+        let drop_pct = rng.gen_range(0..16);
+        let dup_pct = rng.gen_range(0..10);
+        let max_delay = rng.gen_range(0..6);
         let salt = rng.next_u64();
         Self {
             version: PLAN_VERSION,
@@ -125,9 +134,9 @@ impl Plan {
             proposals,
             partitions,
             crashes,
-            drop_pct: 8,
-            dup_pct: 5,
-            max_delay: 3,
+            drop_pct,
+            dup_pct,
+            max_delay,
             salt,
             storage_faults,
         }
@@ -344,12 +353,16 @@ fn parse_idx(raw: &str) -> Result<usize, PlanError> {
     usize::try_from(value).map_err(|_| PlanError::BadField("range"))
 }
 
-/// Executes a plan with no generator draws: every fault and workload choice
-/// is read from the plan, and network faults are pure hash functions.
+/// Executes a plan: fault schedule and workload come from the plan, and
+/// network faults are pure hash functions of the plan salt. Consensus
+/// election jitter and storage fault draws remain seeded RNG streams, so the
+/// same seed replays identically.
 pub fn run_plan(plan: &Plan) {
+    use crate::buggify::set_buggify_seed;
     use crate::device::SimDeviceConfig;
     use anvil_storage::SectorSize;
 
+    set_buggify_seed(plan.seed ^ 0x9E37_79B9_7F4A_7C15);
     let mut cluster = if plan.storage_faults {
         let dev_config = SimDeviceConfig::chaotic(SectorSize::Sector512, 10_000, 5_000, 200);
         SimCluster::new_with_storage_faults(plan.cluster_size, plan.seed, &dev_config)
@@ -378,7 +391,7 @@ pub fn run_plan(plan: &Plan) {
         for crash in &plan.crashes {
             if crash.crash_tick == tick {
                 let victim = node_ids[crash.node_idx % node_ids.len()];
-                if Some(victim) != cluster.leader() {
+                if !cluster.is_node_crashed(victim) {
                     cluster.crash_node(victim);
                 }
             }
@@ -398,7 +411,7 @@ pub fn run_plan(plan: &Plan) {
         if plan.proposals.contains(&tick)
             && let Some(leader) = cluster.leader()
         {
-            let payload = Bytes::from(format!("seed_{}_tick_{}", plan.seed, tick));
+            let payload = plan_proposal_payload(plan.seed, tick);
             cluster.propose(leader, payload);
         }
     }
@@ -528,6 +541,7 @@ fn shrink_ticks(plan: &Plan, fails: &dyn Fn(&Plan) -> bool) -> Option<Plan> {
         .proposals
         .iter()
         .copied()
+        .filter(|p| *p <= plan.ticks)
         .chain(plan.partitions.iter().map(|p| p.end))
         .chain(plan.crashes.iter().map(|c| c.restart_tick))
         .max()
@@ -540,4 +554,43 @@ fn shrink_ticks(plan: &Plan, fails: &dyn Fn(&Plan) -> bool) -> Option<Plan> {
         }
     }
     None
+}
+
+fn plan_proposal_payload(seed: u64, tick: u64) -> Bytes {
+    let mut buf = [0u8; 64];
+    let mut len = 0usize;
+    len += write_static(&mut buf[len..], b"seed_");
+    len += write_u64(&mut buf[len..], seed);
+    len += write_static(&mut buf[len..], b"_tick_");
+    len += write_u64(&mut buf[len..], tick);
+    Bytes::copy_from_slice(&buf[..len])
+}
+
+fn write_static(out: &mut [u8], text: &[u8]) -> usize {
+    let len = text.len().min(out.len());
+    out[..len].copy_from_slice(&text[..len]);
+    len
+}
+
+fn write_u64(out: &mut [u8], mut value: u64) -> usize {
+    if out.is_empty() {
+        return 0;
+    }
+    if value == 0 {
+        out[0] = b'0';
+        return 1;
+    }
+    let mut digits = [0u8; 20];
+    let mut count = 0usize;
+    while value > 0 && count < digits.len() {
+        digits[count] = b'0' + (value % 10) as u8;
+        value /= 10;
+        count += 1;
+    }
+    debug_assert!(count <= out.len(), "proposal buffer fits u64");
+    let len = count.min(out.len());
+    for i in 0..len {
+        out[i] = digits[count - 1 - i];
+    }
+    len
 }

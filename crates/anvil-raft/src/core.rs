@@ -55,6 +55,7 @@ pub struct RaftCore {
     next_persist_token: u64,
     pending_persists: Vec<(PersistToken, PendingAction)>,
     leader_persisted_index: LogIndex,
+    leader_sticky: bool,
 }
 
 impl RaftCore {
@@ -64,6 +65,14 @@ impl RaftCore {
         assert!(
             config.validate().is_ok(),
             "RaftCore requires a valid RaftConfig"
+        );
+        assert!(
+            recovered.commit_index
+                <= recovered
+                    .entries
+                    .last()
+                    .map_or(LogIndex::from_raw(0), |entry| entry.index),
+            "recovered commit index cannot exceed last log index"
         );
         let randomized_election_timeout =
             Self::sample_random_timeout(config.election_timeout_ticks, &mut rng);
@@ -107,6 +116,7 @@ impl RaftCore {
             next_persist_token: 1,
             pending_persists: Vec::with_capacity(64),
             leader_persisted_index: last_log_idx,
+            leader_sticky: false,
         }
     }
 
@@ -200,6 +210,7 @@ impl RaftCore {
                         self.config.election_timeout_ticks,
                         &mut self.rng,
                     );
+                    self.leader_sticky = false;
                     if self.config.pre_vote_enabled {
                         self.start_pre_vote(output);
                     } else {
@@ -269,7 +280,8 @@ impl RaftCore {
         output: &mut Output,
     ) {
         let is_log_ok = self.is_log_up_to_date(last_log_index, last_log_term);
-        let grant = term >= self.term && is_log_ok;
+        let grant =
+            term >= self.term && is_log_ok && (!self.leader_sticky || self.role == Role::Leader);
 
         output.messages.push(OutboundMessage {
             to: from,
@@ -438,6 +450,10 @@ impl RaftCore {
         self.election_elapsed_ticks = 0;
         self.heartbeat_acks.clear();
 
+        assert!(
+            self.log.last_index().next().is_some(),
+            "log index overflow on leader no-op"
+        );
         let next_idx = self
             .log
             .last_index()
@@ -596,6 +612,7 @@ impl RaftCore {
         }
 
         self.election_elapsed_ticks = 0;
+        self.leader_sticky = true;
         if self.role != Role::Follower {
             let same_term_token = self.transition_to_follower(term, output);
             assert!(
@@ -806,6 +823,7 @@ impl RaftCore {
 
         if success {
             progress.on_success(match_index);
+            self.heartbeat_acks.insert(from);
             self.maybe_advance_commit(output);
 
             if self.lead_transferee == Some(from) && match_index >= self.log.last_index() {
@@ -920,10 +938,19 @@ impl RaftCore {
 
         if term >= self.term {
             self.election_elapsed_ticks = 0;
+            self.leader_sticky = true;
             if self.role != Role::Follower {
                 let same_term_token = self.transition_to_follower(term, output);
-                debug_assert!(same_term_token.is_none());
+                assert!(
+                    same_term_token.is_none(),
+                    "same-term follower transition must not require persistence"
+                );
             }
+            // Heartbeat carries no prev_log check, so commit advances only
+            // when the local entry at the target already matches the
+            // leader's term. The leader's commit index always points at a
+            // current-term entry (commit rule), so a mismatch means the log
+            // has diverged and the entry arrives via AppendEntries instead.
             if commit_index > self.commit_index {
                 let target = std::cmp::min(commit_index, self.log.last_index());
                 if target > self.commit_index && self.log.term_at(target) == Some(term) {
@@ -1064,11 +1091,7 @@ impl RaftCore {
             return;
         }
         if term > self.term {
-            self.term = term;
-            self.voted_for = None;
-            self.lead_transferee = None;
-            self.pre_votes_granted.clear();
-            self.votes_granted.clear();
+            let _ = self.transition_to_follower(term, output);
         }
         self.start_election(output);
     }

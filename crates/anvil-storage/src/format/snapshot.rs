@@ -369,4 +369,35 @@ impl SnapshotFooter {
             footer_crc: expected_crc,
         })
     }
+
+    /// Verifies a complete snapshot file: length matches the footer claim and
+    /// the whole-file BLAKE3 digest matches the footer digest.
+    ///
+    /// # Errors
+    /// Returns `StorageError::Blake3Mismatch` when the file length or digest
+    /// does not match the footer, and forwards framing errors from decoding.
+    pub fn verify_file(file: &[u8]) -> Result<Self, StorageError> {
+        if file.len() < SNAPSHOT_HEADER_LEN + SNAPSHOT_FOOTER_LEN {
+            return Err(StorageError::BufferTooSmall {
+                required: SNAPSHOT_HEADER_LEN + SNAPSHOT_FOOTER_LEN,
+                provided: file.len(),
+            });
+        }
+        let footer_start = file.len() - SNAPSHOT_FOOTER_LEN;
+        let footer = Self::decode(&file[footer_start..])?;
+        if file.len() as u64 != footer.total_length {
+            return Err(StorageError::Blake3Mismatch {
+                expected: footer.blake3_digest,
+                computed: blake3::hash(&file[..footer_start]).into(),
+            });
+        }
+        let computed = blake3::hash(&file[..footer_start]);
+        if computed.as_bytes() != &footer.blake3_digest {
+            return Err(StorageError::Blake3Mismatch {
+                expected: footer.blake3_digest,
+                computed: *computed.as_bytes(),
+            });
+        }
+        Ok(footer)
+    }
 }

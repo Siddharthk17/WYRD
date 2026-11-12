@@ -363,3 +363,15 @@ fn test_seq_no_edges() {
     assert_eq!(SeqNo::from_raw(4).checked_sub(4), Some(SeqNo::from_raw(0)));
     assert_eq!(format!("{}", SeqNo::from_raw(6)), "6", "seq display");
 }
+
+#[test]
+fn test_frame_encode_rejects_oversize_payload() {
+    let oversize = vec![0u8; (anvil_types::MAX_FRAME_PAYLOAD_LEN as usize) + 1];
+    let mut buf = Vec::new();
+    let encode_outcome = Frame::encode(FrameType::Message, &oversize, &mut buf);
+    assert!(matches!(
+        encode_outcome,
+        Err(CodecError::PayloadTooLarge { .. })
+    ));
+    assert!(buf.is_empty(), "failed encode must not append bytes");
+}

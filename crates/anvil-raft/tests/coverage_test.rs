@@ -1646,7 +1646,7 @@ fn test_candidate_steps_down_on_same_term_heartbeat() {
 }
 
 #[test]
-fn test_heartbeat_does_not_advance_commit_on_term_mismatch() {
+fn test_heartbeat_commits_only_when_entry_matches_leader_term() {
     let mut follower = make_core(2, &[1]);
     let mut output = Output::new();
     let leader = NodeId::new(1).expect("leader");
@@ -2186,4 +2186,49 @@ fn test_send_append_requires_all_preconditions() {
     replicating.state = ProgressState::Replicate;
     replicating.on_send(0, LogIndex::from_raw(9));
     assert_eq!(replicating.next_index, LogIndex::from_raw(2));
+}
+
+#[test]
+fn test_prevote_rejected_while_leader_sticky() {
+    let mut follower = make_core(2, &[1, 3]);
+    let mut output = Output::new();
+    let leader = NodeId::new(1).expect("leader");
+    let candidate = NodeId::new(3).expect("candidate");
+    follower.step(
+        Input::Recv {
+            from: leader,
+            message: Message::AppendEntriesRequest {
+                term: Term::from_raw(1),
+                leader_id: leader,
+                prev_log_index: LogIndex::from_raw(0),
+                prev_log_term: Term::from_raw(0),
+                entries: Vec::new(),
+                leader_commit: LogIndex::from_raw(0),
+            },
+        },
+        &mut output,
+    );
+    output.clear();
+    follower.step(
+        Input::Recv {
+            from: candidate,
+            message: Message::PreVoteRequest {
+                term: Term::from_raw(2),
+                candidate_id: candidate,
+                last_log_index: LogIndex::from_raw(0),
+                last_log_term: Term::from_raw(0),
+            },
+        },
+        &mut output,
+    );
+    let granted = output.messages.iter().any(|m| {
+        matches!(
+            &m.message,
+            Message::PreVoteResponse {
+                vote_granted: true,
+                ..
+            }
+        )
+    });
+    assert!(!granted, "sticky follower must reject disruptive prevote");
 }

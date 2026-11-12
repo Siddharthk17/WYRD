@@ -268,6 +268,53 @@ fn test_snapshot_header_chunk_and_footer() {
     // Verify whole-file hash
     let recomputed_digest = blake3::hash(&file_data[..file_data.len() - 64]);
     assert_eq!(*recomputed_digest.as_bytes(), decoded_footer.blake3_digest);
+
+    let verified = SnapshotFooter::verify_file(&file_data).unwrap();
+    assert_eq!(verified, footer);
+}
+
+#[test]
+fn test_wal_header_rejects_nonzero_reserved() {
+    let sector_size = SectorSize::Sector512;
+    let header = WalSegmentHeader::new(sector_size, 7, LogIndex::from_raw(1), Term::from_raw(0));
+    let mut buf = vec![0u8; sector_size.as_usize()];
+    header.encode(&mut buf).unwrap();
+    buf[12] = 1;
+    let result = WalSegmentHeader::decode(&buf, sector_size);
+    assert!(matches!(result, Err(StorageError::InvalidField { .. })));
+}
+
+#[test]
+fn test_snapshot_footer_verify_rejects_tampered_file() {
+    let sector_size = SectorSize::Sector512;
+    let header = SnapshotHeader::new(
+        sector_size,
+        LogIndex::from_raw(9),
+        Term::from_raw(3),
+        ClusterId::from_raw(1),
+        GroupId::from_raw(1),
+        1,
+    );
+    let mut header_buf = vec![0u8; 64];
+    header.encode(&mut header_buf).unwrap();
+    let chunk = SnapshotChunk {
+        chunk_index: 0,
+        payload: Bytes::from_static(b"slice"),
+    };
+    let mut file_data = Vec::new();
+    file_data.extend_from_slice(&header_buf);
+    chunk.encode(&mut file_data).unwrap();
+    let digest = blake3::hash(&file_data);
+    let total = file_data.len() as u64 + 64;
+    let footer = SnapshotFooter::new(total, *digest.as_bytes());
+    let mut footer_buf = vec![0u8; 64];
+    footer.encode(&mut footer_buf).unwrap();
+    file_data.extend_from_slice(&footer_buf);
+    assert!(SnapshotFooter::verify_file(&file_data).is_ok());
+
+    let mut tampered = file_data.clone();
+    tampered[70] ^= 0xFF;
+    assert!(SnapshotFooter::verify_file(&tampered).is_err());
 }
 
 #[test]

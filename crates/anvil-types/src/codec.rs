@@ -109,14 +109,20 @@ impl FrameHeader {
 
     /// Decodes a frame header from the input slice, advancing the slice on success.
     pub fn decode(buf: &mut &[u8]) -> Result<Self, CodecError> {
-        if buf.len() < Self::HEADER_LEN {
-            return Err(CodecError::UnexpectedEof {
+        let header_bytes: &[u8] = buf
+            .get(..Self::HEADER_LEN)
+            .ok_or(CodecError::UnexpectedEof {
                 needed: Self::HEADER_LEN,
                 available: buf.len(),
-            });
-        }
+            })?;
 
-        let magic: [u8; 4] = [buf[0], buf[1], buf[2], buf[3]];
+        let magic: [u8; 4] = header_bytes
+            .get(0..4)
+            .and_then(|s| <[u8; 4]>::try_from(s).ok())
+            .ok_or(CodecError::UnexpectedEof {
+                needed: Self::HEADER_LEN,
+                available: buf.len(),
+            })?;
         if magic != FRAME_MAGIC {
             return Err(CodecError::InvalidMagic {
                 expected: FRAME_MAGIC,
@@ -124,13 +130,18 @@ impl FrameHeader {
             });
         }
 
-        let version = u16::from_le_bytes([buf[4], buf[5]]);
+        let version = u16::from_le_bytes([header_bytes[4], header_bytes[5]]);
         if version != CODEC_VERSION_1 {
             return Err(CodecError::UnsupportedVersion(version));
         }
 
-        let frame_type = u16::from_le_bytes([buf[6], buf[7]]);
-        let payload_len = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        let frame_type = u16::from_le_bytes([header_bytes[6], header_bytes[7]]);
+        let payload_len = u32::from_le_bytes([
+            header_bytes[8],
+            header_bytes[9],
+            header_bytes[10],
+            header_bytes[11],
+        ]);
         if payload_len > MAX_FRAME_PAYLOAD_LEN {
             return Err(CodecError::PayloadTooLarge {
                 length: u64::from(payload_len),
@@ -138,7 +149,12 @@ impl FrameHeader {
             });
         }
 
-        let checksum = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+        let checksum = u32::from_le_bytes([
+            header_bytes[12],
+            header_bytes[13],
+            header_bytes[14],
+            header_bytes[15],
+        ]);
         *buf = &buf[Self::HEADER_LEN..];
 
         Ok(Self {
@@ -171,9 +187,20 @@ impl Frame {
         payload: &[u8],
         buf: &mut Vec<u8>,
     ) -> Result<(), CodecError> {
+        let payload_len_u64 =
+            u64::try_from(payload.len()).map_err(|_| CodecError::PayloadTooLarge {
+                length: u64::MAX,
+                limit: u64::from(MAX_FRAME_PAYLOAD_LEN),
+            })?;
+        if payload_len_u64 > u64::from(MAX_FRAME_PAYLOAD_LEN) {
+            return Err(CodecError::PayloadTooLarge {
+                length: payload_len_u64,
+                limit: u64::from(MAX_FRAME_PAYLOAD_LEN),
+            });
+        }
         let payload_len =
-            u32::try_from(payload.len()).map_err(|_| CodecError::PayloadTooLarge {
-                length: payload.len() as u64,
+            u32::try_from(payload_len_u64).map_err(|_| CodecError::PayloadTooLarge {
+                length: payload_len_u64,
                 limit: u64::from(MAX_FRAME_PAYLOAD_LEN),
             })?;
 
@@ -285,6 +312,9 @@ pub fn encode_varint_u64(mut value: u64, buf: &mut Vec<u8>) {
 }
 
 /// Decodes an unsigned 64-bit integer from LEB128, advancing the slice past it.
+///
+/// Accepts non-canonical encodings (for example zero as `[0x80, 0x00]`) and
+/// decodes by value. Canonical minimal form is not required on the wire.
 pub fn decode_varint_u64(buf: &mut &[u8]) -> Result<u64, CodecError> {
     let mut value: u64 = 0;
     let mut shift = 0;
@@ -297,9 +327,6 @@ pub fn decode_varint_u64(buf: &mut &[u8]) -> Result<u64, CodecError> {
 
         let group = u64::from(byte & 0x7F);
         if shift == 63 && group > 1 {
-            return Err(CodecError::VarintOverflow);
-        }
-        if shift > 63 {
             return Err(CodecError::VarintOverflow);
         }
 

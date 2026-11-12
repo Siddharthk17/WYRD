@@ -82,6 +82,9 @@ pub struct SimCluster {
     /// Storage fault atlas enforcing the quorum survivability rule.
     /// `None` unless the cluster was built with storage faults enabled.
     pub fault_atlas: Option<StorageFaultAtlas>,
+    /// Restart count per node, mixed into the restart RNG seed so a restarted
+    /// node continues a fresh election-timeout sequence instead of replaying it.
+    pub restart_counts: BTreeMap<NodeId, u64>,
     /// Scratch output buffer reused across steps to eliminate allocations.
     output_scratch: Output,
 }
@@ -203,6 +206,7 @@ impl SimCluster {
             plan_net: None,
             checker: RaftInvariantChecker::new(),
             fault_atlas: atlas,
+            restart_counts: BTreeMap::new(),
             output_scratch: Output::new(),
         }
     }
@@ -681,8 +685,11 @@ impl SimCluster {
                     commit_res.err()
                 );
 
-                // Re-initialize RaftCore
-                let path = format!("cluster/node/{}", node_id.get());
+                // Re-initialize RaftCore with a restart-aware seed so the
+                // restarted node draws a fresh election-timeout sequence.
+                let restarts = self.restart_counts.get(&node_id).copied().unwrap_or(0);
+                self.restart_counts.insert(node_id, restarts + 1);
+                let path = format!("cluster/node/{}/restart-{restarts}", node_id.get());
                 let seed = derive_component_seed(self.master_seed, &path);
                 let rng = ChaCha8Rng::from_seed(seed);
 

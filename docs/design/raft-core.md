@@ -30,6 +30,7 @@ Every state transition in `specs/anvil_raft.tla` maps to an implementation funct
 | `HandleAppendEntriesResp(s, m)` | `RaftCore::handle_append_entries_response` | `crates/anvil-raft/src/core.rs` |
 | `AdvanceCommit(s)` | `RaftCore::maybe_advance_commit` | `crates/anvil-raft/src/core.rs` |
 | `CheckQuorum(s)` | `RaftCore::handle_tick` (CheckQuorum check) | `crates/anvil-raft/src/core.rs` |
+| `ExpireSticky(s)` | Election-timeout expiry clears `leader_sticky` in `handle_tick` | `crates/anvil-raft/src/core.rs` |
 | `Restart(s)` | `RaftCore::new(config, recovered_state, rng)` | `crates/anvil-raft/src/core.rs` |
 | `TimeoutNow` | `RaftCore::handle_timeout_now` (liveness extension, outside TLA `Next`) | `crates/anvil-raft/src/core.rs` |
 | `TransferLeader` | `RaftCore::handle_transfer_leader` (liveness extension, outside TLA `Next`) | `crates/anvil-raft/src/core.rs` |
@@ -44,30 +45,33 @@ Every state transition in `specs/anvil_raft.tla` maps to an implementation funct
 ### 1. PreVote Protocol
 To prevent partitioned or recovering nodes from causing election churn and bumping terms unnecessarily, nodes first enter `Role::PreCandidate`. A prospective candidate solicits votes for `current_term + 1` without incrementing its own term. Only when a quorum of peers confirms that the prospective candidate's log is up-to-date and that they are willing to vote does the candidate increment its term, transition to `Role::Candidate`, and formally solicit votes via `RequestVote`.
 
-### 2. Leader No-Op Entry on Election
+### 2. Leader Stickiness
+A node that recently heard from a valid leader sets `leader_sticky` on `AppendEntries` or heartbeat contact. While sticky it rejects `PreVote` requests unless it is itself the leader. Stickiness expires when the local election timer fires without further leader contact, so a truly dead leader does not block elections forever. This matches `leaderSticky` and `ExpireSticky` in the TLA+ spec and stops a partitioned candidate from disrupting a healthy leader.
+
+### 3. Leader No-Op Entry on Election
 Upon winning an election, the newly elected leader appends a `EntryKind::NoOp` entry to its log with its new term and replicates it immediately. This guarantees that uncommitted entries from prior terms are committed indirectly once the leader's own current-term no-op is committed by a quorum (Section 5.4.2).
 
-### 3. Current-Term Commit Rule
+### 4. Current-Term Commit Rule
 As formalized in Raft Section 5.4.2 and verified in `specs/anvil_raft.tla`, a leader never advances its `commit_index` directly by counting replicas of entries from older terms. The commit index advances only when an entry from the leader's **current term** is confirmed on a majority quorum.
 
-### 4. 1-RTT Divergent Log Repair (Conflict Hints)
+### 5. 1-RTT Divergent Log Repair (Conflict Hints)
 When a follower rejects an `AppendEntriesRequest` due to a mismatch at `prev_log_index`:
 - If the follower does not have an entry at `prev_log_index`, it returns `conflict_term: None` and `conflict_index: Some(last_log_index + 1)`.
 - If the follower has an entry at `prev_log_index` with term $T \ne prev\_log\_term$, it returns `conflict_term: Some(T)` and `conflict_index: Some(first_index_with_term_T)`.
 The leader immediately bypasses the entire conflicting term or missing suffix, repairing log divergence in a single round trip.
 
-### 5. Peer Progress & Flow Control
+### 6. Peer Progress & Flow Control
 Each peer is tracked with `PeerProgress`:
 - **`Probe` state**: Sends one replication message per round trip. A heartbeat response from a live follower resets the in-flight count so a probe lost on an unreliable network is retried; this favors liveness over strict single-flight.
 - **`Replicate` state**: Pipelined replication allowing up to `max_inflight_messages` in flight with optimistic `next_index` advance. On rejection, progress drops back to `Probe` and steps back using conflict hints.
 
-### 6. Strict Persistence Contract
+### 7. Strict Persistence Contract
 ANVIL enforces a strict storage contract to keep safety across crashes:
 - Follower append responses and vote responses are placed into `pending_persists` and released into `output.messages` **only after** storage emits `Input::Persisted` for the relevant token.
 - Leaders persist new proposals in parallel with broadcasting `AppendEntriesRequest` to followers; however, the leader does **not** count its own match towards quorum until its own persist token is acknowledged.
 - Term and vote updates are always persisted via `PersistOp::HardState` before releasing any message that reveals them.
 
-### 7. SpecProjection Trace Validation
+### 8. SpecProjection Trace Validation
 On every state transition, `RaftCore` emits a `SpecProjection` event:
 ```rust
 pub struct SpecProjection {

@@ -132,7 +132,9 @@ pub fn reset_buggify_registry() {
 }
 
 /// Buggify macro: injects deterministic pseudo-random faults.
-/// Evaluates to constant false unless the `sim` feature is enabled.
+/// Fires according to the calling thread's registry. The `sim` feature is on
+/// by default; building with `--no-default-features` compiles the macro to a
+/// constant `false` and disables all fault injection.
 #[macro_export]
 #[cfg(feature = "sim")]
 macro_rules! buggify {
