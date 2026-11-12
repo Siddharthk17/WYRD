@@ -51,10 +51,12 @@ pub fn run_fuzz(duration_secs: u64) -> Result<(), String> {
 
     if has_cargo_fuzz {
         println!("Running libfuzzer on all targets for {duration_secs}s per target...");
+        println!("(libfuzzer requires nightly sanitizers; invoking via nightly toolchain)");
         for &target in FUZZ_TARGETS {
             println!("  -> Fuzzing target `{target}`...");
             let mut run_cmd = Command::new("cargo");
             run_cmd.current_dir(workspace_root.join("fuzz"));
+            run_cmd.env("RUSTUP_TOOLCHAIN", "nightly");
             run_cmd.args([
                 "fuzz",
                 "run",

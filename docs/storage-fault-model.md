@@ -43,13 +43,7 @@ ANVIL explicitly defends against nine classes of storage faults:
 
 ### Fault 4: Misdirected Writes
 - **Behavior**: Due to controller firmware bugs or DMA race conditions, a write intended for block $A$ of file $X$ is written to block $B$ of file $Y$.
-- **Defense**: Every WAL frame and snapshot chunk header embeds:
-  - Magic byte identifier
-  - Segment ID / File UUID
-  - Logical log index and term
-  - Physical file offset
-  - Chained CRC32C incorporating segment ID and offset
-  A frame written to the wrong file or offset fails header validation and CRC checks.
+- **Defense**: Every WAL frame embeds magic bytes, segment ID, logical log index and term, and the physical file offset, with a CRC32C chained from the previous record over all of those fields. A frame written to the wrong file or offset fails header validation and CRC checks. Snapshot chunks carry a sequence index verified against the expected order plus a payload CRC32C, and the snapshot footer binds the whole file with a total length and a BLAKE3 digest verified by `SnapshotFooter::verify_file`, so a chunk written to the wrong file or position fails verification.
 
 ### Fault 5: Bit Rot and Corruption (Read & Write Paths)
 - **Behavior**: Media degradation, cosmic rays, cable noise, or memory flips alter bytes in transit or at rest.

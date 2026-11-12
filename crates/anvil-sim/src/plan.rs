@@ -3,11 +3,13 @@
 //! Serializable fault plans and the plan shrinker.
 //!
 //! A `Plan` materializes every fault schedule and workload choice as data
-//! before a run starts. Execution then applies the plan without drawing from
-//! any generator: network faults come from pure hash functions of the plan
-//! salt and per-pair message sequence numbers, and all timing comes from the
-//! plan's tick schedule. Any failure replays exactly from the plan encoding,
-//! and the shrinker reduces a failing plan while preserving the failure.
+//! before a run starts. Network faults come from pure hash functions of the
+//! plan salt and per-pair message sequence numbers, and all timing comes from
+//! the plan's tick schedule. Consensus election jitter and storage fault
+//! draws use seeded RNG streams derived from the master seed, so the same
+//! seed replays identically. Any failure replays exactly from the plan
+//! encoding, and the shrinker reduces a failing plan while preserving the
+//! failure.
 
 use crate::cluster::{PlanNet, SimCluster};
 use crate::rng::DetRng;
