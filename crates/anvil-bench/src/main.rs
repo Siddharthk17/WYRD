@@ -35,6 +35,16 @@ struct Cli {
     verify_budgets: bool,
 }
 
+/// Scratch directory for disk benchmarks, unique per process.
+///
+/// Uses the OS temporary directory so benchmarks run on any machine. A fixed
+/// repository path would fail on machines without that layout, including CI.
+fn bench_scratch_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create bench scratch dir");
+    dir
+}
+
 fn measure_event_queue() -> (f64, usize) {
     const OPS: usize = 100_000;
     const ITERATIONS: usize = 5;
@@ -389,9 +399,7 @@ fn measure_raw_fdatasync_rate() -> (f64, usize) {
 
     const SYNCS: usize = 500;
 
-    let base_dir = std::path::PathBuf::from("/mnt/data2/WYRD/target")
-        .join(format!("anvil_fdatasync_bench_{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&base_dir);
+    let base_dir = bench_scratch_dir("anvil_fdatasync_bench");
     let file_path = base_dir.join("fdatasync_test.bin");
     let file = OpenOptions::new()
         .read(true)
@@ -427,9 +435,7 @@ fn measure_sequential_sync_write_ceiling() -> (f64, f64, usize) {
 
     const WRITES: usize = 500;
 
-    let base_dir = std::path::PathBuf::from("/mnt/data2/WYRD/target")
-        .join(format!("anvil_sync_write_bench_{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&base_dir);
+    let base_dir = bench_scratch_dir("anvil_sync_write_bench");
     let file_path = base_dir.join("sync_write_test.bin");
     let file = OpenOptions::new()
         .read(true)
@@ -468,11 +474,7 @@ fn measure_wal_append_throughput(batch_size: usize) -> (f64, f64, usize) {
         StorageEngine, WalSegmentHeader,
     };
 
-    let base_dir = std::path::PathBuf::from("/mnt/data2/WYRD/target").join(format!(
-        "anvil_wal_append_bench_{}_{}",
-        batch_size,
-        std::process::id()
-    ));
+    let base_dir = bench_scratch_dir(&format!("anvil_wal_append_bench_{batch_size}"));
     let _ = std::fs::remove_dir_all(&base_dir);
     let _ = std::fs::create_dir_all(&base_dir);
     let mut device = FsDevice::open(&base_dir).expect("open FsDevice");
