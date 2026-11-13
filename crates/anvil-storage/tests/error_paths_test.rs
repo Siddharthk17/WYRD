@@ -277,7 +277,7 @@ fn test_hard_state_slot_edges() {
     no_vote
         .encode(sector(), &mut nonzero_vote_bytes)
         .expect("encode");
-    nonzero_vote_bytes[32..40].copy_from_slice(&0xDEADBEEFu64.to_le_bytes());
+    nonzero_vote_bytes[32..40].copy_from_slice(&0xDEAD_BEEF_u64.to_le_bytes());
     let repaired = crc32c::crc32c(&nonzero_vote_bytes[16..41]);
     nonzero_vote_bytes[12..16].copy_from_slice(&repaired.to_le_bytes());
     assert!(matches!(
