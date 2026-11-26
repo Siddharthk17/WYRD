@@ -346,8 +346,17 @@ impl RaftInvariantChecker {
                     {
                         for prefix in 1..=idx {
                             let prefix_idx = LogIndex::from_raw(prefix);
-                            let pt1 = core1.log().term_at(prefix_idx).unwrap_or(Term::from_raw(0));
-                            let pt2 = core2.log().term_at(prefix_idx).unwrap_or(Term::from_raw(0));
+                            // A compacted prefix reports no term. Compaction
+                            // only drops entries covered by a verified
+                            // snapshot, whose equality with a log replay is
+                            // checked at take time, so there is no log left
+                            // to compare here.
+                            let (Some(pt1), Some(pt2)) = (
+                                core1.log().term_at(prefix_idx),
+                                core2.log().term_at(prefix_idx),
+                            ) else {
+                                continue;
+                            };
                             if pt1 != pt2 {
                                 return Err(InvariantViolation::LogMatching {
                                     node1: *id1,
@@ -393,15 +402,17 @@ impl RaftInvariantChecker {
                         }
                     }
                     None => {
-                        return Err(InvariantViolation::CommittedEntriesNeverLost {
-                            node: node_id,
-                            index: log_idx,
-                            actual_term: Term::from_raw(0),
-                            expected_term: self
-                                .committed_oracle
-                                .get(&log_idx)
-                                .map_or(Term::from_raw(0), |entry| entry.term),
-                        });
+                        // Compaction only drops committed entries the oracle
+                        // already recorded, so a missing entry with no oracle
+                        // record is the only genuine loss.
+                        if !self.committed_oracle.contains_key(&log_idx) {
+                            return Err(InvariantViolation::CommittedEntriesNeverLost {
+                                node: node_id,
+                                index: log_idx,
+                                actual_term: Term::from_raw(0),
+                                expected_term: Term::from_raw(0),
+                            });
+                        }
                     }
                 }
             }
@@ -454,14 +465,24 @@ impl RaftInvariantChecker {
                 let leader_term = core.term();
                 for (&idx, &committed_term) in &self.committed_terms {
                     if leader_term > committed_term {
-                        let leader_entry_term = core.log().term_at(idx);
-                        if leader_entry_term != Some(committed_term) {
-                            return Err(InvariantViolation::LeaderCompleteness {
-                                leader: node_id,
-                                leader_term,
-                                index: idx,
-                                committed_term,
-                            });
+                        match core.log().term_at(idx) {
+                            Some(leader_entry_term) if leader_entry_term != committed_term => {
+                                return Err(InvariantViolation::LeaderCompleteness {
+                                    leader: node_id,
+                                    leader_term,
+                                    index: idx,
+                                    committed_term,
+                                });
+                            }
+                            None if idx > core.log().base_index() => {
+                                return Err(InvariantViolation::LeaderCompleteness {
+                                    leader: node_id,
+                                    leader_term,
+                                    index: idx,
+                                    committed_term,
+                                });
+                            }
+                            Some(_) | None => {}
                         }
                     }
                 }

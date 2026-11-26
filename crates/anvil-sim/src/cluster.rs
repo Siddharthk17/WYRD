@@ -13,13 +13,16 @@ use crate::device::{SimDevice, SimDeviceConfig, StorageFaultAtlas};
 use crate::network::SimNetwork;
 use crate::raft_invariants::RaftInvariantChecker;
 use crate::rng::{DetRng, derive_component_seed};
-use anvil_raft::{Input, Message, Output, RaftConfig, RaftCore, RecoveredState, Role};
+use anvil_raft::{
+    Input, Message, Output, RaftConfig, RaftCore, ReceivedSnapshot, RecoveredState, Role,
+    SnapshotChunkData, SnapshotRequest,
+};
 use anvil_storage::{
     Device, DeviceOp, EngineInput, EngineOutput, FileId, HardStateSlot, LogRecoveryClassification,
     RecoveredStorageState, SectorSize, StorageConfig, StorageEngine, StorageError, WalRecordFrame,
     WalSegmentHeader,
 };
-use anvil_types::{LogIndex, NodeId, Term};
+use anvil_types::{Entry, LogIndex, NodeId, Term};
 use bytes::Bytes;
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
@@ -91,6 +94,12 @@ pub struct SimCluster {
     /// Completed linearizable read results per node, drained from the core
     /// after every step so workloads can serve reads.
     pub completed_reads: BTreeMap<NodeId, Vec<anvil_raft::ReadIndexResult>>,
+    /// Core snapshot-byte requests per node, drained after every step for the
+    /// workload to satisfy from its state machines.
+    pub snapshot_requests: BTreeMap<NodeId, Vec<SnapshotRequest>>,
+    /// Core-verified snapshots per node, drained after every step for the
+    /// workload to install into its state machines.
+    pub ready_snapshots: BTreeMap<NodeId, Vec<ReceivedSnapshot>>,
     /// Per-node tick rate in ticks per mille. 1000 is real time, 500 is half
     /// speed, 2000 is double speed. Models clock drift between 0.5x and 2x.
     pub tick_rate_per_mille: BTreeMap<NodeId, u64>,
@@ -228,6 +237,8 @@ impl SimCluster {
             paused: BTreeSet::new(),
             paused_missed: BTreeMap::new(),
             completed_reads: BTreeMap::new(),
+            snapshot_requests: BTreeMap::new(),
+            ready_snapshots: BTreeMap::new(),
             last_commit_before_crash: BTreeMap::new(),
             output_scratch: Output::new(),
         }
@@ -315,18 +326,27 @@ impl SimCluster {
         {
             let core_last = core.last_log_index();
             let engine_last = storage.engine.last_entry_index();
+            // Start past the compacted prefix: the core may have installed a
+            // snapshot (or compacted) while the engine still needs the
+            // backfill, which arrives through the workload in the same tick.
+            // The engine gap-buffers the suffix until the prefix lands.
+            let sync_from = engine_last
+                .as_u64()
+                .saturating_add(1)
+                .max(core.log().base_index().as_u64().saturating_add(1));
             if core_last > engine_last {
                 let mut entries_to_sync = Vec::new();
-                for idx in (engine_last.as_u64() + 1)..=core_last.as_u64() {
+                for idx in sync_from..=core_last.as_u64() {
                     if let Some(entry) = core.log().entry_at(LogIndex::from_raw(idx)) {
                         entries_to_sync.push(entry.clone());
                     }
                 }
                 if !entries_to_sync.is_empty() {
+                    let sync_prev = LogIndex::from_raw(sync_from.saturating_sub(1));
                     storage.engine_output.clear();
                     storage.engine.step(
                         EngineInput::AppendEntries {
-                            prev_index: engine_last,
+                            prev_index: sync_prev,
                             entries: entries_to_sync,
                             token: 0,
                         },
@@ -356,6 +376,25 @@ impl SimCluster {
         }
     }
 
+    /// Moves core snapshot outputs from the scratch buffer into the
+    /// per-node queues the workload drains.
+    fn stash_snapshot_outputs(&mut self, node_id: NodeId) {
+        if !self.output_scratch.snapshot_requests.is_empty() {
+            let requests = std::mem::take(&mut self.output_scratch.snapshot_requests);
+            self.snapshot_requests
+                .entry(node_id)
+                .or_default()
+                .extend(requests);
+        }
+        if !self.output_scratch.ready_snapshots.is_empty() {
+            let ready = std::mem::take(&mut self.output_scratch.ready_snapshots);
+            self.ready_snapshots
+                .entry(node_id)
+                .or_default()
+                .extend(ready);
+        }
+    }
+
     fn step_node_internal(&mut self, node_id: NodeId, input: Input) {
         if self.is_node_crashed(node_id)
             || self.is_node_refused_start(node_id)
@@ -373,6 +412,7 @@ impl SimCluster {
             core.step(input, &mut self.output_scratch);
         }
         fresh_reads.append(&mut self.output_scratch.completed_reads);
+        self.stash_snapshot_outputs(node_id);
 
         let outbound = std::mem::take(&mut self.output_scratch.messages);
         for msg in outbound {
@@ -444,6 +484,7 @@ impl SimCluster {
                 if let Some(core) = self.nodes.get_mut(&node_id) {
                     core.step(Input::Persisted { token }, &mut self.output_scratch);
                 }
+                self.stash_snapshot_outputs(node_id);
                 let follow_up = std::mem::take(&mut self.output_scratch.messages);
                 for msg in follow_up {
                     self.route_message(node_id, msg.to, msg.message);
@@ -490,6 +531,7 @@ impl SimCluster {
                 }
                 all_follow_ups.append(&mut self.output_scratch.messages);
                 fresh_reads.append(&mut self.output_scratch.completed_reads);
+                self.stash_snapshot_outputs(node_id);
             }
 
             if let (Some((entries, term, vote)), Some(storage)) =
@@ -528,6 +570,89 @@ impl SimCluster {
                 .or_default()
                 .extend(extra_reads);
         }
+        self.stash_snapshot_outputs(node_id);
+    }
+
+    /// Feeds snapshot bytes the workload encoded from its state machine.
+    /// Steps the core, routes messages, and checks invariants like any input.
+    pub fn supply_snapshot(
+        &mut self,
+        node_id: NodeId,
+        last_included_index: LogIndex,
+        last_included_term: Term,
+        snapshot_bytes: u64,
+        snapshot_digest: [u8; 32],
+        chunks: Vec<SnapshotChunkData>,
+    ) {
+        self.step_node_internal(
+            node_id,
+            Input::SnapshotReady {
+                last_included_index,
+                last_included_term,
+                snapshot_bytes,
+                snapshot_digest,
+                chunks,
+            },
+        );
+    }
+
+    /// Drops the node's log prefix after its snapshot proved durable.
+    pub fn compact_log(&mut self, node_id: NodeId, up_to: LogIndex) {
+        self.step_node_internal(node_id, Input::CompactLog { up_to });
+    }
+
+    /// Backfills log entries the core discarded through a snapshot install
+    /// but the engine never persisted, so future appends chain. Entries come
+    /// from the workload's committed archive and are therefore stable. Uses
+    /// token zero like the storage sync path: completions are consumed
+    /// without notifying the core. Returns false when storage fault
+    /// injection crashed the node.
+    pub fn backfill_log_prefix(&mut self, node_id: NodeId, entries: Vec<Entry>) -> bool {
+        if entries.is_empty() {
+            return !self.is_node_crashed(node_id);
+        }
+        let Some(storage) = self.storage.get_mut(&node_id) else {
+            return false;
+        };
+        let prev_index = entries[0].index.prev().unwrap_or(LogIndex::from_raw(0));
+        storage.engine_output.clear();
+        storage.engine.step(
+            EngineInput::AppendEntries {
+                prev_index,
+                entries,
+                token: 0,
+            },
+            &mut storage.engine_output,
+        );
+        let ops = std::mem::take(&mut storage.engine_output.device_ops);
+        for op in ops {
+            storage.device.submit(op);
+        }
+        while let Some(comp) = storage.device.poll_completion() {
+            storage
+                .engine
+                .step(EngineInput::Completion(comp), &mut storage.engine_output);
+        }
+        storage.engine_output.clear();
+        if self.drive_storage(node_id) {
+            self.crash_node(node_id);
+            return false;
+        }
+        !self.is_node_crashed(node_id)
+    }
+
+    /// Returns the engine's durable tip for one node.
+    #[must_use]
+    pub fn engine_last_index(&self, node_id: NodeId) -> Option<LogIndex> {
+        self.storage
+            .get(&node_id)
+            .map(|storage| storage.engine.last_entry_index())
+    }
+
+    /// Tells the core a log entry was applied to the state machine, keeping
+    /// the never-beyond-applied bound exact for compaction checks.
+    pub fn notify_applied(&mut self, node_id: NodeId, index: LogIndex) {
+        self.step_node_internal(node_id, Input::Applied { index });
     }
 
     /// Drives a node's storage to quiescence: submits buffered device operations,

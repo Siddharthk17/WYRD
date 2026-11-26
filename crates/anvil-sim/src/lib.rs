@@ -39,5 +39,6 @@ pub use time::SimTime;
 pub use trace::{TraceEvent, TraceRecorder};
 pub use watchdog::{Watchdog, WatchdogError};
 pub use workload::{
-    SwarmProfile, convergence_audit, run_kv_seed, run_kv_seed_with_storage, swarm_profile,
+    SnapshotStats, SwarmProfile, convergence_audit, run_kv_seed, run_kv_seed_with_stats,
+    run_kv_seed_with_storage, swarm_profile,
 };

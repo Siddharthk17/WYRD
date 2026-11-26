@@ -672,3 +672,225 @@ fn test_truncate_across_segments_unlinks_and_rewinds() {
     );
     assert_eq!(engine.last_record_crc(), reference.last_record_crc());
 }
+
+fn overlap_entry(index: u64, term: u64, payload: &'static [u8]) -> Entry {
+    Entry {
+        index: LogIndex::from_raw(index),
+        term: Term::from_raw(term),
+        kind: EntryKind::Normal,
+        payload: Bytes::from_static(payload),
+    }
+}
+
+#[test]
+fn test_engine_overlapping_append_skips_durable_prefix() {
+    let config = StorageConfig::for_test(SectorSize::Sector512, 1024 * 1024);
+    let mut engine = StorageEngine::new_empty(config);
+    let mut output = EngineOutput::default();
+    engine.step(
+        EngineInput::AppendEntries {
+            prev_index: LogIndex::from_raw(0),
+            entries: vec![
+                overlap_entry(1, 1, b"a"),
+                overlap_entry(2, 1, b"b"),
+                overlap_entry(3, 1, b"c"),
+            ],
+            token: 1,
+        },
+        &mut output,
+    );
+    let sync_op_id = output
+        .device_ops
+        .iter()
+        .find_map(|op| match op {
+            DeviceOp::Fdatasync { op_id, .. } => Some(*op_id),
+            _ => None,
+        })
+        .expect("first append syncs");
+    engine.step(
+        EngineInput::Completion(DeviceCompletion {
+            op_id: sync_op_id,
+            result: Ok(CompletionPayload::Synced),
+        }),
+        &mut output,
+    );
+    output.clear();
+
+    // Snapshot install wiped the core log; the core resends entries the
+    // engine already holds plus one new entry.
+    engine.step(
+        EngineInput::AppendEntries {
+            prev_index: LogIndex::from_raw(1),
+            entries: vec![
+                overlap_entry(2, 1, b"b"),
+                overlap_entry(3, 1, b"c"),
+                overlap_entry(4, 1, b"d"),
+            ],
+            token: 2,
+        },
+        &mut output,
+    );
+
+    engine.step(
+        EngineInput::AppendEntries {
+            prev_index: LogIndex::from_raw(1),
+            entries: vec![overlap_entry(2, 1, b"b"), overlap_entry(3, 1, b"c")],
+            token: 3,
+        },
+        &mut output,
+    );
+    for _ in 0..8 {
+        let Some(sync_op_id) = output.device_ops.iter().find_map(|op| match op {
+            DeviceOp::Fdatasync { op_id, .. } => Some(*op_id),
+            _ => None,
+        }) else {
+            break;
+        };
+        output.clear();
+        engine.step(
+            EngineInput::Completion(DeviceCompletion {
+                op_id: sync_op_id,
+                result: Ok(CompletionPayload::Synced),
+            }),
+            &mut output,
+        );
+        if output.persisted_tokens.contains(&3) {
+            break;
+        }
+    }
+    assert!(output.persisted_tokens.contains(&3));
+}
+
+#[test]
+fn test_engine_overlapping_append_with_conflict_rewinds() {
+    let config = StorageConfig::for_test(SectorSize::Sector512, 1024 * 1024);
+    let mut engine = StorageEngine::new_empty(config);
+    let mut output = EngineOutput::default();
+    engine.step(
+        EngineInput::AppendEntries {
+            prev_index: LogIndex::from_raw(0),
+            entries: vec![overlap_entry(1, 1, b"a"), overlap_entry(2, 2, b"b")],
+            token: 1,
+        },
+        &mut output,
+    );
+    output.clear();
+
+    engine.step(
+        EngineInput::AppendEntries {
+            prev_index: LogIndex::from_raw(1),
+            entries: vec![overlap_entry(2, 3, b"b2"), overlap_entry(3, 3, b"c")],
+            token: 2,
+        },
+        &mut output,
+    );
+    assert!(output.persisted_tokens.is_empty());
+}
+
+#[test]
+fn test_engine_gap_append_flushes_after_backfill() {
+    let config = StorageConfig::for_test(SectorSize::Sector512, 1024 * 1024);
+    let mut engine = StorageEngine::new_empty(config);
+    let mut output = EngineOutput::default();
+    engine.step(
+        EngineInput::AppendEntries {
+            prev_index: LogIndex::from_raw(0),
+            entries: vec![overlap_entry(1, 1, b"a")],
+            token: 1,
+        },
+        &mut output,
+    );
+    let sync1 = output
+        .device_ops
+        .iter()
+        .find_map(|op| match op {
+            DeviceOp::Fdatasync { op_id, .. } => Some(*op_id),
+            _ => None,
+        })
+        .expect("first append syncs");
+    engine.step(
+        EngineInput::Completion(DeviceCompletion {
+            op_id: sync1,
+            result: Ok(CompletionPayload::Synced),
+        }),
+        &mut output,
+    );
+    output.clear();
+
+    // Post-install appends arrive before the backfill closes the gap.
+    engine.step(
+        EngineInput::AppendEntries {
+            prev_index: LogIndex::from_raw(3),
+            entries: vec![overlap_entry(4, 1, b"d")],
+            token: 2,
+        },
+        &mut output,
+    );
+    assert!(output.persisted_tokens.is_empty());
+
+    // Backfill closes the gap; both the backfill and the buffered append
+    // become durable through the normal sync path.
+    engine.step(
+        EngineInput::AppendEntries {
+            prev_index: LogIndex::from_raw(1),
+            entries: vec![overlap_entry(2, 1, b"b"), overlap_entry(3, 1, b"c")],
+            token: 3,
+        },
+        &mut output,
+    );
+    let mut acked = Vec::new();
+    for _ in 0..16 {
+        let Some(sync_op_id) = output.device_ops.iter().find_map(|op| match op {
+            DeviceOp::Fdatasync { op_id, .. } => Some(*op_id),
+            _ => None,
+        }) else {
+            break;
+        };
+        output.clear();
+        engine.step(
+            EngineInput::Completion(DeviceCompletion {
+                op_id: sync_op_id,
+                result: Ok(CompletionPayload::Synced),
+            }),
+            &mut output,
+        );
+        acked.extend_from_slice(&output.persisted_tokens);
+        if acked.contains(&2) && acked.contains(&3) {
+            break;
+        }
+    }
+    assert!(acked.contains(&2));
+    assert!(acked.contains(&3));
+}
+
+#[test]
+fn test_engine_truncate_discards_replaced_gap_tail() {
+    let config = StorageConfig::for_test(SectorSize::Sector512, 1024 * 1024);
+    let mut engine = StorageEngine::new_empty(config);
+    let mut output = EngineOutput::default();
+    engine.step(
+        EngineInput::AppendEntries {
+            prev_index: LogIndex::from_raw(0),
+            entries: vec![overlap_entry(1, 1, b"a")],
+            token: 1,
+        },
+        &mut output,
+    );
+    output.clear();
+    engine.step(
+        EngineInput::AppendEntries {
+            prev_index: LogIndex::from_raw(3),
+            entries: vec![overlap_entry(4, 2, b"d")],
+            token: 2,
+        },
+        &mut output,
+    );
+    engine.step(
+        EngineInput::TruncateAndAppend {
+            from_index: LogIndex::from_raw(2),
+            entries: vec![overlap_entry(2, 3, b"b"), overlap_entry(3, 3, b"c")],
+            token: 3,
+        },
+        &mut output,
+    );
+}

@@ -297,11 +297,13 @@ impl RaftCore {
                     let mut peers = [NodeId::from_nonzero(core::num::NonZeroU64::MIN); 16];
                     let peer_len = self.peer_array(&mut peers);
                     for &peer in &peers[..peer_len] {
+                        self.resend_snapshot_chunk(peer, output);
                         self.send_snapshot_chunk(peer, output);
                     }
                 } else {
                     let peers: Vec<NodeId> = self.config.peers.iter().copied().collect();
                     for peer in peers {
+                        self.resend_snapshot_chunk(peer, output);
                         self.send_snapshot_chunk(peer, output);
                     }
                 }
@@ -718,9 +720,9 @@ impl RaftCore {
         }
     }
 
-    /// Sends the next snapshot chunk permitted by the flow-control window.
+    /// Sends the next never-yet-sent snapshot chunk within the window.
     fn send_snapshot_chunk(&mut self, peer: NodeId, output: &mut Output) {
-        let state = self.progress.get(&peer).and_then(|progress| {
+        let cursor = self.progress.get(&peer).and_then(|progress| {
             if !progress.can_send_snapshot() {
                 return None;
             }
@@ -730,7 +732,7 @@ impl RaftCore {
                 None
             }
         });
-        let Some(mut cursor) = state else {
+        let Some(mut cursor) = cursor else {
             return;
         };
         let Some(snap) = self.leader_snapshot.clone() else {
@@ -745,25 +747,22 @@ impl RaftCore {
         } else {
             cursor = SnapshotProgress {
                 last_included_index: snap.last_included_index,
-                next_chunk: 0,
+                send_next: 0,
+                acked_chunk: 0,
                 total_chunks: total,
             };
         }
-        let mut chunk_idx = cursor.next_chunk.min(total.saturating_sub(1));
+        if cursor.send_next >= total {
+            return;
+        }
+        let chunk_idx = cursor.send_next;
         let slot = usize::try_from(chunk_idx).unwrap_or(usize::MAX);
-        let cached = snap.chunks.get(slot).cloned();
-        let data = if let Some(entry) = cached {
-            entry
-        } else {
-            chunk_idx = 0;
-            let Some(first) = snap.chunks.first().cloned() else {
-                return;
-            };
-            first
+        let Some(data) = snap.chunks.get(slot).cloned() else {
+            return;
         };
         if let Some(progress) = self.progress.get_mut(&peer) {
             progress.state = crate::progress::ProgressState::Snapshot(cursor);
-            progress.on_snapshot_send(chunk_idx.saturating_add(1).min(total));
+            progress.on_snapshot_send_new();
         }
         output.messages.push(OutboundMessage {
             to: peer,
@@ -773,6 +772,52 @@ impl RaftCore {
                 last_included_index: cursor.last_included_index,
                 last_included_term: snap.last_included_term,
                 chunk_index: chunk_idx,
+                total_chunks: total,
+                chunk: data.chunk,
+                chunk_crc: data.chunk_crc,
+                snapshot_digest: snap.snapshot_digest,
+                snapshot_bytes: snap.snapshot_bytes,
+            },
+        });
+    }
+
+    /// Resends the oldest unacked chunk without consuming window: the chunk
+    /// is already counted in flight, so a lost ack or packet can always be
+    /// recovered on Tick even when the window is full.
+    fn resend_snapshot_chunk(&mut self, peer: NodeId, output: &mut Output) {
+        let cursor = self.progress.get(&peer).and_then(|progress| {
+            if let crate::progress::ProgressState::Snapshot(state) = progress.state {
+                Some(state)
+            } else {
+                None
+            }
+        });
+        let Some(cursor) = cursor else {
+            return;
+        };
+        let Some(snap) = self.leader_snapshot.clone() else {
+            return;
+        };
+        if cursor.last_included_index != snap.last_included_index {
+            return;
+        }
+        let total = u32::try_from(snap.chunks.len()).unwrap_or(u32::MAX);
+        let outstanding = cursor.send_next.min(total);
+        if cursor.acked_chunk >= outstanding {
+            return;
+        }
+        let slot = usize::try_from(cursor.acked_chunk).unwrap_or(usize::MAX);
+        let Some(data) = snap.chunks.get(slot).cloned() else {
+            return;
+        };
+        output.messages.push(OutboundMessage {
+            to: peer,
+            message: Message::InstallSnapshotRequest {
+                term: self.term,
+                leader_id: self.config.node_id,
+                last_included_index: cursor.last_included_index,
+                last_included_term: snap.last_included_term,
+                chunk_index: cursor.acked_chunk,
                 total_chunks: total,
                 chunk: data.chunk,
                 chunk_crc: data.chunk_crc,
@@ -1493,6 +1538,7 @@ impl RaftCore {
                     last_included_index,
                     last_included_term,
                     data,
+                    snapshot_digest,
                 });
                 self.follower_snapshot = None;
                 let ack = OutboundMessage {
@@ -1558,7 +1604,7 @@ impl RaftCore {
             return;
         };
         if let Some(progress) = self.progress.get_mut(&from) {
-            progress.inflight_count = progress.inflight_count.saturating_sub(1);
+            progress.on_snapshot_ack(next_chunk);
         }
         if success && match_index >= state.last_included_index {
             if let Some(progress) = self.progress.get_mut(&from) {
@@ -1569,23 +1615,63 @@ impl RaftCore {
             self.replicate_to(from, output);
             return;
         }
-        let total = state.total_chunks;
-        let mut wanted = next_chunk.min(total);
-        if wanted >= total {
-            wanted = total.saturating_sub(1);
+        // The follower wants an older chunk back: resend exactly that one
+        // without touching the send pointer, then keep filling the window
+        // with new chunks.
+        let send_next = self.progress.get(&from).and_then(|progress| {
+            if let crate::progress::ProgressState::Snapshot(snapshot) = progress.state {
+                Some((snapshot.send_next, snapshot.total_chunks))
+            } else {
+                None
+            }
+        });
+        if let Some((send_next, total)) = send_next {
+            let resend = next_chunk.min(total.saturating_sub(1));
+            if resend < send_next
+                && let Some(snap) = self.leader_snapshot.clone()
+                && snap.last_included_index == state.last_included_index
+                && let Some(data) = snap
+                    .chunks
+                    .get(usize::try_from(resend).unwrap_or(usize::MAX))
+                    .cloned()
+            {
+                output.messages.push(OutboundMessage {
+                    to: from,
+                    message: Message::InstallSnapshotRequest {
+                        term: self.term,
+                        leader_id: self.config.node_id,
+                        last_included_index: state.last_included_index,
+                        last_included_term: snap.last_included_term,
+                        chunk_index: resend,
+                        total_chunks: total,
+                        chunk: data.chunk,
+                        chunk_crc: data.chunk_crc,
+                        snapshot_digest: snap.snapshot_digest,
+                        snapshot_bytes: snap.snapshot_bytes,
+                    },
+                });
+            }
         }
-        if let Some(progress) = self.progress.get_mut(&from)
-            && let crate::progress::ProgressState::Snapshot(snapshot) = &mut progress.state
-        {
-            snapshot.next_chunk = wanted;
-        }
-        while self
-            .progress
-            .get(&from)
-            .is_some_and(crate::progress::PeerProgress::can_send_snapshot)
+        while self.snapshot_has_unsent(from)
+            && self
+                .progress
+                .get(&from)
+                .is_some_and(crate::progress::PeerProgress::can_send_snapshot)
         {
             self.send_snapshot_chunk(from, output);
         }
+    }
+
+    /// Returns true when the peer's snapshot stream still has never-sent
+    /// chunks, so a fill loop makes progress on every iteration.
+    fn snapshot_has_unsent(&self, peer: NodeId) -> bool {
+        self.progress.get(&peer).is_some_and(|progress| {
+            if let crate::progress::ProgressState::Snapshot(state) = progress.state {
+                state.send_next < state.total_chunks
+            } else {
+                false
+            }
+        })
     }
 
     fn handle_transfer_leader(&mut self, to: NodeId, output: &mut Output) {

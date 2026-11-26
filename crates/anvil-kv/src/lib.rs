@@ -12,5 +12,8 @@ pub mod snapshot;
 pub mod store;
 
 pub use command::{KvCommand, KvResponse, KvRole};
-pub use snapshot::{ChunkError, SnapshotChunk, SnapshotPolicy, reassemble_chunks, snapshot_digest};
+pub use snapshot::{
+    ChunkError, SnapshotChunk, SnapshotPolicy, reassemble_chunks, snapshot_digest,
+    split_into_chunks,
+};
 pub use store::{KvConfig, KvError, KvRecord, KvStore, SessionIdView};

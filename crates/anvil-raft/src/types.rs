@@ -199,6 +199,8 @@ pub struct ReceivedSnapshot {
     pub last_included_term: Term,
     /// Full snapshot byte stream.
     pub data: Bytes,
+    /// BLAKE3 digest of `data`, verified by the core before handing over.
+    pub snapshot_digest: [u8; 32],
 }
 
 /// A core request for snapshot bytes: follower `to` needs the log that is

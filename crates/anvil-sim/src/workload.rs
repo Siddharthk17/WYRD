@@ -28,8 +28,8 @@ use crate::cluster::SimCluster;
 use crate::device::SimDeviceConfig;
 use crate::rng::DetRng;
 use anvil_check::{ClientOp, History, HistoryOp, OpResult};
-use anvil_kv::{KvCommand, KvConfig, KvResponse, KvStore};
-use anvil_raft::Input;
+use anvil_kv::{KvCommand, KvConfig, KvResponse, KvStore, SnapshotPolicy};
+use anvil_raft::{Input, ReceivedSnapshot, SnapshotChunkData};
 use anvil_types::{LogIndex, NodeId, SeqNo, SessionId};
 use bytes::Bytes;
 use std::collections::BTreeMap;
@@ -96,6 +96,68 @@ pub fn swarm_profile(seed: u64) -> SwarmProfile {
         client_crashes,
         unordered,
     }
+}
+
+/// Snapshot flow state for one KV seed: a committed-payload archive for the
+/// `SnapshotEqualsReplay` check, per-node snapshot counters, and the policy.
+struct SnapshotHarness {
+    policy: SnapshotPolicy,
+    chunk_bytes: usize,
+    archive: BTreeMap<LogIndex, (anvil_types::Term, Option<Bytes>)>,
+    since_entries: BTreeMap<NodeId, u64>,
+    since_bytes: BTreeMap<NodeId, u64>,
+    last_snapshot: BTreeMap<NodeId, LogIndex>,
+    snapshots_taken: u64,
+    installs: u64,
+    snapshots: BTreeMap<NodeId, (LogIndex, Bytes)>,
+}
+
+impl SnapshotHarness {
+    fn for_sim() -> Self {
+        Self {
+            policy: SnapshotPolicy {
+                max_entries_since_snapshot: 20,
+                max_bytes_since_snapshot: 8 * 1024,
+                retain_entries: 5,
+                chunk_bytes: 256,
+            },
+            chunk_bytes: 256,
+            archive: BTreeMap::new(),
+            since_entries: BTreeMap::new(),
+            since_bytes: BTreeMap::new(),
+            last_snapshot: BTreeMap::new(),
+            snapshots_taken: 0,
+            installs: 0,
+            snapshots: BTreeMap::new(),
+        }
+    }
+}
+
+/// Replays the archived committed prefix into a fresh store and asserts the
+/// state hash equals the snapshot's: `SnapshotEqualsReplay`.
+fn assert_snapshot_equals_replay(
+    snapshot: &KvStore,
+    archive: &BTreeMap<LogIndex, (anvil_types::Term, Option<Bytes>)>,
+) {
+    let mut replay = KvStore::new(snapshot.config());
+    let mut idx = 1u64;
+    let applied = snapshot.applied_index().as_u64();
+    while idx <= applied {
+        if let Some((_, payload)) = archive.get(&LogIndex::from_raw(idx)) {
+            if let Some(bytes) = payload {
+                assert!(
+                    replay.apply(LogIndex::from_raw(idx), bytes).is_ok(),
+                    "archived payload must replay cleanly"
+                );
+            }
+        }
+        idx += 1;
+    }
+    assert_eq!(
+        replay.state_hash(),
+        snapshot.state_hash(),
+        "SnapshotEqualsReplay violated at applied {applied}"
+    );
 }
 
 /// Live client session state.
@@ -184,16 +246,37 @@ fn leader_interm_commit(cluster: &SimCluster, leader: NodeId) -> Option<LogIndex
 /// When `stale_canary` is true, reads are served stale but recorded as
 /// linearizable, which the checker must reject.
 pub fn run_kv_seed(seed: u64, stale_canary: bool) -> (History, bool) {
-    run_kv_seed_inner(seed, false, stale_canary)
+    let (history, audit, _) = run_kv_seed_inner(seed, false, stale_canary);
+    (history, audit)
 }
 
 /// Runs one KV seed with storage faults enabled.
 pub fn run_kv_seed_with_storage(seed: u64, stale_canary: bool) -> (History, bool) {
-    run_kv_seed_inner(seed, true, stale_canary)
+    let (history, audit, _) = run_kv_seed_inner(seed, true, stale_canary);
+    (history, audit)
+}
+
+/// Snapshot flow counters for one KV seed, also consumed by the farm
+/// summary in a later subtask.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SnapshotStats {
+    /// Snapshots taken, verified against a log replay, and supplied.
+    pub snapshots_taken: u64,
+    /// Core-verified snapshots installed into a state machine.
+    pub installs: u64,
+}
+
+/// Runs one deterministic KV seed and returns its history.
+pub fn run_kv_seed_with_stats(seed: u64, storage_faults: bool) -> (History, bool, SnapshotStats) {
+    run_kv_seed_inner(seed, storage_faults, false)
 }
 
 #[allow(clippy::too_many_lines)]
-fn run_kv_seed_inner(seed: u64, storage_faults: bool, stale_canary: bool) -> (History, bool) {
+fn run_kv_seed_inner(
+    seed: u64,
+    storage_faults: bool,
+    stale_canary: bool,
+) -> (History, bool, SnapshotStats) {
     let profile = swarm_profile(seed);
     let mut cluster = if storage_faults {
         let dev =
@@ -245,6 +328,7 @@ fn run_kv_seed_inner(seed: u64, storage_faults: bool, stale_canary: bool) -> (Hi
         .map(|id| (*id, LogIndex::from_raw(0)))
         .collect();
     let mut applied_terms: BTreeMap<NodeId, (LogIndex, anvil_types::Term)> = BTreeMap::new();
+    let mut harness = SnapshotHarness::for_sim();
 
     let mut clients: Vec<WorkloadClient> = (0..profile.clients)
         .map(|_| WorkloadClient {
@@ -277,7 +361,20 @@ fn run_kv_seed_inner(seed: u64, storage_faults: bool, stale_canary: bool) -> (Hi
     let mut canary_prev: BTreeMap<Vec<u8>, (Option<Bytes>, u64)> = BTreeMap::new();
     cluster.tick_n(15);
     tick += 15;
-    apply_all(&mut cluster, &mut stores, &mut applied, &mut applied_terms);
+    apply_all(
+        &mut cluster,
+        &mut stores,
+        &mut applied,
+        &mut applied_terms,
+        &mut harness,
+    );
+    snapshot_maintenance(
+        &mut cluster,
+        &mut stores,
+        &mut applied,
+        &mut applied_terms,
+        &mut harness,
+    );
 
     while tick < end_tick && op_cursor < schedule.len() {
         let op = &schedule[op_cursor];
@@ -287,6 +384,7 @@ fn run_kv_seed_inner(seed: u64, storage_faults: bool, stale_canary: bool) -> (Hi
                 &mut stores,
                 &mut applied,
                 &mut applied_terms,
+                &mut harness,
                 &node_ids,
                 &faults,
                 &mut fault_cursor,
@@ -301,6 +399,7 @@ fn run_kv_seed_inner(seed: u64, storage_faults: bool, stale_canary: bool) -> (Hi
             &mut stores,
             &mut applied,
             &mut applied_terms,
+            &mut harness,
             &node_ids,
             &faults,
             &mut fault_cursor,
@@ -311,6 +410,7 @@ fn run_kv_seed_inner(seed: u64, storage_faults: bool, stale_canary: bool) -> (Hi
             &mut stores,
             &mut applied,
             &mut applied_terms,
+            &mut harness,
             &mut clients,
             &profile,
             list_pct,
@@ -324,15 +424,45 @@ fn run_kv_seed_inner(seed: u64, storage_faults: bool, stale_canary: bool) -> (Hi
         op_cursor += 1;
         cluster.tick();
         tick += 1;
-        apply_all(&mut cluster, &mut stores, &mut applied, &mut applied_terms);
+        apply_all(
+            &mut cluster,
+            &mut stores,
+            &mut applied,
+            &mut applied_terms,
+            &mut harness,
+        );
+        snapshot_maintenance(
+            &mut cluster,
+            &mut stores,
+            &mut applied,
+            &mut applied_terms,
+            &mut harness,
+        );
     }
 
     cluster.plan_net = None;
     cluster.heal_all();
-    drain_to_convergence(&mut cluster, &mut stores, &mut applied, &mut applied_terms);
+    snapshot_maintenance(
+        &mut cluster,
+        &mut stores,
+        &mut applied,
+        &mut applied_terms,
+        &mut harness,
+    );
+    drain_to_convergence(
+        &mut cluster,
+        &mut stores,
+        &mut applied,
+        &mut applied_terms,
+        &mut harness,
+    );
 
     let audit = convergence_audit(&cluster, &stores, &applied);
-    (history, audit)
+    let stats = SnapshotStats {
+        snapshots_taken: harness.snapshots_taken,
+        installs: harness.installs,
+    };
+    (history, audit, stats)
 }
 
 /// Ticks a healed cluster until every live replica shares the same commit
@@ -343,10 +473,12 @@ fn drain_to_convergence(
     stores: &mut BTreeMap<NodeId, KvStore>,
     applied: &mut BTreeMap<NodeId, LogIndex>,
     applied_terms: &mut BTreeMap<NodeId, (LogIndex, anvil_types::Term)>,
+    harness: &mut SnapshotHarness,
 ) {
     for _ in 0..500 {
         cluster.tick();
-        apply_all(cluster, stores, applied, applied_terms);
+        apply_all(cluster, stores, applied, applied_terms, harness);
+        snapshot_maintenance(cluster, stores, applied, applied_terms, harness);
         let live: Vec<NodeId> = cluster
             .nodes
             .keys()
@@ -378,6 +510,7 @@ fn advance_with_faults(
     stores: &mut BTreeMap<NodeId, KvStore>,
     applied: &mut BTreeMap<NodeId, LogIndex>,
     applied_terms: &mut BTreeMap<NodeId, (LogIndex, anvil_types::Term)>,
+    harness: &mut SnapshotHarness,
     node_ids: &[NodeId],
     faults: &[KvFault],
     fault_cursor: &mut usize,
@@ -418,7 +551,8 @@ fn advance_with_faults(
         *fault_cursor += 1;
     }
     cluster.tick();
-    apply_all(cluster, stores, applied, applied_terms);
+    apply_all(cluster, stores, applied, applied_terms, harness);
+    snapshot_maintenance(cluster, stores, applied, applied_terms, harness);
     tick + 1
 }
 
@@ -467,6 +601,7 @@ fn execute_scheduled(
     stores: &mut BTreeMap<NodeId, KvStore>,
     applied: &mut BTreeMap<NodeId, LogIndex>,
     applied_terms: &mut BTreeMap<NodeId, (LogIndex, anvil_types::Term)>,
+    harness: &mut SnapshotHarness,
     clients: &mut [WorkloadClient],
     profile: &SwarmProfile,
     list_pct: u64,
@@ -512,7 +647,8 @@ fn execute_scheduled(
                 break;
             }
             cluster.tick();
-            apply_all(cluster, stores, applied, applied_terms);
+            apply_all(cluster, stores, applied, applied_terms, harness);
+            snapshot_maintenance(cluster, stores, applied, applied_terms, harness);
             if let Some(id) = find_register_session(cluster, leader, before_idx) {
                 client.session = Some(id);
                 break;
@@ -585,7 +721,8 @@ fn execute_scheduled(
             while t < deadline {
                 cluster.tick();
                 t += 1;
-                apply_all(cluster, stores, applied, applied_terms);
+                apply_all(cluster, stores, applied, applied_terms, harness);
+                snapshot_maintenance(cluster, stores, applied, applied_terms, harness);
                 let visible = match effective_kind {
                     ScheduledKind::Delete => delete_committed(stores, &leader, &key, before),
                     _ => write_visible_on_leader(stores, &leader, &key, &value, effective_kind),
@@ -707,7 +844,8 @@ fn execute_scheduled(
                 while t < deadline {
                     cluster.tick();
                     t += 1;
-                    apply_all(cluster, stores, applied, applied_terms);
+                    apply_all(cluster, stores, applied, applied_terms, harness);
+                    snapshot_maintenance(cluster, stores, applied, applied_terms, harness);
                     // Wait on the follower's own commit index, not the
                     // workload's applied map: a commit advance carries a term
                     // match, so the prefix below it is agreed with a leader.
@@ -773,7 +911,8 @@ fn execute_scheduled(
                 while !ready && t < deadline {
                     cluster.tick();
                     t += 1;
-                    apply_all(cluster, stores, applied, applied_terms);
+                    apply_all(cluster, stores, applied, applied_terms, harness);
+                    snapshot_maintenance(cluster, stores, applied, applied_terms, harness);
                     ready = cluster.leader() == Some(leader)
                         && leader_interm_commit(cluster, leader).is_some();
                 }
@@ -806,7 +945,8 @@ fn execute_scheduled(
                 while t < deadline {
                     cluster.tick();
                     t += 1;
-                    apply_all(cluster, stores, applied, applied_terms);
+                    apply_all(cluster, stores, applied, applied_terms, harness);
+                    snapshot_maintenance(cluster, stores, applied, applied_terms, harness);
                     let reads = cluster.take_completed_reads(leader);
                     for read in reads {
                         if read.context == context {
@@ -821,7 +961,8 @@ fn execute_scheduled(
                 if let Some(read_index) = confirmed {
                     let mut waited = t;
                     while waited < deadline {
-                        apply_all(cluster, stores, applied, applied_terms);
+                        apply_all(cluster, stores, applied, applied_terms, harness);
+                        snapshot_maintenance(cluster, stores, applied, applied_terms, harness);
                         if applied.get(&leader).copied().unwrap_or_default() >= read_index {
                             break;
                         }
@@ -889,11 +1030,13 @@ fn execute_scheduled(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_all(
     cluster: &mut SimCluster,
     stores: &mut BTreeMap<NodeId, KvStore>,
     applied: &mut BTreeMap<NodeId, LogIndex>,
     applied_terms: &mut BTreeMap<NodeId, (LogIndex, anvil_types::Term)>,
+    harness: &mut SnapshotHarness,
 ) {
     let ids: Vec<NodeId> = cluster.nodes.keys().copied().collect();
     for id in ids {
@@ -905,8 +1048,9 @@ fn apply_all(
         // A truncated suffix (conflict repair or torn-tail recovery) leaves
         // store effects the log no longer has. Detect the divergence and
         // replay from scratch: small sim logs make the replay cheap and
-        // exact. Snapshots replace this in Week 5.
-        let diverged = if from.is_zero() {
+        // exact. A prefix dropped by snapshot compaction is not a
+        // divergence: an install converges the store instead of a replay.
+        let diverged = if from.is_zero() || from < core.log().base_index() {
             false
         } else {
             !matches!(
@@ -915,27 +1059,272 @@ fn apply_all(
             )
         };
         if diverged {
-            stores.insert(id, KvStore::new(KvConfig::default()));
-            applied.insert(id, LogIndex::from_raw(0));
-            applied_terms.remove(&id);
+            let base = core.log().base_index();
+            let usable = harness
+                .snapshots
+                .get(&id)
+                .filter(|(at, _)| *at >= base && !at.is_zero())
+                .cloned();
+            if base.is_zero() || usable.is_none() {
+                if base.is_zero() {
+                    stores.insert(id, KvStore::new(KvConfig::default()));
+                    applied.insert(id, LogIndex::from_raw(0));
+                    applied_terms.remove(&id);
+                }
+            } else if let Some((at, bytes)) = usable {
+                if let Ok(restored) = KvStore::decode_snapshot(KvConfig::default(), &bytes) {
+                    let term = core.log().term_at(at).unwrap_or_default();
+                    stores.insert(id, restored);
+                    applied.insert(id, at);
+                    applied_terms.insert(id, (at, term));
+                }
+            }
         }
         let mut idx = applied.get(&id).copied().unwrap_or_default().as_u64() + 1;
         while idx <= commit.as_u64() {
-            if let Some(entry) = core.log().entry_at(LogIndex::from_raw(idx)) {
-                let (index, kind, term, payload) =
-                    (entry.index, entry.kind, entry.term, entry.payload.clone());
-                if kind == anvil_types::EntryKind::NoOp {
-                    applied.insert(id, index);
-                    applied_terms.insert(id, (index, term));
-                } else {
-                    if let Some(store) = stores.get_mut(&id) {
-                        let _ = store.apply(index, &payload);
-                    }
-                    applied.insert(id, index);
-                    applied_terms.insert(id, (index, term));
+            // A compacted prefix reports no entry. Advancing past it would
+            // certify state the machine never applied, so stop and wait for
+            // the snapshot install that carries the missing effects.
+            let Some(entry) = core.log().entry_at(LogIndex::from_raw(idx)) else {
+                break;
+            };
+            let (index, kind, term, payload) =
+                (entry.index, entry.kind, entry.term, entry.payload.clone());
+            if kind == anvil_types::EntryKind::NoOp {
+                harness.archive.insert(index, (term, None));
+                applied.insert(id, index);
+                applied_terms.insert(id, (index, term));
+            } else {
+                if let Some(store) = stores.get_mut(&id) {
+                    let _ = store.apply(index, &payload);
                 }
+                harness.archive.insert(index, (term, Some(payload.clone())));
+                harness
+                    .since_entries
+                    .entry(id)
+                    .and_modify(|n| *n = n.saturating_add(1))
+                    .or_insert(1);
+                harness
+                    .since_bytes
+                    .entry(id)
+                    .and_modify(|n| *n = n.saturating_add(payload.len() as u64))
+                    .or_insert(payload.len() as u64);
+                applied.insert(id, index);
+                applied_terms.insert(id, (index, term));
             }
             idx += 1;
+        }
+        // A restarted core resumes with commit zero while the workload's
+        // applied marker survives the crash. Capping the notice at commit
+        // keeps the core's applied-at-most-commit bound exact; the marker
+        // converges as the node re-commits.
+        let advanced = applied.get(&id).copied().unwrap_or_default();
+        if let Some(core) = cluster.nodes.get(&id) {
+            let capped = advanced.min(core.commit_index());
+            if !capped.is_zero() {
+                cluster.notify_applied(id, capped);
+            }
+        }
+    }
+}
+
+/// Installs core-verified snapshots, supplies snapshot bytes for pending
+/// requests, and takes policy-triggered snapshots with compaction. Runs
+/// after every apply pass so installs land before client reads execute.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn snapshot_maintenance(
+    cluster: &mut SimCluster,
+    stores: &mut BTreeMap<NodeId, KvStore>,
+    applied: &mut BTreeMap<NodeId, LogIndex>,
+    applied_terms: &mut BTreeMap<NodeId, (LogIndex, anvil_types::Term)>,
+    harness: &mut SnapshotHarness,
+) {
+    let ids: Vec<NodeId> = cluster.nodes.keys().copied().collect();
+    for id in &ids {
+        let ready = cluster.ready_snapshots.remove(id).unwrap_or_default();
+        for snap in &ready {
+            install_snapshot_state(cluster, stores, applied, applied_terms, harness, *id, snap);
+        }
+    }
+    for id in &ids {
+        let requests = cluster.snapshot_requests.remove(id).unwrap_or_default();
+        for request in &requests {
+            supply_snapshot_for(cluster, stores, applied, harness, *id, request.least_index);
+        }
+    }
+    for id in &ids {
+        if cluster.is_node_crashed(*id) {
+            continue;
+        }
+        let entries = harness.since_entries.get(id).copied().unwrap_or(0);
+        let bytes = harness.since_bytes.get(id).copied().unwrap_or(0);
+        if !harness.policy.should_snapshot(entries, bytes) {
+            continue;
+        }
+        let Some(at) = applied.get(id).copied() else {
+            continue;
+        };
+        if at.is_zero() {
+            continue;
+        }
+        take_snapshot_for(cluster, stores, harness, *id, at);
+    }
+}
+
+/// Encodes a node's state machine, checks `SnapshotEqualsReplay` against the
+/// committed archive, supplies the chunks to the core, and compacts the
+/// covered log prefix.
+fn take_snapshot_for(
+    cluster: &mut SimCluster,
+    stores: &BTreeMap<NodeId, KvStore>,
+    harness: &mut SnapshotHarness,
+    id: NodeId,
+    at: LogIndex,
+) {
+    let Some(store) = stores.get(&id) else {
+        return;
+    };
+    let handle = store.snapshot_handle();
+    assert_snapshot_equals_replay(&handle, &harness.archive);
+    let full = handle.encode_snapshot();
+    let digest = anvil_kv::snapshot_digest(&full);
+    let chunks = anvil_kv::split_into_chunks(&full, harness.chunk_bytes);
+    let mut total: u64 = 0;
+    let mut data = Vec::with_capacity(chunks.len());
+    for chunk in &chunks {
+        total = total.saturating_add(chunk.payload.len() as u64);
+        data.push(SnapshotChunkData {
+            chunk: chunk.payload.clone(),
+            chunk_crc: chunk.crc,
+        });
+    }
+    let snapped_term = applied_term_for(cluster, id, at);
+    cluster.supply_snapshot(id, at, snapped_term, total, digest, data);
+    harness.snapshots_taken = harness.snapshots_taken.saturating_add(1);
+    harness.snapshots.insert(id, (at, full.clone()));
+    harness.since_entries.insert(id, 0);
+    harness.since_bytes.insert(id, 0);
+    harness.last_snapshot.insert(id, at);
+    if let Some(up_to) = harness.policy.compaction_index(at, at, true) {
+        cluster.compact_log(id, up_to);
+    }
+}
+
+/// Replays the committed archive into the engine up to the installed
+/// snapshot, closing the gap a snapshot install leaves between the wiped
+/// core log and the disk. Archive entries are committed, hence stable, so
+/// the backfill matches what the leader holds.
+fn backfill_engine_from_archive(
+    cluster: &mut SimCluster,
+    harness: &SnapshotHarness,
+    id: NodeId,
+    up_to: LogIndex,
+) {
+    let Some(tip) = cluster.engine_last_index(id) else {
+        return;
+    };
+    if tip >= up_to {
+        return;
+    }
+    let mut entries = Vec::new();
+    let mut idx = tip.as_u64() + 1;
+    while idx <= up_to.as_u64() {
+        let at = LogIndex::from_raw(idx);
+        let Some((term, payload)) = harness.archive.get(&at) else {
+            return;
+        };
+        let (kind, bytes) = match payload {
+            Some(bytes) => (anvil_types::EntryKind::Normal, bytes.clone()),
+            None => (anvil_types::EntryKind::NoOp, Bytes::new()),
+        };
+        entries.push(anvil_types::Entry {
+            index: at,
+            term: *term,
+            kind,
+            payload: bytes,
+        });
+        idx += 1;
+    }
+    let _ = cluster.backfill_log_prefix(id, entries);
+}
+
+/// Returns the term covering `at`: the applied entry's term, or the
+/// compacted base term when the prefix is already snapshotted away.
+fn applied_term_for(cluster: &SimCluster, id: NodeId, at: LogIndex) -> anvil_types::Term {
+    cluster
+        .nodes
+        .get(&id)
+        .and_then(|core| core.log().term_at(at))
+        .unwrap_or(anvil_types::Term::from_raw(0))
+}
+
+/// Supplies one pending snapshot request from the node's applied state.
+#[allow(clippy::too_many_arguments)]
+fn supply_snapshot_for(
+    cluster: &mut SimCluster,
+    stores: &BTreeMap<NodeId, KvStore>,
+    applied: &BTreeMap<NodeId, LogIndex>,
+    harness: &mut SnapshotHarness,
+    id: NodeId,
+    least: LogIndex,
+) {
+    let Some(at) = applied.get(&id).copied() else {
+        return;
+    };
+    assert!(
+        at.as_u64() + 1 >= least.as_u64(),
+        "snapshot need beyond applied state"
+    );
+    if at.is_zero() {
+        return;
+    }
+    take_snapshot_for(cluster, stores, harness, id, at);
+}
+
+/// Installs a verified snapshot into the state machine and advances the
+/// applied marker past the compacted prefix.
+fn install_snapshot_state(
+    cluster: &mut SimCluster,
+    stores: &mut BTreeMap<NodeId, KvStore>,
+    applied: &mut BTreeMap<NodeId, LogIndex>,
+    applied_terms: &mut BTreeMap<NodeId, (LogIndex, anvil_types::Term)>,
+    harness: &mut SnapshotHarness,
+    id: NodeId,
+    snap: &ReceivedSnapshot,
+) {
+    let current = applied.get(&id).copied().unwrap_or_default();
+    if snap.last_included_index <= current {
+        return;
+    }
+
+    if anvil_kv::snapshot_digest(&snap.data) != snap.snapshot_digest {
+        return;
+    }
+    let config = KvConfig::default();
+    let Ok(restored) = KvStore::decode_snapshot(config, &snap.data) else {
+        return;
+    };
+    if restored.applied_index() != snap.last_included_index {
+        return;
+    }
+    if let Some(storage) = cluster.storage.get_mut(&id) {
+        storage.engine.discard_gap_buffer();
+    }
+    stores.insert(id, restored);
+    applied.insert(id, snap.last_included_index);
+    applied_terms.insert(id, (snap.last_included_index, snap.last_included_term));
+    harness.last_snapshot.insert(id, snap.last_included_index);
+    harness.since_entries.insert(id, 0);
+    harness.since_bytes.insert(id, 0);
+    harness.installs = harness.installs.saturating_add(1);
+    harness
+        .snapshots
+        .insert(id, (snap.last_included_index, snap.data.clone()));
+    backfill_engine_from_archive(cluster, harness, id, snap.last_included_index);
+    if let Some(core) = cluster.nodes.get(&id) {
+        let capped = snap.last_included_index.min(core.commit_index());
+        if !capped.is_zero() {
+            cluster.notify_applied(id, capped);
         }
     }
 }

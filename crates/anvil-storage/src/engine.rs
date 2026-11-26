@@ -151,9 +151,30 @@ pub struct StorageEngine {
     active_first_index: LogIndex,
     active_header_crc: u32,
 
+    // Appends that arrived ahead of a not-yet-persisted prefix. A snapshot
+    // install wipes the core log but not the disk, so the first post-install
+    // appends gap the engine until the workload backfills the covered
+    // prefix. Buffered appends flush in order once contiguous; a truncate
+    // discards the replaced tail. Tokens wait until staging, preserving
+    // exactly-once persistence.
+    gap_buffer: VecDeque<GapAppend>,
+
     // Unrecoverable fatal error (e.g. fsync failure under ADR 0013)
     fatal_error: Option<StorageError>,
 }
+
+/// One append held until the log prefix it chains from is persisted.
+#[derive(Debug, Clone)]
+struct GapAppend {
+    prev_index: LogIndex,
+    entries: Vec<Entry>,
+    tokens: Vec<u64>,
+}
+
+/// Upper bound on buffered gap entries. A gap is always closed by the
+/// backfill in the same tick, so breaching the bound means the core stopped
+/// driving the log and the engine refuses to grow without bound.
+const MAX_GAP_BUFFER_ENTRIES: usize = 1_048_576;
 
 impl StorageEngine {
     /// Creates a new `StorageEngine` initialized from recovered storage state.
@@ -215,6 +236,7 @@ impl StorageEngine {
                 active_segment_id,
                 last_record_crc,
             ),
+            gap_buffer: VecDeque::new(),
             fatal_error: None,
         };
         // An active segment rewritten after a torn tail holds no frames yet,
@@ -353,6 +375,7 @@ impl StorageEngine {
             seg_header_crcs: BTreeMap::from([(segment_id, dummy_header.header_crc)]),
             active_first_index: LogIndex::from_raw(1),
             active_header_crc: dummy_header.header_crc,
+            gap_buffer: VecDeque::new(),
             fatal_error: None,
         }
     }
@@ -493,12 +516,11 @@ impl StorageEngine {
         token: u64,
         output: &mut EngineOutput,
     ) {
-        assert_eq!(
-            prev_index, self.last_entry_index,
-            "storage engine append must be strictly sequential"
-        );
-
         if entries.is_empty() {
+            assert_eq!(
+                prev_index, self.last_entry_index,
+                "storage engine append must be strictly sequential"
+            );
             if self.in_flight_wal_syncs.is_empty() {
                 output.persisted_tokens.push(token);
             } else {
@@ -507,7 +529,138 @@ impl StorageEngine {
             return;
         }
 
+        // Contiguity is a core guarantee: the first staged entry follows prev.
+        let first = entries[0].index;
+        assert_eq!(
+            first,
+            prev_index.next().unwrap_or(prev_index),
+            "appended entries must follow prev_index"
+        );
+
+        if prev_index < self.last_entry_index {
+            self.handle_overlapping_append(prev_index, entries, token, output);
+            self.flush_gap_buffer(output);
+            return;
+        }
+
+        if prev_index != self.last_entry_index {
+            self.buffer_gap_append(prev_index, entries, token);
+            return;
+        }
         self.stage_entries(prev_index, entries, token, output);
+        self.flush_gap_buffer(output);
+    }
+
+    /// Holds an append that arrived ahead of its prefix. The prefix always
+    /// follows in the same tick (snapshot-install backfill), so the buffer
+    /// stays tiny; the bound below turns a stuck core into a loud failure
+    /// instead of unbounded growth.
+    fn buffer_gap_append(&mut self, prev_index: LogIndex, entries: &[Entry], token: u64) {
+        let mut start = 0usize;
+        if let Some(tail) = self.gap_buffer.back() {
+            let tail_last = tail
+                .entries
+                .last()
+                .map_or(tail.prev_index, |entry| entry.index);
+            assert!(
+                prev_index.as_u64() <= tail_last.as_u64() + 1,
+                "gap appends must not regress behind the buffered tip"
+            );
+            while start < entries.len() && entries[start].index.as_u64() <= tail_last.as_u64() {
+                start += 1;
+            }
+            if start >= entries.len() {
+                if let Some(tail) = self.gap_buffer.back_mut() {
+                    tail.tokens.push(token);
+                }
+                return;
+            }
+        } else {
+            assert!(
+                prev_index > self.last_entry_index,
+                "gap appends arrive ahead of the durable tip"
+            );
+        }
+        let buffered: usize = self.gap_buffer.iter().map(|gap| gap.entries.len()).sum();
+        assert!(
+            buffered + entries.len() - start <= MAX_GAP_BUFFER_ENTRIES,
+            "snapshot gap grew without a backfill"
+        );
+        let first = entries[start].index;
+        self.gap_buffer.push_back(GapAppend {
+            prev_index: first.prev().unwrap_or(prev_index),
+            entries: entries[start..].to_vec(),
+            tokens: vec![token],
+        });
+    }
+
+    /// Stages buffered appends that turned contiguous, in order.
+    fn flush_gap_buffer(&mut self, output: &mut EngineOutput) {
+        while self
+            .gap_buffer
+            .front()
+            .is_some_and(|gap| gap.prev_index == self.last_entry_index)
+        {
+            let Some(gap) = self.gap_buffer.pop_front() else {
+                break;
+            };
+            let tokens = gap.tokens.clone();
+            self.stage_entries(gap.prev_index, &gap.entries, tokens[0], output);
+            for token in tokens.iter().skip(1) {
+                if self.in_flight_wal_syncs.is_empty() {
+                    output.persisted_tokens.push(*token);
+                } else {
+                    self.pending_tokens.push(*token);
+                }
+            }
+        }
+    }
+
+    /// Discards buffered gap appends. Unacked batches are always safe to
+    /// drop: the core still holds the entries and resends them under new
+    /// tokens once the truncation (or install) settles, while the dropped
+    /// tokens are superseded instead of completed. The workload calls this
+    /// before backfilling a freshly installed snapshot so no stale suffix
+    /// can stage ahead of the authoritative prefix.
+    pub fn discard_gap_buffer(&mut self) {
+        self.gap_buffer.clear();
+    }
+
+    /// Reconciles an append whose prefix the engine already holds. A snapshot
+    /// install wipes the core log but not the disk, so the core resends
+    /// entries the engine persisted under an earlier sequence. Matching terms
+    /// make the overlap idempotent and only the new suffix is staged; a
+    /// mismatch is a conflict the wiped core could not see, so the engine
+    /// rewinds to the append point and stages everything.
+    fn handle_overlapping_append(
+        &mut self,
+        prev_index: LogIndex,
+        entries: &[Entry],
+        token: u64,
+        output: &mut EngineOutput,
+    ) {
+        let mut skip = 0usize;
+        for entry in entries {
+            if entry.index > self.last_entry_index {
+                break;
+            }
+            if self.journal_at(entry.index).term != entry.term {
+                self.rewind_to(prev_index, output);
+                self.stage_entries(prev_index, entries, token, output);
+                return;
+            }
+            skip += 1;
+        }
+        if skip >= entries.len() {
+            if self.in_flight_wal_syncs.is_empty() {
+                output.persisted_tokens.push(token);
+            } else {
+                self.pending_tokens.push(token);
+            }
+            return;
+        }
+        let suffix_prev = entries[skip].index.prev().unwrap_or(prev_index);
+        self.stage_entries(suffix_prev, &entries[skip..], token, output);
     }
 
     /// Stages entries into the pending batch, rotating the segment when the
@@ -596,15 +749,24 @@ impl StorageEngine {
             "truncate point beyond log tip"
         );
 
-        if from_index.as_u64() <= self.last_entry_index.as_u64() {
-            self.rewind_to(
-                from_index.checked_sub(1).unwrap_or(LogIndex::from_raw(0)),
-                output,
-            );
+        self.discard_gap_buffer();
+        if from_index.as_u64() <= self.last_entry_index.as_u64() + 1 {
+            if from_index.as_u64() <= self.last_entry_index.as_u64() {
+                self.rewind_to(
+                    from_index.checked_sub(1).unwrap_or(LogIndex::from_raw(0)),
+                    output,
+                );
+            }
+            let target_prev_index = from_index.checked_sub(1).unwrap_or(LogIndex::from_raw(0));
+            self.stage_entries(target_prev_index, entries, token, output);
+            self.flush_gap_buffer(output);
+            return;
         }
 
+        // Truncation beyond the durable tip follows a snapshot install that
+        // wiped the core log: buffer the suffix until the backfill lands.
         let target_prev_index = from_index.checked_sub(1).unwrap_or(LogIndex::from_raw(0));
-        self.stage_entries(target_prev_index, entries, token, output);
+        self.buffer_gap_append(target_prev_index, entries, token);
     }
 
     /// Rewinds the log to `keep_last`, discarding every frame above it.
