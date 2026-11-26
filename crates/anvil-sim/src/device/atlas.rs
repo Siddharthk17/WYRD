@@ -34,6 +34,12 @@ struct AtlasState {
     /// least a quorum of valid copies always survives, whether or not the
     /// entry has committed yet.
     corrupted: BTreeMap<LogIndex, BTreeSet<NodeId>>,
+    /// Nodes whose hard state is unrecoverably lost (refused restart).
+    /// Hard state has no redundant copies elsewhere, so at most `N - Q`
+    /// nodes may lose it: a second permanent loss would leave no electable
+    /// quorum for any future term. Recorded at refusal time, when the
+    /// loss is certain, never speculatively at fault time.
+    hard_state_dead: BTreeSet<NodeId>,
     /// Whether the atlas is in permissive mode (allows all faults without veto).
     permissive: bool,
     /// Counter of vetoed corruption attempts to uphold survivability.
@@ -61,6 +67,7 @@ impl StorageFaultAtlas {
                 commit_index: LogIndex::from_raw(0),
                 valid_copies: BTreeMap::new(),
                 corrupted: BTreeMap::new(),
+                hard_state_dead: BTreeSet::new(),
                 permissive: false,
                 vetoed_corruptions: 0,
                 allowed_corruptions: 0,
@@ -80,6 +87,7 @@ impl StorageFaultAtlas {
                 commit_index: LogIndex::from_raw(0),
                 valid_copies: BTreeMap::new(),
                 corrupted: BTreeMap::new(),
+                hard_state_dead: BTreeSet::new(),
                 permissive: true,
                 vetoed_corruptions: 0,
                 allowed_corruptions: 0,
@@ -147,6 +155,33 @@ impl StorageFaultAtlas {
     pub fn is_committed(&self, index: LogIndex) -> bool {
         let state = self.lock();
         index <= state.commit_index
+    }
+
+    /// Records that `node_id` refused restart: its hard state is
+    /// unrecoverably lost. Later hard-state faults on other nodes are
+    /// vetoed once the survivor budget is spent, so a second permanent
+    /// loss cannot take the last electable quorum with it.
+    pub fn record_hard_state_dead(&self, node_id: NodeId) {
+        self.lock().hard_state_dead.insert(node_id);
+    }
+
+    /// Returns whether hard state on `node_id` may be destroyed. At most
+    /// `N - Q` nodes may lose it; beyond that no quorum could ever elect
+    /// again. Nodes with no other dead peer are always allowed, so fault
+    /// pressure is unchanged until the first permanent loss.
+    #[must_use]
+    pub fn can_lose_hard_state(&self, node_id: NodeId) -> bool {
+        let state = self.lock();
+        if state.permissive {
+            return true;
+        }
+        let others_dead = state
+            .hard_state_dead
+            .iter()
+            .filter(|&&n| n != node_id)
+            .count();
+        let budget = state.cluster_size.saturating_sub(state.quorum_size).max(1);
+        others_dead < budget
     }
 
     /// Shared survivability rule. Corrupting `index` on `node_id` keeps

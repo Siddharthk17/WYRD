@@ -358,7 +358,10 @@ impl SimDevice {
                 corrupt_offset as u64,
                 &read_bytes[corrupt_offset.min(read_bytes.len())..],
             );
-            if self.rng.bernoulli_ppm(self.config.read_corruption_rate_ppm) && corruptible {
+            if self.rng.bernoulli_ppm(self.config.read_corruption_rate_ppm)
+                && corruptible
+                && self.can_damage_hard_state(file_id)
+            {
                 let corrupted_index =
                     Self::frame_index_at(&read_bytes[corrupt_offset.min(read_bytes.len())..]);
                 // Read-path rot is media damage, not a transient: the flip
@@ -462,6 +465,7 @@ impl SimDevice {
                 .rng
                 .bernoulli_ppm(self.config.unsynced_dir_loss_rate_ppm)
                 && !self.wal_file_loss_breaks_quorum(file_id, &mut pending_corruption)
+                && self.can_damage_hard_state(file_id)
             {
                 self.volatile_files.remove(&file_id);
                 self.files.remove(&file_id);
@@ -539,8 +543,17 @@ impl SimDevice {
                     continue;
                 }
 
-                // Fate decision: Torn, Lost, or Persisted
-                let fate_draw = self.rng.gen_range(0..1_000_000);
+                // Fate decision: Torn, Lost, or Persisted. Hard-state
+                // sectors with no survivor budget persist whole: tearing
+                // the last viable copy would refuse the node permanently
+                // and could take the last electable quorum with it.
+                let hard_state_immune = file_id.is_hard_state()
+                    && matches!((&self.atlas, self.node_id), (Some(a), Some(n)) if !a.can_lose_hard_state(n));
+                let fate_draw = if hard_state_immune {
+                    u64::MAX
+                } else {
+                    self.rng.gen_range(0..1_000_000)
+                };
                 if fate_draw < u64::from(self.config.torn_write_rate_ppm) {
                     // Torn write: first half new bytes, second half old/zeroes/corrupted
                     self.stats.torn_sectors_persisted += 1;
@@ -717,9 +730,22 @@ impl SimDevice {
         }
     }
 
+    /// Internal helper to check if hard-state damage is permitted by the
+    /// atlas. Hard state has no redundant copies elsewhere, so only
+    /// `N - Q` nodes may ever lose it. Non-hard-state files are always
+    /// allowed here; WAL frames have their own per-entry rule.
+    fn can_damage_hard_state(&self, file_id: FileId) -> bool {
+        if !file_id.is_hard_state() {
+            return true;
+        }
+        match (&self.atlas, self.node_id) {
+            (Some(atlas), Some(node_id)) => atlas.can_lose_hard_state(node_id),
+            _ => true,
+        }
+    }
+
     /// Internal helper to check if a corruption of a WAL frame is permitted by the atlas.
-    fn can_corrupt_wal_frame(&self, file_id: FileId, offset: u64, buf: &[u8]) -> bool {
-        if let (Some(atlas), Some(node_id)) = (&self.atlas, self.node_id)
+    fn can_corrupt_wal_frame(&self, file_id: FileId, offset: u64, buf: &[u8]) -> bool {        if let (Some(atlas), Some(node_id)) = (&self.atlas, self.node_id)
             && file_id.is_wal_segment()
             && offset >= self.config.sector_size.as_u64()
             && let Some(index) = Self::frame_index_at(buf)
@@ -843,6 +869,7 @@ impl SimDevice {
                         .rng
                         .bernoulli_ppm(self.config.write_corruption_rate_ppm)
                     && self.can_corrupt_wal_frame(file_id, offset, &write_bytes)
+                    && self.can_damage_hard_state(file_id)
                 {
                     let corrupted_index = Self::frame_index_at(&write_bytes);
                     if !write_bytes.is_empty() {
@@ -929,6 +956,7 @@ impl SimDevice {
                 if self.config.read_corruption_rate_ppm > 0
                     && self.rng.bernoulli_ppm(self.config.read_corruption_rate_ppm)
                     && self.can_corrupt_wal_frame(file_id, offset, &read_bytes)
+                    && self.can_damage_hard_state(file_id)
                 {
                     let corrupted_index = Self::frame_index_at(&read_bytes);
                     if !read_bytes.is_empty() {

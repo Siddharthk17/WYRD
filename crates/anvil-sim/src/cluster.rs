@@ -1027,8 +1027,13 @@ impl SimCluster {
                 // Both slots corrupted: refuse to start under ADR 0012.
                 // The node stays down until Week 6 replaces it, so mark it
                 // crashed: every quorum-based check already skips crashed nodes.
+                // Recorded in the atlas: a second permanent hard-state loss
+                // would leave no electable quorum, so later faults are vetoed.
                 storage.refused_start = true;
                 storage.crashed = true;
+                if let Some(atlas) = &self.fault_atlas {
+                    atlas.record_hard_state_dead(node_id);
+                }
                 self.trace_line(format!("{node_id:?} restart refused: unrecoverable"));
                 return Err(e);
             }
@@ -1045,6 +1050,9 @@ impl SimCluster {
         {
             storage.refused_start = true;
             storage.crashed = true;
+            if let Some(atlas) = &self.fault_atlas {
+                atlas.record_hard_state_dead(node_id);
+            }
             return Err(StorageError::StaleHardState {
                 recovered_term: recovered.current_term,
                 recovered_vote: recovered.voted_for,
@@ -1224,6 +1232,9 @@ impl SimCluster {
                 ) {
                     storage.refused_start = true;
                     storage.crashed = true;
+                    if let Some(atlas) = &self.fault_atlas {
+                        atlas.record_hard_state_dead(node_id);
+                    }
                     return Err(StorageError::StaleHardState {
                         recovered_term: recovered.current_term,
                         recovered_vote: recovered.voted_for,
