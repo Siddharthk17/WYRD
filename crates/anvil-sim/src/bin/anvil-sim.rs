@@ -216,8 +216,11 @@ fn run_trace(args: TraceArgs) {
     }
 }
 
-fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(text) = payload.downcast_ref::<String>() {
+fn panic_text(payload: &Box<dyn std::any::Any + Send>) -> String {
+    // See `anvil_sim::panic_failure_class`: downcast through an explicitly
+    // typed reborrow, never an implicitly coerced `&(dyn Any)` argument.
+    let borrowed: &(dyn std::any::Any + Send) = payload.as_ref();
+    if let Some(text) = borrowed.downcast_ref::<String>() {
         text.clone()
     } else if let Some(text) = payload.downcast_ref::<&str>() {
         (*text).to_string()

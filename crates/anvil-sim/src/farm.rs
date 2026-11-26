@@ -636,8 +636,11 @@ fn kv_plan_fault_counts(seed: u64, storage_faults: bool) -> Vec<(String, u64)> {
 }
 
 /// Extracts a human-readable message from a caught panic.
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(text) = payload.downcast_ref::<String>() {
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    // See `panic_failure_class`: downcast through an explicitly typed
+    // reborrow, never an implicitly coerced `&(dyn Any)` argument.
+    let borrowed: &(dyn std::any::Any + Send) = payload.as_ref();
+    if let Some(text) = borrowed.downcast_ref::<String>() {
         text.clone()
     } else if let Some(text) = payload.downcast_ref::<&str>() {
         (*text).to_string()

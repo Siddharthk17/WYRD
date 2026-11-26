@@ -35,9 +35,11 @@ fn test_normalize_failure_class_collapses_digits() {
 
 #[test]
 fn test_panic_failure_class_names_payload() {
-    let class = panic_failure_class(&String::from("invariant X at index 42"));
+    let boxed: Box<dyn std::any::Any + Send> = Box::new(String::from("invariant X at index 42"));
+    let class = panic_failure_class(&boxed);
     assert_eq!(class, "panic:invariant X at index #");
-    let class = panic_failure_class(&"static at tick 9");
+    let boxed: Box<dyn std::any::Any + Send> = Box::new("static at tick 9");
+    let class = panic_failure_class(&boxed);
     assert_eq!(class, "panic:static at tick #");
 }
 

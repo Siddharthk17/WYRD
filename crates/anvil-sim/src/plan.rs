@@ -984,9 +984,15 @@ pub fn normalize_failure_class(raw: &str) -> String {
 }
 
 /// Names the failure kind carried by a caught panic payload.
+///
+/// Takes the boxed payload by reference: callers must not rely on the
+/// implicit `&Box<dyn Any>` to `&(dyn Any)` coercion at the call boundary.
+/// Downcasting is done through an explicitly typed reborrow, which is the
+/// only form verified to preserve the vtable across all call sites.
 #[must_use]
-pub fn panic_failure_class(payload: &(dyn std::any::Any + Send)) -> String {
-    let raw = if let Some(text) = payload.downcast_ref::<String>() {
+pub fn panic_failure_class(payload: &Box<dyn std::any::Any + Send>) -> String {
+    let borrowed: &(dyn std::any::Any + Send) = payload.as_ref();
+    let raw = if let Some(text) = borrowed.downcast_ref::<String>() {
         text.clone()
     } else if let Some(text) = payload.downcast_ref::<&str>() {
         (*text).to_string()
@@ -1274,3 +1280,7 @@ fn write_u64(out: &mut [u8], mut value: u64) -> usize {
     }
     len
 }
+
+
+
+
