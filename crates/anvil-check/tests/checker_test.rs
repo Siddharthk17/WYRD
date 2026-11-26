@@ -161,6 +161,24 @@ fn test_checker_brute_force_agrees_on_tiny_histories() {
     assert_eq!(verified, 2000);
 }
 
+/// Million-history brute-force agreement. Ignored by default: it takes
+/// seconds in release and minutes in debug. Run explicitly with
+/// `cargo test -p anvil-check --release --test checker_test
+/// -- --ignored --nocapture`.
+#[test]
+#[ignore = "million-history agreement run, execute explicitly in release"]
+fn test_checker_brute_force_agrees_on_million_histories() {
+    let mut verified = 0u64;
+    for seed in 0..1_000_000u64 {
+        let history = tiny_history(seed);
+        let fast = check_history(&history).is_ok();
+        let brute = brute_force(&history);
+        assert_eq!(fast, brute, "disagreement on seed {seed}");
+        verified += 1;
+    }
+    assert_eq!(verified, 1_000_000);
+}
+
 #[test]
 fn test_checker_mutated_histories_fail() {
     for seed in 0..200u64 {
@@ -180,6 +198,8 @@ fn test_porcupine_export_shape() {
     let json = export_porcupine(&history);
     assert!(json.starts_with('['));
     assert!(json.contains("put"));
+    assert!(json.contains("\"result\""));
+    assert!(json.contains("\"version\":9"));
 }
 
 fn tiny_history(seed: u64) -> History {
