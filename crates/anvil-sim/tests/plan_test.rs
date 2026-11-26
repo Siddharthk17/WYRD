@@ -113,6 +113,7 @@ fn test_plan_events_cover_fault_vocabulary() {
                 FaultKind::Crash { .. } => "crash",
                 FaultKind::Pause { .. } => "pause",
                 FaultKind::SlowClock { .. } => "clock",
+                FaultKind::Transfer { .. } => "transfer",
                 FaultKind::DelaySpike { .. } => "delay",
             };
             seen.insert(kind);

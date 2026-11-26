@@ -31,7 +31,7 @@ use crate::rng::DetRng;
 use anvil_check::{ClientOp, History, HistoryOp, OpResult};
 use anvil_kv::{KvCommand, KvConfig, KvResponse, KvStore, SnapshotPolicy};
 use anvil_raft::{Input, ReceivedSnapshot, SnapshotChunkData};
-use anvil_types::{LogIndex, NodeId, SeqNo, SessionId};
+use anvil_types::{LogIndex, NodeId, SeqNo, SessionId, sometimes};
 use bytes::Bytes;
 use std::collections::BTreeMap;
 
@@ -241,7 +241,7 @@ pub fn run_kv_seed_with_storage(seed: u64, stale_canary: bool) -> (History, bool
 
 /// Snapshot flow counters for one KV seed, also consumed by the farm
 /// summary in a later subtask.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SnapshotStats {
     /// Snapshots taken, verified against a log replay, and supplied.
     pub snapshots_taken: u64,
@@ -251,6 +251,8 @@ pub struct SnapshotStats {
     pub virtual_ticks: u64,
     /// Invariant evaluation rounds performed.
     pub invariant_checks: u64,
+    /// Rare-path hits tallied by point name.
+    pub sometimes: Vec<(String, u64)>,
 }
 
 /// Runs one deterministic KV seed and returns its history.
@@ -415,6 +417,7 @@ fn run_kv_plan_inner(
 
     let mut op_cursor = 0;
     let mut fault_cursor = 0;
+    let mut sometimes_hits: Vec<&'static str> = Vec::new();
     // Canary state: the last two observed register values per key, with the
     // completion tick of the latest write. A canary read returns the older
     // pair once its successor completed, which is exactly the stale read a
@@ -472,6 +475,7 @@ fn run_kv_plan_inner(
                 stale_canary,
                 &mut canary_last,
                 &mut canary_prev,
+                &mut sometimes_hits,
             );
             op_cursor += 1;
             cluster.tick();
@@ -509,7 +513,7 @@ fn run_kv_plan_inner(
 
     cluster.plan_net = None;
     cluster.heal_all();
-    heal_step(&mut cluster, &node_ids, &base_skew);
+    heal_step(&mut cluster, &node_ids, &base_skew, &harness.archive);
     snapshot_maintenance(
         &mut cluster,
         &mut stores,
@@ -539,11 +543,13 @@ fn run_kv_plan_inner(
     );
 
     let audit = convergence_audit(&cluster, &stores, &applied);
+    sometimes_hits.append(&mut cluster.sometimes_hits);
     let stats = SnapshotStats {
         snapshots_taken: harness.snapshots_taken,
         installs: harness.installs,
         virtual_ticks: cluster.current_tick,
         invariant_checks: cluster.checker.checks(),
+        sometimes: crate::count_sometimes(sometimes_hits),
     };
     (history, audit, stats)
 }
@@ -552,8 +558,14 @@ fn run_kv_plan_inner(
 /// nodes, restore base tick rates, and restart crashed nodes that can
 /// restart. Storage faults can crash nodes at any time, so convergence and
 /// liveness loops repeat this instead of relying on a single heal.
-fn heal_step(cluster: &mut SimCluster, node_ids: &[NodeId], base_skew: &BTreeMap<NodeId, u64>) {
+fn heal_step(
+    cluster: &mut SimCluster,
+    node_ids: &[NodeId],
+    base_skew: &BTreeMap<NodeId, u64>,
+    archive: &BTreeMap<LogIndex, (anvil_types::Term, Option<Bytes>)>,
+) {
     cluster.heal_all();
+    cluster.repair_step(Some(archive));
     for id in node_ids.iter().copied() {
         if cluster.is_paused(id) {
             cluster.resume_node(id);
@@ -561,10 +573,11 @@ fn heal_step(cluster: &mut SimCluster, node_ids: &[NodeId], base_skew: &BTreeMap
         if let Some(base) = base_skew.get(&id) {
             cluster.set_tick_skew(id, *base);
         }
-        if cluster.is_node_crashed(id)
-            && !cluster.is_node_needs_repair(id)
-            && !cluster.is_node_refused_start(id)
-        {
+        // Restart every crashed node that is not refused: recovery re-derives
+        // NeedsRepair from the current disk, so a repaired node rejoins and
+        // an unrepaired one stays sidelined. Skipping sidelined nodes here
+        // would deadlock repair: nothing else restarts them.
+        if cluster.is_node_crashed(id) && !cluster.is_node_refused_start(id) {
             let _ = cluster.restart_node(id);
         }
     }
@@ -583,7 +596,7 @@ fn drain_to_convergence(
     base_skew: &BTreeMap<NodeId, u64>,
 ) {
     for _ in 0..500 {
-        heal_step(cluster, node_ids, base_skew);
+        heal_step(cluster, node_ids, base_skew, &harness.archive);
         cluster.tick();
         apply_all(cluster, stores, applied, applied_terms, harness);
         snapshot_maintenance(cluster, stores, applied, applied_terms, harness);
@@ -700,6 +713,15 @@ fn begin_workload_event(
                 cluster.set_tick_skew(*id, rate_per_mille);
             }
         }
+        FaultKind::Transfer { node } => {
+            if let Some(target) = node_ids.get(node).copied()
+                && let Some(leader) = cluster.leader()
+                && leader != target
+            {
+                sometimes!(cluster.sometimes_hits, "sim.transfer.begin");
+                cluster.step_node(leader, anvil_raft::Input::TransferLeader { to: target });
+            }
+        }
         FaultKind::DelaySpike { .. } => {}
     }
 }
@@ -730,8 +752,10 @@ fn end_workload_event(
             }
         }
         FaultKind::Crash { node } => {
+            // Restart every crashed node that is not refused: recovery
+            // re-derives NeedsRepair from the current disk, so a repaired
+            // node rejoins and an unrepaired one stays sidelined.
             if let Some(id) = node_ids.get(node)
-                && !cluster.is_node_needs_repair(*id)
                 && !cluster.is_node_refused_start(*id)
             {
                 let _ = cluster.restart_node(*id);
@@ -750,6 +774,7 @@ fn end_workload_event(
             }
         }
         FaultKind::DelaySpike { .. } => {}
+        FaultKind::Transfer { .. } => {}
     }
 }
 
@@ -808,9 +833,11 @@ fn execute_scheduled(
     stale_canary: bool,
     canary_last: &mut BTreeMap<Vec<u8>, (Option<Bytes>, u64, u64)>,
     canary_prev: &mut BTreeMap<Vec<u8>, (Option<Bytes>, u64)>,
+    sometimes_hits: &mut Vec<&'static str>,
 ) {
     let client = &mut clients[op.client];
     if profile.client_crashes && tick < client.crashed_until {
+        sometimes!(sometimes_hits, "sim.client.crash");
         return;
     }
     if profile.client_crashes && op.seq_in_client == 1 && op.client % 3 == 0 {
@@ -1049,12 +1076,17 @@ fn execute_scheduled(
                     // Raw applied indexes can cross leader changes. The
                     // leader's number only counts once it committed in-term;
                     // a fresh leader's stale commit would end the wait early.
+                    // The store must also be caught up: right after a snapshot
+                    // install the commit is already past the install index
+                    // while the newly available suffix still waits for the
+                    // next apply pass, and reading that gap serves stale data.
                     if let Some(current) = cluster.leader()
                         && let Some(leader_commit) = leader_interm_commit(cluster, current)
                         && cluster
                             .nodes
                             .get(&target)
                             .is_some_and(|core| core.commit_index() >= leader_commit)
+                        && applied.get(&target).copied().unwrap_or_default() >= leader_commit
                     {
                         satisfied = true;
                         break;
@@ -1740,7 +1772,7 @@ fn liveness_check(
 ) {
     let mut waited = 0u64;
     while cluster.leader().is_none() && waited < 100 {
-        heal_step(cluster, node_ids, base_skew);
+        heal_step(cluster, node_ids, base_skew, &harness.archive);
         cluster.tick();
         waited += 1;
         apply_all(cluster, stores, applied, applied_terms, harness);
@@ -1748,7 +1780,23 @@ fn liveness_check(
     }
     assert!(
         cluster.leader().is_some(),
-        "liveness: no leader within 100 ticks after heal (seed {seed})"
+        "liveness: no leader within 100 ticks after heal (seed {seed} states={})",
+        node_ids
+            .iter()
+            .map(|id| {
+                let role = cluster.nodes.get(id).map_or_else(
+                    || String::from("absent"),
+                    |core| format!("{:?}/{}", core.role(), core.term().as_u64()),
+                );
+                format!(
+                    "{id:?}:{role}:crashed={}:repair={}:refused={}",
+                    cluster.is_node_crashed(*id),
+                    cluster.is_node_needs_repair(*id),
+                    cluster.is_node_refused_start(*id),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
     );
     if let Some(leader) = cluster.leader() {
         let tick_now = stores
@@ -1775,7 +1823,7 @@ fn liveness_check(
         let mut advanced = false;
         waited = 0;
         while waited < 200 {
-            heal_step(cluster, node_ids, base_skew);
+            heal_step(cluster, node_ids, base_skew, &harness.archive);
             cluster.tick();
             waited += 1;
             apply_all(cluster, stores, applied, applied_terms, harness);

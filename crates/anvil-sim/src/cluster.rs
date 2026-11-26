@@ -21,8 +21,9 @@ use anvil_storage::{
     Device, DeviceOp, EngineInput, EngineOutput, FileId, HardStateSlot, LogRecoveryClassification,
     RecoveredStorageState, SectorSize, StorageConfig, StorageEngine, StorageError, WalRecordFrame,
     WalSegmentHeader,
+    format::wal::{WalScanResult, decode_wal_frame},
 };
-use anvil_types::{Entry, LogIndex, NodeId, Term};
+use anvil_types::{Entry, LogIndex, NodeId, Term, sometimes};
 use bytes::Bytes;
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
@@ -53,6 +54,10 @@ pub struct SimNodeStorage {
     pub crashed: bool,
     /// Whether this node is marked `NeedsRepair` due to mid-log corruption.
     pub needs_repair: bool,
+    /// First log index needing peer repair. Set when the node is sidelined,
+    /// cleared when recovery succeeds cleanly or repair completes. Survives
+    /// crashes: a crashed sidelined node still knows what to fetch.
+    pub repair_from: Option<LogIndex>,
     /// Whether this node refused to start due to unrecoverable hard-state corruption.
     pub refused_start: bool,
     /// Record of all log entries whose persistence has been acknowledged.
@@ -100,6 +105,10 @@ pub struct SimCluster {
     /// Core-verified snapshots per node, drained after every step for the
     /// workload to install into its state machines.
     pub ready_snapshots: BTreeMap<NodeId, Vec<ReceivedSnapshot>>,
+    /// Rare protocol paths executed anywhere in the cluster, drained from
+    /// every core step. The farm aggregates these per seed for the
+    /// sometimes-coverage gate.
+    pub sometimes_hits: Vec<&'static str>,
     /// Per-node tick rate in ticks per mille. 1000 is real time, 500 is half
     /// speed, 2000 is double speed. Models clock drift between 0.5x and 2x.
     pub tick_rate_per_mille: BTreeMap<NodeId, u64>,
@@ -213,6 +222,7 @@ impl SimCluster {
                     engine_output: EngineOutput::default(),
                     crashed: false,
                     needs_repair: false,
+                    repair_from: None,
                     refused_start: false,
                     acknowledged_entries: Vec::new(),
                     persisted_votes: BTreeMap::new(),
@@ -239,6 +249,7 @@ impl SimCluster {
             completed_reads: BTreeMap::new(),
             snapshot_requests: BTreeMap::new(),
             ready_snapshots: BTreeMap::new(),
+            sometimes_hits: Vec::new(),
             last_commit_before_crash: BTreeMap::new(),
             output_scratch: Output::new(),
         }
@@ -411,6 +422,8 @@ impl SimCluster {
         if let Some(core) = self.nodes.get_mut(&node_id) {
             core.step(input, &mut self.output_scratch);
         }
+        self.sometimes_hits
+            .append(&mut self.output_scratch.sometimes_hits);
         fresh_reads.append(&mut self.output_scratch.completed_reads);
         self.stash_snapshot_outputs(node_id);
 
@@ -484,6 +497,8 @@ impl SimCluster {
                 if let Some(core) = self.nodes.get_mut(&node_id) {
                     core.step(Input::Persisted { token }, &mut self.output_scratch);
                 }
+                self.sometimes_hits
+                    .append(&mut self.output_scratch.sometimes_hits);
                 self.stash_snapshot_outputs(node_id);
                 let follow_up = std::mem::take(&mut self.output_scratch.messages);
                 for msg in follow_up {
@@ -530,6 +545,8 @@ impl SimCluster {
                     ));
                 }
                 all_follow_ups.append(&mut self.output_scratch.messages);
+                self.sometimes_hits
+                    .append(&mut self.output_scratch.sometimes_hits);
                 fresh_reads.append(&mut self.output_scratch.completed_reads);
                 self.stash_snapshot_outputs(node_id);
             }
@@ -849,10 +866,19 @@ impl SimCluster {
             };
         }
 
+        if matches!(
+            recovered.log.classification,
+            LogRecoveryClassification::TornTail { .. }
+        ) {
+            sometimes!(self.sometimes_hits, "storage.torn.tail");
+        }
+
         match &recovered.log.classification {
-            LogRecoveryClassification::MidLogCorruption { .. } => {
+            LogRecoveryClassification::MidLogCorruption { corrupt_index, .. } => {
                 // Mid-log corruption: marked NeedsRepair, does not vote or lead
+                sometimes!(self.sometimes_hits, "storage.midlog.needsrepair");
                 storage.needs_repair = true;
+                storage.repair_from = Some(*corrupt_index);
                 storage.crashed = false;
                 Ok(recovered)
             }
@@ -1011,12 +1037,251 @@ impl SimCluster {
                 storage.crashed = false;
                 storage.refused_start = false;
                 storage.needs_repair = false;
+                storage.repair_from = None;
 
                 self.checker.check_invariants(&self.nodes);
 
                 Ok(recovered)
             }
         }
+    }
+
+    /// Peer-validated disk repair for sidelined nodes. A node marked
+    /// `NeedsRepair` rejoins once the corrupt range is rewritten from a
+    /// live peer and the node re-replicates the suffix through the core's
+    /// validated paths. Each rewritten frame is re-chained and the file
+    /// re-scanned, so a failed repair leaves the node sidelined instead of
+    /// installing unverified bytes. Repair is a heal-phase activity;
+    /// mid-chaos faults keep faulting.
+    pub fn repair_step(&mut self, archive: Option<&BTreeMap<LogIndex, (Term, Option<Bytes>)>>) {
+        // Crashed sidelined nodes are included: repair fixes their disk
+        // first, and the heal pass restarts them right after (crashed nodes
+        // restart unconditionally now that recovery re-derives the flag).
+        let targets: Vec<NodeId> = self
+            .storage
+            .iter()
+            .filter(|(_, storage)| !storage.refused_start && storage.repair_from.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in targets {
+            self.repair_node(id, archive);
+        }
+    }
+
+    /// Repairs one sidelined node from peer data. Returns true when the
+    /// node rejoined.
+    fn repair_node(
+        &mut self,
+        node_id: NodeId,
+        archive: Option<&BTreeMap<LogIndex, (Term, Option<Bytes>)>>,
+    ) -> bool {
+        if !self.rewrite_repair_frames(node_id, archive) {
+            return false;
+        }
+        if let Some(storage) = self.storage.get_mut(&node_id) {
+            storage.needs_repair = false;
+            storage.repair_from = None;
+            if !self.nodes.contains_key(&node_id) {
+                // No core exists: the crash that sidelined this node removed
+                // it and recovery never rebuilt it. Mark crashed so the heal
+                // pass restarts it from the repaired disk.
+                storage.crashed = true;
+            }
+        }
+        sometimes!(self.sometimes_hits, "sim.repair.cleared");
+        true
+    }
+
+    /// Finds a validated copy of the missing entry. Prefers the committed
+    /// archive (never compacted); otherwise requires a live peer whose
+    /// commit covers the entry, which makes it branch truth by leader
+    /// completeness.
+    fn repair_source(
+        &self,
+        node_id: NodeId,
+        repair_from: LogIndex,
+        archive: Option<&BTreeMap<LogIndex, (Term, Option<Bytes>)>>,
+    ) -> Option<Entry> {
+        if let Some((term, payload)) = archive.and_then(|archive| archive.get(&repair_from)) {
+            return Some(Entry {
+                index: repair_from,
+                term: *term,
+                kind: if payload.is_some() {
+                    anvil_types::EntryKind::Normal
+                } else {
+                    anvil_types::EntryKind::NoOp
+                },
+                payload: payload.clone().unwrap_or_default(),
+            });
+        }
+        let mut best: Option<(LogIndex, Entry)> = None;
+        for (peer_id, core) in &self.nodes {
+            if *peer_id == node_id
+                || self.is_node_crashed(*peer_id)
+                || self.is_node_needs_repair(*peer_id)
+                || self.is_node_refused_start(*peer_id)
+            {
+                continue;
+            }
+            if core.commit_index() < repair_from {
+                continue;
+            }
+            let Some(entry) = core.log().entry_at(repair_from) else {
+                continue;
+            };
+            if best
+                .as_ref()
+                .is_some_and(|(best_commit, _)| *best_commit >= core.commit_index())
+            {
+                continue;
+            }
+            best = Some((core.commit_index(), entry.clone()));
+        }
+        best.map(|(_, entry)| entry)
+    }
+
+    /// Rewrites corrupt frames in the node's WAL files from validated peer
+    /// data, re-chaining CRCs. Only committed entries are implanted, so the
+    /// bytes are branch truth wherever they land. Skips files that do not
+    /// need repair; aborts a file on the first frame no peer can supply.
+    /// Returns true when at least one frame was rewritten and the repaired
+    /// files re-scan clean.
+    fn rewrite_repair_frames(
+        &mut self,
+        node_id: NodeId,
+        archive: Option<&BTreeMap<LogIndex, (Term, Option<Bytes>)>>,
+    ) -> bool {
+        let Some(sector_size) = self
+            .storage
+            .get(&node_id)
+            .map(|storage| storage.config.sector_size)
+        else {
+            return false;
+        };
+        let file_ids: Vec<FileId> = match self.storage.get(&node_id) {
+            Some(storage) => storage
+                .device
+                .list_durable_files()
+                .into_iter()
+                .filter(|file| file.is_wal_segment())
+                .collect(),
+            None => return false,
+        };
+        let mut repaired_any = false;
+        for file_id in file_ids {
+            if self.try_repair_file(node_id, file_id, sector_size, archive) {
+                repaired_any = true;
+            }
+        }
+        repaired_any
+    }
+
+    /// Repairs one segment file in place, replacing undecodable frames with
+    /// committed peer entries. Verifies the rebuilt layout by re-scanning;
+    /// any failure leaves the file untouched.
+    fn try_repair_file(
+        &mut self,
+        node_id: NodeId,
+        file_id: FileId,
+        sector_size: SectorSize,
+        archive: Option<&BTreeMap<LogIndex, (Term, Option<Bytes>)>>,
+    ) -> bool {
+        let sector_len = sector_size.as_usize();
+        let Some(data) = self
+            .storage
+            .get(&node_id)
+            .and_then(|storage| storage.device.get_file_durable_bytes(file_id))
+            .map(<[u8]>::to_vec)
+        else {
+            return false;
+        };
+        if data.len() < sector_len {
+            return false;
+        }
+        let Ok(header) = WalSegmentHeader::decode(&data[..sector_len], sector_size) else {
+            return false;
+        };
+        let mut rebuilt = data[..sector_len].to_vec();
+        let mut last_crc = header.header_crc;
+        let mut offset = sector_len;
+        let mut expected = header.first_index;
+        let mut replaced = false;
+        while offset + sector_len <= data.len() {
+            match decode_wal_frame(
+                &data[offset..],
+                sector_size,
+                last_crc,
+                header.segment_id,
+                offset as u64,
+            ) {
+                WalScanResult::Valid {
+                    frame,
+                    bytes_consumed,
+                    next_crc,
+                } => {
+                    if frame.index != expected {
+                        return false;
+                    }
+                    rebuilt.extend_from_slice(&data[offset..offset + bytes_consumed]);
+                    last_crc = next_crc;
+                    offset += bytes_consumed;
+                    expected = LogIndex::from_raw(expected.as_u64() + 1);
+                }
+                WalScanResult::Unallocated => break,
+                WalScanResult::Corrupted(_) => {
+                    let Some(entry) = self.repair_source(node_id, expected, archive) else {
+                        return false;
+                    };
+                    assert!(
+                        entry.index == expected,
+                        "repair peer returned a different index",
+                    );
+                    let frame = WalRecordFrame::from_entry(
+                        &entry,
+                        last_crc,
+                        header.segment_id,
+                        offset as u64,
+                    );
+                    let mut frame_bytes = Vec::new();
+                    frame.encode_frame(sector_size, &mut frame_bytes);
+                    let next_offset = offset + frame_bytes.len();
+                    let layout_ok = match next_offset.cmp(&data.len()) {
+                        std::cmp::Ordering::Equal => true,
+                        std::cmp::Ordering::Greater => false,
+                        std::cmp::Ordering::Less => match decode_wal_frame(
+                            &data[next_offset..],
+                            sector_size,
+                            frame.crc32c,
+                            header.segment_id,
+                            next_offset as u64,
+                        ) {
+                            WalScanResult::Valid { frame: next, .. } => {
+                                next.index.as_u64() == expected.as_u64() + 1
+                            }
+                            WalScanResult::Unallocated => true,
+                            WalScanResult::Corrupted(_) => false,
+                        },
+                    };
+                    if !layout_ok {
+                        return false;
+                    }
+                    rebuilt.extend_from_slice(&frame_bytes);
+                    last_crc = frame.crc32c;
+                    offset = next_offset;
+                    expected = LogIndex::from_raw(expected.as_u64() + 1);
+                    replaced = true;
+                }
+            }
+        }
+        if !replaced {
+            return false;
+        }
+        rebuilt.extend_from_slice(&data[offset..]);
+        let Some(storage) = self.storage.get_mut(&node_id) else {
+            return false;
+        };
+        storage.device.overwrite_durable(file_id, 0, &rebuilt);
+        true
     }
 
     /// Routes an outbound message through partitions and fault hooks into the network.

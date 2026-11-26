@@ -348,6 +348,40 @@ pub struct SeedOutcome {
     pub invariant_checks: u64,
     /// Fault events injected, by class name.
     pub fault_counts: Vec<(String, u64)>,
+    /// Rare-path hits tallied by point name.
+    pub sometimes: Vec<(String, u64)>,
+}
+
+/// Registered `sometimes!` coverage points. Every name marked anywhere in
+/// the deterministic crates or the sim must appear here exactly once; a
+/// source-scan test enforces it. Session expiry, joint config, and repair
+/// completion join in Week 6 with the code that triggers them.
+pub const SOMETIMES_INVENTORY: &[&str] = &[
+    "raft.snapshot.install.complete",
+    "raft.snapshot.resend",
+    "raft.snapshot.send.start",
+    "raft.term.bump.append",
+    "raft.transfer.aborted",
+    "raft.transfer.timeoutnow.sent",
+    "sim.client.crash",
+    "sim.repair.cleared",
+    "sim.transfer.begin",
+    "storage.midlog.needsrepair",
+    "storage.torn.tail",
+];
+
+/// Points in the inventory with zero hits in a summary.
+#[must_use]
+pub fn sometimes_missed(sometimes: &[(String, u64)]) -> Vec<String> {
+    SOMETIMES_INVENTORY
+        .iter()
+        .filter(|point| {
+            !sometimes
+                .iter()
+                .any(|(name, hits)| name == **point && *hits > 0)
+        })
+        .map(|point| (*point).to_string())
+        .collect()
 }
 
 /// Aggregated farm summary.
@@ -369,6 +403,16 @@ pub struct FarmSummary {
     pub buggify: Vec<(String, String, u64, u64)>,
     /// Total invariant evaluation rounds.
     pub invariant_checks: u64,
+    /// Rare-path hits tallied by point name.
+    pub sometimes: Vec<(String, u64)>,
+}
+
+impl FarmSummary {
+    /// Inventory points with zero hits in this summary.
+    #[must_use]
+    pub fn sometimes_missed(&self) -> Vec<String> {
+        sometimes_missed(&self.sometimes)
+    }
 }
 
 impl FarmSummary {
@@ -412,6 +456,19 @@ impl FarmSummary {
         for (name, location, evals, hits) in &self.buggify {
             let _ = writeln!(out, "  {name}@{location}: {evals} / {hits}");
         }
+        out.push_str("sometimes points (hits):\n");
+        if self.sometimes.is_empty() {
+            out.push_str("  none hit\n");
+        }
+        for (name, hits) in &self.sometimes {
+            let _ = writeln!(out, "  {name}: {hits}");
+        }
+        let missed = self.sometimes_missed();
+        if missed.is_empty() {
+            out.push_str("sometimes coverage: all registered points hit\n");
+        } else {
+            let _ = writeln!(out, "sometimes coverage: NEVER HIT: {}", missed.join(", "));
+        }
         let _ = writeln!(out, "invariants evaluated: {}", self.invariant_checks);
         if !self.failed_seeds.is_empty() {
             let _ = writeln!(out, "first failing seed: {}", self.failed_seeds[0]);
@@ -449,6 +506,7 @@ fn fault_kind_name(kind: &crate::plan::FaultKind) -> &'static str {
         crate::plan::FaultKind::Crash { .. } => "crash",
         crate::plan::FaultKind::Pause { .. } => "pause",
         crate::plan::FaultKind::SlowClock { .. } => "clock",
+        crate::plan::FaultKind::Transfer { .. } => "transfer",
         crate::plan::FaultKind::DelaySpike { .. } => "delay",
     }
 }
@@ -480,6 +538,7 @@ fn finish_consensus(
             installs: 0,
             invariant_checks: stats.invariant_checks,
             fault_counts: faults.into_iter().collect(),
+            sometimes: stats.sometimes,
         },
         Err(payload) => SeedOutcome {
             seed,
@@ -490,6 +549,7 @@ fn finish_consensus(
             installs: 0,
             invariant_checks: 0,
             fault_counts: faults.into_iter().collect(),
+            sometimes: Vec::new(),
         },
     }
 }
@@ -518,6 +578,7 @@ fn run_kv_seed_outcome(seed: u64, storage_faults: bool) -> SeedOutcome {
             installs: stats.installs,
             invariant_checks: stats.invariant_checks,
             fault_counts: faults.into_iter().collect(),
+            sometimes: stats.sometimes,
         },
         Ok(Err(json)) => SeedOutcome {
             seed,
@@ -528,6 +589,7 @@ fn run_kv_seed_outcome(seed: u64, storage_faults: bool) -> SeedOutcome {
             installs: 0,
             invariant_checks: 0,
             fault_counts: faults.into_iter().collect(),
+            sometimes: Vec::new(),
         },
         Err(payload) => SeedOutcome {
             seed,
@@ -538,6 +600,7 @@ fn run_kv_seed_outcome(seed: u64, storage_faults: bool) -> SeedOutcome {
             installs: 0,
             invariant_checks: 0,
             fault_counts: faults.into_iter().collect(),
+            sometimes: Vec::new(),
         },
     }
 }
@@ -908,6 +971,12 @@ fn summarize(
         entry.0 = entry.0.saturating_add(point.evaluations);
         entry.1 = entry.1.saturating_add(point.activations);
     }
+    let mut sometimes: BTreeMap<String, u64> = BTreeMap::new();
+    for outcome in outcomes {
+        for (name, hits) in &outcome.sometimes {
+            *sometimes.entry(name.clone()).or_insert(0) += hits;
+        }
+    }
     FarmSummary {
         total_seeds,
         passed_seeds,
@@ -920,5 +989,6 @@ fn summarize(
             .map(|((name, location), (evals, hits))| (name, location, evals, hits))
             .collect(),
         invariant_checks,
+        sometimes: sometimes.into_iter().collect(),
     }
 }

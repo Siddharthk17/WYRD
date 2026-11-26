@@ -20,7 +20,7 @@
 
 use crate::cluster::{PlanNet, SimCluster};
 use crate::rng::DetRng;
-use anvil_types::LogIndex;
+use anvil_types::{LogIndex, sometimes};
 use bytes::Bytes;
 use std::fmt::Write as _;
 use std::panic::AssertUnwindSafe;
@@ -61,6 +61,10 @@ pub enum FaultKind {
     Pause { node: usize },
     /// Skew one node's tick rate in ticks per mille (500 to 2000).
     SlowClock { node: usize, rate_per_mille: u64 },
+    /// Hand leadership to one node through `TimeoutNow`. The transfer runs
+    /// inside the chaos window and aborts on its own when the target is
+    /// unreachable, so liveness after heal is unaffected.
+    Transfer { node: usize },
     /// Add delivery delay in ticks while active.
     DelaySpike { extra_ticks: u64 },
 }
@@ -242,6 +246,7 @@ impl Plan {
         // generation time like everything else.
         if workload.is_some() && seed.is_multiple_of(4) {
             let id = next_id;
+            next_id = next_id.saturating_add(1);
             let member =
                 usize::try_from(rng.gen_range(0..cluster_size as u64)).unwrap_or(0) % cluster_size;
             events.push(FaultEvent {
@@ -251,6 +256,15 @@ impl Plan {
                 fault: FaultKind::Partition { member },
             });
         }
+        Self::push_transfer_events(
+            seed,
+            workload.is_some(),
+            warmup_end,
+            heal_start,
+            cluster_size,
+            &mut events,
+            &mut next_id,
+        );
         events.sort_by_key(|event| (event.start, event.id));
 
         let mut proposals = Vec::new();
@@ -276,6 +290,49 @@ impl Plan {
             salt,
             storage_faults,
             workload,
+        }
+    }
+
+    /// Adds `TimeoutNow` transfer events to workload plans so the transfer
+    /// path executes under faults. The presence draw uses an independent
+    /// stream, so consensus plans and existing event parameters never
+    /// shift; per-event parameters still come from the stream keyed by
+    /// event id.
+    fn push_transfer_events(
+        seed: u64,
+        is_workload: bool,
+        warmup_end: u64,
+        heal_start: u64,
+        cluster_size: usize,
+        events: &mut Vec<FaultEvent>,
+        next_id: &mut u32,
+    ) {
+        if !is_workload {
+            return;
+        }
+        let mut trng = DetRng::new(seed, "sim/plan/transfer");
+        if trng.gen_range(0..100) >= 30 {
+            return;
+        }
+        let count = 1 + trng.gen_range(0..2);
+        for _ in 0..count {
+            if events.len() >= MAX_EVENTS {
+                break;
+            }
+            let id = *next_id;
+            *next_id = next_id.saturating_add(1);
+            let mut erng = DetRng::new(seed, &format!("sim/plan/event/{id}"));
+            let span = heal_start.saturating_sub(warmup_end + 1).max(1);
+            let start = warmup_end + 1 + erng.gen_range(0..span) % span;
+            let end = (start + 1).min(heal_start);
+            let node =
+                usize::try_from(erng.gen_range(0..cluster_size as u64)).unwrap_or(0) % cluster_size;
+            events.push(FaultEvent {
+                id,
+                start,
+                end,
+                fault: FaultKind::Transfer { node },
+            });
         }
     }
 
@@ -431,6 +488,7 @@ fn encode_event(event: &FaultEvent) -> String {
             node,
             rate_per_mille,
         } => ("clock", format!("{node}-{rate_per_mille}")),
+        FaultKind::Transfer { node } => ("xfer", node.to_string()),
         FaultKind::DelaySpike { extra_ticks } => ("delay", extra_ticks.to_string()),
     };
     format!("{}:{}-{}:{kind}:{params}", event.id, event.start, event.end)
@@ -477,6 +535,9 @@ fn decode_event(raw: &str) -> Result<FaultEvent, PlanError> {
                 rate_per_mille: rate,
             }
         }
+        "xfer" => FaultKind::Transfer {
+            node: parse_idx(params)?,
+        },
         "delay" => FaultKind::DelaySpike {
             extra_ticks: parse_bounded(params)?,
         },
@@ -640,6 +701,7 @@ fn event_member(event: &FaultEvent) -> usize {
         FaultKind::Partition { member }
         | FaultKind::Crash { node: member }
         | FaultKind::Pause { node: member }
+        | FaultKind::Transfer { node: member }
         | FaultKind::SlowClock { node: member, .. } => member,
         FaultKind::Asymmetric { from, to } => from.max(to),
         FaultKind::DelaySpike { .. } => 0,
@@ -675,12 +737,14 @@ fn parse_idx(raw: &str) -> Result<usize, PlanError> {
 }
 
 /// Outcome counters for one consensus-plan run. The farm aggregates these.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlanRunStats {
     /// Invariant evaluation rounds performed.
     pub invariant_checks: u64,
     /// Virtual ticks advanced.
     pub virtual_ticks: u64,
+    /// Rare-path hits tallied by point name.
+    pub sometimes: Vec<(String, u64)>,
 }
 
 /// Executes a plan: warm-up with no faults, chaos from the event schedule,
@@ -759,6 +823,7 @@ pub fn run_plan(plan: &Plan) -> PlanRunStats {
 
     cluster.plan_net = None;
     cluster.heal_all();
+    cluster.repair_step(None);
     cluster.drain_network(20);
 
     let highest_commit = cluster.highest_commit_index();
@@ -792,6 +857,7 @@ pub fn run_plan(plan: &Plan) -> PlanRunStats {
     PlanRunStats {
         invariant_checks: cluster.checker.checks(),
         virtual_ticks: cluster.current_tick,
+        sometimes: crate::count_sometimes(std::mem::take(&mut cluster.sometimes_hits)),
     }
 }
 
@@ -819,6 +885,15 @@ fn begin_event(node_ids: &[anvil_types::NodeId], event: &FaultEvent, cluster: &m
             rate_per_mille,
         } => {
             cluster.set_tick_skew(at(node), rate_per_mille);
+        }
+        FaultKind::Transfer { node } => {
+            let target = at(node);
+            if let Some(leader) = cluster.leader()
+                && leader != target
+            {
+                sometimes!(cluster.sometimes_hits, "sim.transfer.begin");
+                cluster.step_node(leader, anvil_raft::Input::TransferLeader { to: target });
+            }
         }
         FaultKind::DelaySpike { .. } => {
             // Delay spikes compose through the per-tick plan_net override in
@@ -855,10 +930,10 @@ fn end_event(
         }
         FaultKind::Crash { node } => {
             let victim = at(node);
-            if cluster.is_node_crashed(victim)
-                && !cluster.is_node_refused_start(victim)
-                && !cluster.is_node_needs_repair(victim)
-            {
+            // Restart every crashed node that is not refused: recovery
+            // re-derives NeedsRepair from the current disk, so a repaired
+            // node rejoins and an unrepaired one stays sidelined.
+            if cluster.is_node_crashed(victim) && !cluster.is_node_refused_start(victim) {
                 let _ = cluster.restart_node(victim);
             }
         }
@@ -870,7 +945,7 @@ fn end_event(
         FaultKind::SlowClock { node, .. } => {
             cluster.set_tick_skew(at(node), 1000);
         }
-        FaultKind::DelaySpike { .. } => {}
+        FaultKind::Transfer { .. } | FaultKind::DelaySpike { .. } => {}
     }
 }
 

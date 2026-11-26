@@ -29,6 +29,11 @@ struct AtlasState {
     commit_index: LogIndex,
     /// Map from `LogIndex` to the set of nodes currently holding a valid, uncorrupted copy.
     valid_copies: BTreeMap<LogIndex, BTreeSet<NodeId>>,
+    /// Map from `LogIndex` to the set of nodes whose copy was corrupted or
+    /// lost. Each index may be destroyed on at most `N - Q` nodes, so at
+    /// least a quorum of valid copies always survives, whether or not the
+    /// entry has committed yet.
+    corrupted: BTreeMap<LogIndex, BTreeSet<NodeId>>,
     /// Whether the atlas is in permissive mode (allows all faults without veto).
     permissive: bool,
     /// Counter of vetoed corruption attempts to uphold survivability.
@@ -55,6 +60,7 @@ impl StorageFaultAtlas {
                 quorum_size,
                 commit_index: LogIndex::from_raw(0),
                 valid_copies: BTreeMap::new(),
+                corrupted: BTreeMap::new(),
                 permissive: false,
                 vetoed_corruptions: 0,
                 allowed_corruptions: 0,
@@ -73,6 +79,7 @@ impl StorageFaultAtlas {
                 quorum_size: 1,
                 commit_index: LogIndex::from_raw(0),
                 valid_copies: BTreeMap::new(),
+                corrupted: BTreeMap::new(),
                 permissive: true,
                 vetoed_corruptions: 0,
                 allowed_corruptions: 0,
@@ -125,6 +132,7 @@ impl StorageFaultAtlas {
         if let Some(nodes) = state.valid_copies.get_mut(&index) {
             nodes.remove(&node_id);
         }
+        state.corrupted.entry(index).or_default().insert(node_id);
     }
 
     /// Returns the number of nodes currently holding a valid copy of `index`.
@@ -141,6 +149,44 @@ impl StorageFaultAtlas {
         index <= state.commit_index
     }
 
+    /// Shared survivability rule. Corrupting `index` on `node_id` keeps
+    /// every quorum able to elect and recover: an entry may be destroyed on
+    /// at most `N - Q` nodes, and a committed entry additionally needs a
+    /// quorum of other recorded valid copies. The budget half covers
+    /// entries corrupted before they commit: without it, two nodes could
+    /// each destroy an uncommitted entry that later commits through the
+    /// survivors, leaving one copy and no electable quorum.
+    fn corruption_allowed(state: &AtlasState, node_id: NodeId, index: LogIndex) -> bool {
+        if state.permissive {
+            return true;
+        }
+        let already_destroyed = state
+            .corrupted
+            .get(&index)
+            .map_or(0, |nodes| nodes.iter().filter(|&&n| n != node_id).count());
+        let budget = state.cluster_size.saturating_sub(state.quorum_size).max(1);
+        if already_destroyed >= budget {
+            return false;
+        }
+        if index > state.commit_index {
+            return true;
+        }
+        let others_valid = state
+            .valid_copies
+            .get(&index)
+            .map_or(0, |nodes| nodes.iter().filter(|&&n| n != node_id).count());
+        others_valid >= state.quorum_size
+    }
+
+    /// Returns whether corrupting entry `index` on `node_id` keeps a quorum
+    /// of valid copies of every committed entry. Pure query without
+    /// touching the allow/veto counters; crash-time fate uses it to decide
+    /// without accounting a corruption that never happens.
+    #[must_use]
+    pub fn entry_survives_corruption(&self, node_id: NodeId, index: LogIndex) -> bool {
+        Self::corruption_allowed(&self.lock(), node_id, index)
+    }
+
     /// Evaluates whether the injector is permitted to corrupt entry `index` on `node_id`.
     ///
     /// Returns `true` if corruption is allowed under the Quorum Survivability Rule.
@@ -148,32 +194,13 @@ impl StorageFaultAtlas {
     /// a quorum of nodes holding valid copies of a committed entry.
     pub fn can_corrupt_entry(&self, node_id: NodeId, index: LogIndex) -> bool {
         let mut state = self.lock();
-        if state.permissive {
+        let decision = Self::corruption_allowed(&state, node_id, index);
+        if decision {
             state.allowed_corruptions += 1;
-            return true;
-        }
-
-        // Uncommitted entries can be corrupted: Raft safety allows uncommitted logs to be overwritten
-        if index > state.commit_index {
-            state.allowed_corruptions += 1;
-            return true;
-        }
-
-        // For committed entries, ensure a quorum of *other* nodes retains
-        // valid copies after this node's copy is corrupted. Counting only
-        // recorded copies besides the target is exactly the survivability
-        // rule: some majority must keep a valid copy.
-        let others_valid = state
-            .valid_copies
-            .get(&index)
-            .map_or(0, |nodes| nodes.iter().filter(|&&n| n != node_id).count());
-        if others_valid >= state.quorum_size {
-            state.allowed_corruptions += 1;
-            true
         } else {
             state.vetoed_corruptions += 1;
-            false
         }
+        decision
     }
 
     /// Returns the total number of vetoed corruptions.

@@ -25,9 +25,10 @@ pub use buggify::{
 pub use cluster::{InFlightPacket, PlanNet, SimCluster, SimNodeStorage};
 pub use device::{FileState, SimDevice, SimDeviceConfig, SimDeviceStats, StorageFaultAtlas};
 pub use farm::{
-    FarmOptions, FarmProfile, FarmRange, FarmResult, FarmSummary, SeedOutcome, run_farm_range,
-    run_farm_seed, run_farm_seed_with_storage_faults, run_kv_farm, run_kv_farm_seed,
-    run_kv_farm_seed_with_storage, run_seed_farm, run_seed_farm_with_storage_faults,
+    FarmOptions, FarmProfile, FarmRange, FarmResult, FarmSummary, SOMETIMES_INVENTORY, SeedOutcome,
+    run_farm_range, run_farm_seed, run_farm_seed_with_storage_faults, run_kv_farm,
+    run_kv_farm_seed, run_kv_farm_seed_with_storage, run_seed_farm,
+    run_seed_farm_with_storage_faults, sometimes_missed,
 };
 pub use kernel::{Actor, ActorContext, SimError, SimKernel, SimReport};
 pub use network::{LatencyModel, NetworkDelayHook, NetworkFilterHook, SimNetwork, TransportMode};
@@ -46,3 +47,13 @@ pub use workload::{
     SnapshotStats, SwarmProfile, convergence_audit, kv_plan_failure_class, run_kv_plan,
     run_kv_seed, run_kv_seed_with_stats, run_kv_seed_with_storage, swarm_profile,
 };
+
+/// Tallies rare-path hits by name, sorted for deterministic reports.
+#[must_use]
+pub fn count_sometimes(hits: Vec<&'static str>) -> Vec<(String, u64)> {
+    let mut counts = std::collections::BTreeMap::new();
+    for hit in hits {
+        *counts.entry(hit.to_string()).or_insert(0u64) += 1;
+    }
+    counts.into_iter().collect()
+}

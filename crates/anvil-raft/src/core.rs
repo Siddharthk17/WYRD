@@ -11,7 +11,7 @@ use crate::types::{
     ReceivedSnapshot, RecoveredState, Role, RoleChangeEvent, SnapshotChunkData, SnapshotRequest,
     SpecProjection,
 };
-use anvil_types::{Entry, LogIndex, NodeId, Term};
+use anvil_types::{Entry, LogIndex, NodeId, Term, sometimes};
 use bytes::Bytes;
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::Rng;
@@ -294,6 +294,7 @@ impl RaftCore {
                 if self.lead_transferee.is_some() {
                     self.transfer_elapsed = self.transfer_elapsed.saturating_add(1);
                     if self.transfer_elapsed >= self.config.election_timeout_ticks {
+                        sometimes!(output.sometimes_hits, "raft.transfer.aborted");
                         self.lead_transferee = None;
                         self.transfer_elapsed = 0;
                     }
@@ -539,6 +540,9 @@ impl RaftCore {
 
     fn become_leader(&mut self, output: &mut Output) {
         self.transition_role(Role::Leader, output);
+        if self.lead_transferee.is_some() {
+            sometimes!(output.sometimes_hits, "raft.transfer.aborted");
+        }
         self.lead_transferee = None;
         self.transfer_elapsed = 0;
         self.heartbeat_elapsed_ticks = 0;
@@ -719,6 +723,7 @@ impl RaftCore {
                 && let Some(snap) = self.leader_snapshot.as_ref()
                 && let Some(progress) = self.progress.get_mut(&peer)
             {
+                sometimes!(output.sometimes_hits, "raft.snapshot.send.start");
                 let total = u32::try_from(snap.chunks.len()).unwrap_or(u32::MAX);
                 progress.enter_snapshot(snap.last_included_index, total, 0);
             }
@@ -824,6 +829,7 @@ impl RaftCore {
         let Some(data) = snap.chunks.get(slot).cloned() else {
             return;
         };
+        sometimes!(output.sometimes_hits, "raft.snapshot.resend");
         output.messages.push(OutboundMessage {
             to: peer,
             message: Message::InstallSnapshotRequest {
@@ -855,6 +861,7 @@ impl RaftCore {
     ) {
         let mut term_persist_token: Option<PersistToken> = None;
         if term > self.term {
+            sometimes!(output.sometimes_hits, "raft.term.bump.append");
             term_persist_token = self.transition_to_follower(term, output);
         }
 
@@ -955,11 +962,18 @@ impl RaftCore {
             }
         }
 
-        let mut new_match = prev_log_index;
+        let mut new_match = prev_log_index.max(self.log.base_index());
         let mut entries_to_append = Vec::new();
         let mut truncate_from = None;
 
         for entry in entries {
+            if entry.index <= self.log.base_index() {
+                // Already snapshotted: a stale resend of the compacted
+                // prefix (for example after a delayed conflict hint reset
+                // the leader's next index) must be skipped, never appended
+                // past the live tail. The snapshot covers this prefix.
+                continue;
+            }
             if truncate_from.is_some() {
                 entries_to_append.push(entry);
             } else if let Some(existing_term) = self.log.term_at(entry.index) {
@@ -1089,6 +1103,7 @@ impl RaftCore {
             self.maybe_advance_commit(output);
 
             if self.lead_transferee == Some(from) && match_index >= self.log.last_index() {
+                sometimes!(output.sometimes_hits, "raft.transfer.timeoutnow.sent");
                 output.messages.push(OutboundMessage {
                     to: from,
                     message: Message::TimeoutNow {
@@ -1546,6 +1561,7 @@ impl RaftCore {
                 }
                 self.log
                     .install_snapshot(last_included_index, last_included_term);
+                sometimes!(output.sometimes_hits, "raft.snapshot.install.complete");
                 if last_included_index > self.commit_index {
                     self.commit_index = last_included_index;
                 }
@@ -1650,6 +1666,7 @@ impl RaftCore {
                     .get(usize::try_from(resend).unwrap_or(usize::MAX))
                     .cloned()
             {
+                sometimes!(output.sometimes_hits, "raft.snapshot.resend");
                 output.messages.push(OutboundMessage {
                     to: from,
                     message: Message::InstallSnapshotRequest {
@@ -1702,6 +1719,7 @@ impl RaftCore {
 
         if let Some(peer) = self.progress.get(&to) {
             if peer.match_index >= self.log.last_index() {
+                sometimes!(output.sometimes_hits, "raft.transfer.timeoutnow.sent");
                 output.messages.push(OutboundMessage {
                     to,
                     message: Message::TimeoutNow {
@@ -1908,6 +1926,9 @@ impl RaftCore {
         if term_changed {
             self.term = term;
             self.voted_for = None;
+        }
+        if self.lead_transferee.is_some() {
+            sometimes!(output.sometimes_hits, "raft.transfer.aborted");
         }
         self.lead_transferee = None;
         self.transfer_elapsed = 0;

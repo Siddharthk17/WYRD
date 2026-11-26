@@ -21,6 +21,7 @@ use super::atlas::StorageFaultAtlas;
 use crate::rng::DetRng;
 use anvil_storage::{
     CompletionPayload, Device, DeviceCompletion, DeviceOp, FileId, SectorSize, StorageError,
+    format::wal::WAL_RECORD_HEADER_FIXED_LEN,
 };
 use anvil_types::{LogIndex, NodeId};
 use bytes::Bytes;
@@ -434,9 +435,12 @@ impl SimDevice {
     /// All in-flight pending asynchronous completions are dropped.
     pub fn crash(&mut self) {
         self.stats.crash_count += 1;
-        let sector_size = self.config.sector_size.as_u64();
 
-        // 1. Directory entry reconciliation
+        // 1. Directory entry reconciliation. Losing a whole WAL segment
+        // file destroys every frame in it, so the survivability atlas
+        // vetoes dropping a file whose loss would take the last quorum
+        // copies of a committed entry.
+        let mut pending_corruption: Vec<(FileId, u64, LogIndex)> = Vec::new();
         let unsynced_creates: Vec<FileId> = self
             .volatile_files
             .difference(&self.durable_files)
@@ -447,6 +451,7 @@ impl SimDevice {
             if self
                 .rng
                 .bernoulli_ppm(self.config.unsynced_dir_loss_rate_ppm)
+                && !self.wal_file_loss_breaks_quorum(file_id, &mut pending_corruption)
             {
                 self.volatile_files.remove(&file_id);
                 self.files.remove(&file_id);
@@ -468,9 +473,55 @@ impl SimDevice {
             }
         }
 
-        // 2. Per-file dirty sector crash resolution
-        for file_state in self.files.values_mut() {
-            for &s in &file_state.dirty_sectors {
+        // 2. Per-file dirty sector crash resolution. Crash-time fate of a        // WAL sector carrying a committed entry consults the survivability
+        // atlas first: tearing or losing the last quorum copies would halt
+        // the cluster without any repair path, so protected frames persist
+        // whole and every other crash loss is recorded for later vetoes.
+        self.crash_resolve_dirty_sectors(&mut pending_corruption);
+        for (file_id, offset, index) in pending_corruption {
+            self.record_corruption_at(file_id, offset, index);
+        }
+
+        // 3. Drop all pending in-flight completions (process killed)
+        self.pending_completions.clear();
+    }
+
+    /// Resolves dirty sectors file by file after a crash, honoring
+    /// atlas-protected frames. Split from `crash` to keep crash-site
+    /// accounting in one reviewable place.
+    fn crash_resolve_dirty_sectors(
+        &mut self,
+        pending_corruption: &mut Vec<(FileId, u64, LogIndex)>,
+    ) {
+        let sector_size = self.config.sector_size.as_u64();
+        for (file_id, file_state) in &mut self.files {
+            let sector_index = if file_id.is_wal_segment() {
+                Self::wal_dirty_sector_indexes(
+                    &file_state.volatile_data,
+                    sector_size as usize,
+                    &file_state.dirty_sectors,
+                )
+            } else {
+                BTreeMap::new()
+            };
+            let mut protected: BTreeSet<LogIndex> = BTreeSet::new();
+            if let (Some(atlas), Some(node)) = (&self.atlas, self.node_id) {
+                for index in sector_index.values() {
+                    if !atlas.entry_survives_corruption(node, *index) {
+                        protected.insert(*index);
+                    }
+                }
+            }
+            for index in &protected {
+                Self::persist_frame_sectors(
+                    file_state,
+                    sector_size as usize,
+                    &sector_index,
+                    *index,
+                );
+            }
+            let dirty: Vec<u64> = file_state.dirty_sectors.iter().copied().collect();
+            for s in dirty {
                 let start = (s * sector_size) as usize;
                 let end =
                     ((s + 1) * sector_size).min(file_state.volatile_data.len() as u64) as usize;
@@ -493,6 +544,9 @@ impl SimDevice {
                     if mid < end {
                         file_state.durable_data[mid] ^= 0xAA;
                     }
+                    if let Some(index) = sector_index.get(&s) {
+                        pending_corruption.push((*file_id, s * sector_size, *index));
+                    }
                 } else if fate_draw
                     < u64::from(
                         self.config.torn_write_rate_ppm + self.config.unsynced_sector_loss_rate_ppm,
@@ -500,6 +554,9 @@ impl SimDevice {
                 {
                     // Lost sector: do not write to durable disk (retains old state)
                     self.stats.lost_sectors_discarded += 1;
+                    if let Some(index) = sector_index.get(&s) {
+                        pending_corruption.push((*file_id, s * sector_size, *index));
+                    }
                 } else {
                     // Persisted sector: made it to durable media before power cut
                     if file_state.durable_data.len() < end {
@@ -513,9 +570,126 @@ impl SimDevice {
             file_state.dirty_sectors.clear();
             file_state.volatile_data = file_state.durable_data.clone();
         }
+    }
 
-        // 3. Drop all pending in-flight completions (process killed)
-        self.pending_completions.clear();
+    /// Returns true when dropping an unsynced-created file would destroy
+    /// the last quorum copies of a committed entry, in which case the
+    /// directory entry is treated as synced. Records the lost frames when
+    /// the file is dropped so later vetoes stay accurate.
+    fn wal_file_loss_breaks_quorum(
+        &self,
+        file_id: FileId,
+        pending_corruption: &mut Vec<(FileId, u64, LogIndex)>,
+    ) -> bool {
+        let (Some(atlas), Some(node)) = (&self.atlas, self.node_id) else {
+            return false;
+        };
+        if !file_id.is_wal_segment() {
+            return false;
+        }
+        let Some(file) = self.files.get(&file_id) else {
+            return false;
+        };
+        let sector_len = self.config.sector_size.as_usize();
+        if sector_len == 0 {
+            return false;
+        }
+        let sectors: BTreeSet<u64> =
+            (0..file.volatile_data.len().div_ceil(sector_len) as u64).collect();
+        let frame_index = Self::wal_dirty_sector_indexes(&file.volatile_data, sector_len, &sectors);
+        let mut breaks = false;
+        for index in frame_index.values() {
+            if !atlas.entry_survives_corruption(node, *index) {
+                breaks = true;
+                break;
+            }
+        }
+        if breaks {
+            return true;
+        }
+        for (sector, index) in &frame_index {
+            pending_corruption.push((file_id, sector * sector_len as u64, *index));
+        }
+        false
+    }
+
+    /// Maps dirty sectors of a WAL segment file to their owning record index,
+    /// parsed from volatile frame headers. Frames start at sector boundaries
+    /// with sector zero holding the segment header. Sectors whose frame
+    /// header does not decode (partial tail writes, zero padding) map to
+    /// nothing and keep their drawn fate: the record is unrecoverable
+    /// either way.
+    fn wal_dirty_sector_indexes(
+        volatile_data: &[u8],
+        sector_len: usize,
+        dirty: &BTreeSet<u64>,
+    ) -> BTreeMap<u64, LogIndex> {
+        let mut map = BTreeMap::new();
+        if sector_len == 0 {
+            return map;
+        }
+        let mut offset = sector_len;
+        while offset + WAL_RECORD_HEADER_FIXED_LEN <= volatile_data.len() {
+            let mut index_bytes = [0u8; 8];
+            index_bytes.copy_from_slice(&volatile_data[offset..offset + 8]);
+            let raw_index = u64::from_le_bytes(index_bytes);
+            if raw_index == 0 {
+                break;
+            }
+            let mut len_bytes = [0u8; 4];
+            len_bytes.copy_from_slice(&volatile_data[offset + 16..offset + 20]);
+            let payload_len = u32::from_le_bytes(len_bytes) as usize;
+            let frame_len = WAL_RECORD_HEADER_FIXED_LEN.saturating_add(payload_len);
+            let frame_sectors = frame_len.div_ceil(sector_len);
+            if frame_sectors == 0
+                || offset + frame_sectors.saturating_mul(sector_len) > volatile_data.len()
+            {
+                break;
+            }
+            let index = LogIndex::from_raw(raw_index);
+            let first_sector = (offset / sector_len) as u64;
+            for sector in first_sector..first_sector + frame_sectors as u64 {
+                if dirty.contains(&sector) {
+                    map.insert(sector, index);
+                }
+            }
+            offset += frame_sectors * sector_len;
+        }
+        map
+    }
+
+    /// Persists every dirty sector of one record frame, removing them from
+    /// the dirty set so the fate draw skips them. Used for frames the atlas
+    /// protects: tearing or losing them would drop the last quorum copies
+    /// of a committed entry.
+    fn persist_frame_sectors(
+        file: &mut FileState,
+        sector_len: usize,
+        sector_index: &BTreeMap<u64, LogIndex>,
+        index: LogIndex,
+    ) {
+        let sectors: Vec<u64> = sector_index
+            .iter()
+            .filter(|(_, idx)| **idx == index)
+            .map(|(sector, _)| *sector)
+            .collect();
+        for sector in sectors {
+            if !file.dirty_sectors.contains(&sector) {
+                continue;
+            }
+            let start = sector as usize * sector_len;
+            let end = start
+                .saturating_add(sector_len)
+                .min(file.volatile_data.len());
+            if start >= end {
+                continue;
+            }
+            if file.durable_data.len() < end {
+                file.durable_data.resize(end, 0);
+            }
+            file.durable_data[start..end].copy_from_slice(&file.volatile_data[start..end]);
+            file.dirty_sectors.remove(&sector);
+        }
     }
 
     /// Extracts the WAL record index from the head of a frame buffer.

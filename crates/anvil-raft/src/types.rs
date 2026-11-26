@@ -242,6 +242,10 @@ pub struct Output {
     pub role_changes: Vec<RoleChangeEvent>,
     /// Trace events projecting exact TLA+ spec state.
     pub spec_projections: Vec<SpecProjection>,
+    /// Rare protocol paths executed since the last drain, for farm coverage.
+    /// Entries are `&'static str` markers pushed by `sometimes!`; the
+    /// simulator drains them after every step.
+    pub sometimes_hits: Vec<&'static str>,
 }
 
 impl Output {
@@ -261,6 +265,7 @@ impl Output {
         self.ready_snapshots.clear();
         self.role_changes.clear();
         self.spec_projections.clear();
+        self.sometimes_hits.clear();
     }
 }
 

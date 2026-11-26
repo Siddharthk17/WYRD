@@ -41,6 +41,10 @@ struct FarmArgs {
     /// Stop taking new seeds after this many wall-clock seconds (nightly).
     #[arg(long)]
     time_budget_secs: Option<u64>,
+    /// Fail when any registered sometimes-point is never hit. Use on runs
+    /// of at least 100,000 seeds; small runs cannot reach every rare path.
+    #[arg(long, default_value_t = false)]
+    require_sometimes_coverage: bool,
 }
 
 fn main() {
@@ -75,7 +79,18 @@ fn run_farm(args: FarmArgs) {
     };
     let (outcomes, summary) = run_farm_range(range, profile, &options);
     print!("{}", summary.render(profile));
-    if outcomes.iter().any(|outcome| !outcome.ok) {
+    let mut failed = outcomes.iter().any(|outcome| !outcome.ok);
+    if args.require_sometimes_coverage {
+        let missed = summary.sometimes_missed();
+        if !missed.is_empty() {
+            eprintln!(
+                "anvil-sim farm: sometimes coverage incomplete: {}",
+                missed.join(", ")
+            );
+            failed = true;
+        }
+    }
+    if failed {
         std::process::exit(1);
     }
 }
