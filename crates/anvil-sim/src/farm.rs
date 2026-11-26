@@ -64,6 +64,97 @@ pub fn run_farm_seed_with_storage_faults(seed: u64) {
     run_plan(&Plan::generate(seed, true));
 }
 
+/// Runs a single KV seed: full fault model, workload, checker, audit.
+pub fn run_kv_farm_seed(seed: u64) {
+    let (history, audit) = crate::workload::run_kv_seed(seed, false);
+    assert!(audit, "seed {seed}: convergence audit failed");
+    let failure = match anvil_check::check_history(&history) {
+        Ok(()) => None,
+        Err(failure) => Some(failure.json),
+    };
+    assert!(
+        failure.is_none(),
+        "seed {seed}: linearizability violation: {}",
+        failure.unwrap_or_default()
+    );
+}
+
+/// Runs a single KV seed with storage faults on.
+pub fn run_kv_farm_seed_with_storage(seed: u64) {
+    let (history, audit) = crate::workload::run_kv_seed_with_storage(seed, false);
+    assert!(audit, "seed {seed}: convergence audit failed");
+    let failure = match anvil_check::check_history(&history) {
+        Ok(()) => None,
+        Err(failure) => Some(failure.json),
+    };
+    assert!(
+        failure.is_none(),
+        "seed {seed}: linearizability violation: {}",
+        failure.unwrap_or_default()
+    );
+}
+
+/// Executes `num_seeds` KV seeds in parallel across worker threads.
+#[must_use]
+pub fn run_kv_farm(num_seeds: usize, num_threads: usize, storage_faults: bool) -> FarmResult {
+    let start = Instant::now();
+    let passed = Arc::new(AtomicUsize::new(0));
+    let failed_seed = Arc::new(std::sync::Mutex::new(None));
+
+    let threads_count = num_threads.max(1);
+    let chunk_size = num_seeds.div_ceil(threads_count);
+    let mut handles = Vec::with_capacity(threads_count);
+
+    for worker in 0..threads_count {
+        let start_seed = worker * chunk_size;
+        let end_seed = (start_seed + chunk_size).min(num_seeds);
+        let passed_clone = Arc::clone(&passed);
+        let failed_clone = Arc::clone(&failed_seed);
+        let handle = thread::spawn(move || {
+            let mut local_passed = 0usize;
+            let mut local_failed: Option<u64> = None;
+            for seed in start_seed..end_seed {
+                let outcome = std::panic::catch_unwind(|| {
+                    if storage_faults {
+                        run_kv_farm_seed_with_storage(seed as u64);
+                    } else {
+                        run_kv_farm_seed(seed as u64);
+                    }
+                });
+                if outcome.is_ok() {
+                    local_passed += 1;
+                } else if local_failed.is_none() {
+                    local_failed = Some(seed as u64);
+                }
+            }
+            passed_clone.fetch_add(local_passed, Ordering::Relaxed);
+            if let Some(failed) = local_failed {
+                let mut lock = failed_clone
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if lock.is_none_or(|current| failed < current) {
+                    *lock = Some(failed);
+                }
+            }
+        });
+        handles.push(handle);
+    }
+    for handle in handles {
+        let _ = handle.join();
+    }
+    let duration = start.elapsed();
+    let passed_count = passed.load(Ordering::SeqCst);
+    let failed = *failed_seed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    FarmResult {
+        total_seeds: num_seeds,
+        passed_seeds: passed_count,
+        failed_seed: failed,
+        duration,
+    }
+}
+
 /// Executes `num_seeds` simulation seeds in parallel across worker threads.
 #[must_use]
 pub fn run_seed_farm(num_seeds: usize, num_threads: usize) -> FarmResult {

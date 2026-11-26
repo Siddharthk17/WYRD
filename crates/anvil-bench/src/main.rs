@@ -37,9 +37,21 @@ struct Cli {
 
 /// Scratch directory for disk benchmarks, unique per process.
 ///
-/// Uses the OS temporary directory so benchmarks run on any machine. A fixed
-/// repository path would fail on machines without that layout, including CI.
+/// Disk sync benchmarks are meaningless on `tmpfs` (`/tmp`): `fdatasync` is a
+/// no-op there and the sync ceiling inflates by 50x, so the WAL-append ratio
+/// check fails. Prefer `target/bench-scratch` under the current workspace
+/// (real disk when run via `cargo run`), falling back to the OS temp dir
+/// only when the workspace directory is not writable.
 fn bench_scratch_dir(name: &str) -> std::path::PathBuf {
+    if let Ok(cwd) = std::env::current_dir() {
+        let candidate = cwd
+            .join("target")
+            .join("bench-scratch")
+            .join(format!("{name}_{}", std::process::id()));
+        if std::fs::create_dir_all(&candidate).is_ok() {
+            return candidate;
+        }
+    }
     let dir = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create bench scratch dir");
     dir

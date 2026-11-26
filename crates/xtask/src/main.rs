@@ -38,6 +38,9 @@ enum Commands {
         /// Enable storage fault injection (bit rot, torn writes, fsync failures) on every node
         #[arg(long, default_value_t = false)]
         storage_faults: bool,
+        /// Run the Week 4 KV workload farm (workload plus checker plus audit)
+        #[arg(long, default_value_t = false)]
+        kv: bool,
     },
     /// Run performance and instruction-count benchmarks
     Bench,
@@ -70,15 +73,19 @@ enum Commands {
     Release,
 }
 
-fn run_farm_command(seeds: usize, storage_faults: bool) -> ExitCode {
-    if storage_faults {
+fn run_farm_command(seeds: usize, storage_faults: bool, kv: bool) -> ExitCode {
+    if kv {
+        println!("ANVIL KV Seed Farm (workload plus checker plus audit)");
+    } else if storage_faults {
         println!("ANVIL Simulator Seed Farm (storage faults on)");
     } else {
         println!("ANVIL Simulator Seed Farm");
     }
     let threads = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
     println!("Evaluating {seeds} seeds across {threads} parallel worker threads...");
-    let farm = if storage_faults {
+    let farm = if kv {
+        anvil_sim::run_kv_farm(seeds, threads, storage_faults)
+    } else if storage_faults {
         anvil_sim::run_seed_farm_with_storage_faults(seeds, threads)
     } else {
         anvil_sim::run_seed_farm(seeds, threads)
@@ -165,7 +172,8 @@ fn main() -> ExitCode {
         Commands::Farm {
             seeds,
             storage_faults,
-        } => run_farm_command(seeds, storage_faults),
+            kv,
+        } => run_farm_command(seeds, storage_faults, kv),
         Commands::Bench => {
             let status = std::process::Command::new("cargo")
                 .args([
