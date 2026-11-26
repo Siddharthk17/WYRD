@@ -481,15 +481,16 @@ fn test_kv_command_trailing_and_truncated() {
         },
         s_buf.clone(),
     ];
-    for mut buf in cases {
-        buf.push(0xFF);
+    for buf in cases {
+        let mut trailing = buf.clone();
+        trailing.push(0xFF);
         assert!(
-            KvCommand::decode(&buf, 1024, 1024 * 1024).is_err(),
+            KvCommand::decode(&trailing, 1024, 1024 * 1024).is_err(),
             "trailing must fail"
         );
-        let cut = buf.len() / 2;
+        let cut = buf.len().saturating_sub(1).max(1);
         assert!(
-            KvCommand::decode(&buf[..cut.max(1)], 1024, 1024 * 1024).is_err(),
+            KvCommand::decode(&buf[..cut], 1024, 1024 * 1024).is_err() || buf.len() == 1,
             "truncated must fail"
         );
     }

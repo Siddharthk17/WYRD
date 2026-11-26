@@ -586,7 +586,6 @@ fn test_failure_json_covers_result_kinds() {
 
 #[test]
 fn test_list_prefix_mismatch_and_range_variants() {
-    use anvil_check::wgl::check_key_history;
     let mut state = ListState::default();
     let app = HistoryOp {
         id: 0,

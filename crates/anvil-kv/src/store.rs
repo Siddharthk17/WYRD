@@ -410,7 +410,7 @@ impl KvStore {
     /// Decodes a snapshot produced by `encode_snapshot`.
     pub fn decode_snapshot(config: KvConfig, input: &[u8]) -> Result<Self, KvError> {
         let rest = input.strip_prefix(b"ANVKVS02").ok_or(KvError::Decode)?;
-        if rest.len() < 48 {
+        if rest.len() < 56 {
             return Err(KvError::Decode);
         }
         let virtual_tick = u64::from_le_bytes(rest[0..8].try_into().map_err(|_| KvError::Decode)?);
