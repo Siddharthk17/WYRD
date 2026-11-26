@@ -361,7 +361,17 @@ impl SimDevice {
             if self.rng.bernoulli_ppm(self.config.read_corruption_rate_ppm) && corruptible {
                 let corrupted_index =
                     Self::frame_index_at(&read_bytes[corrupt_offset.min(read_bytes.len())..]);
+                // Read-path rot is media damage, not a transient: the flip
+                // lands on durable storage so peer repair observes (and
+                // heals) exactly what recovery observed. A phantom flip in
+                // the returned clone alone would sideline the node for
+                // damage the repair walk can never see.
                 read_bytes[corrupt_offset] ^= 0x3C;
+                if let Some(state) = self.files.get_mut(&file_id)
+                    && corrupt_offset < state.durable_data.len()
+                {
+                    state.durable_data[corrupt_offset] ^= 0x3C;
+                }
                 self.stats.read_corruptions_injected += 1;
                 if let Some(index) = corrupted_index {
                     self.record_corruption_at(file_id, corrupt_offset as u64, index);
