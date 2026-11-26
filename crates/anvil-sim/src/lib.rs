@@ -34,7 +34,8 @@ pub use kernel::{Actor, ActorContext, SimError, SimKernel, SimReport};
 pub use network::{LatencyModel, NetworkDelayHook, NetworkFilterHook, SimNetwork, TransportMode};
 pub use plan::{
     FaultEvent, FaultKind, Plan, PlanError, PlanRunStats, WorkloadSpec, consensus_failure_class,
-    normalize_failure_class, panic_failure_class, run_plan, shrink_plan, shrink_plan_same_class,
+    normalize_failure_class, panic_failure_class, run_plan, run_plan_traced, shrink_plan,
+    shrink_plan_same_class,
 };
 pub use queue::{BinaryHeapEventQueue, EventQueue, HierarchicalTimingWheel, ScheduledEvent};
 pub use raft_invariants::{InvariantViolation, RaftInvariantChecker};
@@ -45,7 +46,8 @@ pub use trace::{TraceEvent, TraceRecorder};
 pub use watchdog::{Watchdog, WatchdogError};
 pub use workload::{
     SnapshotStats, SwarmProfile, convergence_audit, kv_plan_failure_class, run_kv_plan,
-    run_kv_seed, run_kv_seed_with_stats, run_kv_seed_with_storage, swarm_profile,
+    run_kv_plan_traced, run_kv_seed, run_kv_seed_with_stats, run_kv_seed_with_storage,
+    swarm_profile,
 };
 
 /// Tallies rare-path hits by name, sorted for deterministic reports.

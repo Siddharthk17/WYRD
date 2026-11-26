@@ -280,7 +280,44 @@ pub fn run_kv_plan(plan: &Plan, stale_canary: bool) -> (History, bool, SnapshotS
         },
         None => swarm_profile(plan.seed),
     };
-    run_kv_plan_inner(plan.seed, plan, &profile, plan.storage_faults, stale_canary)
+    let (history, audit, stats, _) = run_kv_plan_inner(
+        plan.seed,
+        plan,
+        &profile,
+        plan.storage_faults,
+        stale_canary,
+        false,
+    );
+    (history, audit, stats)
+}
+
+/// Executes a materialized workload plan with the text trace recorder on.
+/// Returns the history, convergence audit, counters, and the trace lines.
+pub fn run_kv_plan_traced(
+    plan: &Plan,
+    stale_canary: bool,
+) -> (History, bool, SnapshotStats, Vec<String>) {
+    let profile = match &plan.workload {
+        Some(workload) => SwarmProfile {
+            clients: workload.clients,
+            keys: workload.keys,
+            ops_per_client: workload.ops_per_client,
+            list_pct: workload.list_pct,
+            think_ticks: workload.think_ticks,
+            timeout_ticks: workload.timeout_ticks,
+            client_crashes: workload.client_crashes,
+            unordered: workload.unordered,
+        },
+        None => swarm_profile(plan.seed),
+    };
+    run_kv_plan_inner(
+        plan.seed,
+        plan,
+        &profile,
+        plan.storage_faults,
+        stale_canary,
+        true,
+    )
 }
 
 /// Failure class of a workload plan: `None` when the run converges and its
@@ -329,7 +366,9 @@ fn run_kv_seed_inner(
         unordered: profile.unordered,
     };
     let plan = Plan::generate_for_workload(seed, storage_faults, workload_spec);
-    run_kv_plan_inner(seed, &plan, &profile, storage_faults, stale_canary)
+    let (history, audit, stats, _) =
+        run_kv_plan_inner(seed, &plan, &profile, storage_faults, stale_canary, false);
+    (history, audit, stats)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -339,7 +378,8 @@ fn run_kv_plan_inner(
     profile: &SwarmProfile,
     storage_faults: bool,
     stale_canary: bool,
-) -> (History, bool, SnapshotStats) {
+    trace: bool,
+) -> (History, bool, SnapshotStats, Vec<String>) {
     let fault_window = FaultWindow::new(&plan);
     let mut cluster = if storage_faults {
         let dev =
@@ -364,6 +404,7 @@ fn run_kv_plan_inner(
         .network
         .set_latency_model(crate::network::LatencyModel::Uniform { min: 0, max: 2 });
     cluster.network.set_bandwidth_per_tick(64);
+    cluster.trace_enabled = trace;
     cluster.plan_net = Some(PlanNet {
         salt: plan.salt,
         drop_pct: plan.drop_pct,
@@ -551,7 +592,8 @@ fn run_kv_plan_inner(
         invariant_checks: cluster.checker.checks(),
         sometimes: crate::count_sometimes(sometimes_hits),
     };
-    (history, audit, stats)
+    let trace = std::mem::take(&mut cluster.trace_lines);
+    (history, audit, stats, trace)
 }
 
 /// Runs one round of post-heal maintenance: heal partitions, resume paused
@@ -724,6 +766,7 @@ fn begin_workload_event(
         }
         FaultKind::DelaySpike { .. } => {}
     }
+    cluster.trace_line(format!("fault begin id={} {:?}", event.id, event.fault));
 }
 
 /// Ends one workload fault event, restoring the pre-event condition.
@@ -776,6 +819,7 @@ fn end_workload_event(
         FaultKind::DelaySpike { .. } => {}
         FaultKind::Transfer { .. } => {}
     }
+    cluster.trace_line(format!("fault end id={} {:?}", event.id, event.fault));
 }
 
 fn key_bytes(list_pct: u64, keys: usize, key_idx: usize) -> (Bytes, bool) {
@@ -1438,6 +1482,7 @@ fn take_snapshot_for(
     }
     let snapped_term = applied_term_for(cluster, id, snap_at);
     cluster.supply_snapshot(id, snap_at, snapped_term, total, digest, data);
+    cluster.trace_line(format!("{id:?} snapshot taken at {snap_at:?}"));
     harness.snapshots_taken = harness.snapshots_taken.saturating_add(1);
     harness.snapshots.insert(id, (snap_at, full.clone()));
     harness.since_entries.insert(id, 0);
@@ -1551,6 +1596,10 @@ fn install_snapshot_state(
     stores.insert(id, restored);
     applied.insert(id, snap.last_included_index);
     applied_terms.insert(id, (snap.last_included_index, snap.last_included_term));
+    cluster.trace_line(format!(
+        "{id:?} snapshot installed at {:?}",
+        snap.last_included_index
+    ));
     harness.last_snapshot.insert(id, snap.last_included_index);
     harness.since_entries.insert(id, 0);
     harness.since_bytes.insert(id, 0);
@@ -1859,7 +1908,23 @@ fn liveness_check(
         }
         assert!(
             advanced,
-            "liveness: fresh write did not commit within 200 ticks after heal (seed {seed})"
+            "liveness: fresh write {need:?} did not commit within 200 ticks after heal (seed {seed} states={})",
+            node_ids
+                .iter()
+                .map(|id| {
+                    let core = cluster.nodes.get(id);
+                    format!(
+                        "{id:?}:leader={}:commit={:?}:applied={:?}:crashed={}:repair={}:refused={}",
+                        cluster.leader() == Some(*id),
+                        core.map(|core| core.commit_index()),
+                        applied.get(id),
+                        cluster.is_node_crashed(*id),
+                        cluster.is_node_needs_repair(*id),
+                        cluster.is_node_refused_start(*id),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
         );
         drain_to_convergence(
             cluster,

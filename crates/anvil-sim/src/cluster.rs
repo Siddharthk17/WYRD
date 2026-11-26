@@ -68,6 +68,16 @@ pub struct SimNodeStorage {
     pub config: StorageConfig,
 }
 
+/// Renders the first four digest bytes as hex for compact trace lines.
+fn short_digest(digest: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(8);
+    for byte in digest.iter().take(4) {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 /// Simulated Raft cluster harness for deterministic consensus testing.
 pub struct SimCluster {
     /// Active Raft consensus cores indexed by node ID.
@@ -109,6 +119,13 @@ pub struct SimCluster {
     /// every core step. The farm aggregates these per seed for the
     /// sometimes-coverage gate.
     pub sometimes_hits: Vec<&'static str>,
+    /// Human-readable trace lines for `anvil-sim trace`. Recorded only when
+    /// `trace_enabled` is set, so farm runs pay nothing.
+    pub trace_enabled: bool,
+    /// Trace lines in emission order, each prefixed with the cluster tick.
+    pub trace_lines: Vec<String>,
+    /// Last emitted spec projection per node, for change-triggered tracing.
+    last_projection: BTreeMap<NodeId, anvil_raft::SpecProjection>,
     /// Per-node tick rate in ticks per mille. 1000 is real time, 500 is half
     /// speed, 2000 is double speed. Models clock drift between 0.5x and 2x.
     pub tick_rate_per_mille: BTreeMap<NodeId, u64>,
@@ -250,6 +267,9 @@ impl SimCluster {
             snapshot_requests: BTreeMap::new(),
             ready_snapshots: BTreeMap::new(),
             sometimes_hits: Vec::new(),
+            trace_enabled: false,
+            trace_lines: Vec::new(),
+            last_projection: BTreeMap::new(),
             last_commit_before_crash: BTreeMap::new(),
             output_scratch: Output::new(),
         }
@@ -588,6 +608,7 @@ impl SimCluster {
                 .extend(extra_reads);
         }
         self.stash_snapshot_outputs(node_id);
+        self.trace_step(node_id);
     }
 
     /// Feeds snapshot bytes the workload encoded from its state machine.
@@ -736,6 +757,7 @@ impl SimCluster {
         self.network
             .in_flight
             .retain(|pkt| pkt.to != node_id && pkt.from != node_id);
+        self.trace_line(format!("{node_id:?} crashed"));
     }
 
     /// Restarts a crashed node: runs `scan_recovery` against the node's `SimDevice`,
@@ -797,9 +819,12 @@ impl SimCluster {
         let mut recovered = match recovery_res {
             Ok(rec) => rec,
             Err(e) => {
-                // Both slots corrupted: refuse to start under ADR 0012
+                // Both slots corrupted: refuse to start under ADR 0012.
+                // The node stays down until Week 6 replaces it, so mark it
+                // crashed: every quorum-based check already skips crashed nodes.
                 storage.refused_start = true;
-                storage.crashed = false;
+                storage.crashed = true;
+                self.trace_line(format!("{node_id:?} restart refused: unrecoverable"));
                 return Err(e);
             }
         };
@@ -814,7 +839,7 @@ impl SimCluster {
                 || (recovered.current_term == max_term && recovered.voted_for != max_vote))
         {
             storage.refused_start = true;
-            storage.crashed = false;
+            storage.crashed = true;
             return Err(StorageError::StaleHardState {
                 recovered_term: recovered.current_term,
                 recovered_vote: recovered.voted_for,
@@ -877,14 +902,27 @@ impl SimCluster {
             LogRecoveryClassification::MidLogCorruption { corrupt_index, .. } => {
                 // Mid-log corruption: marked NeedsRepair, does not vote or lead
                 sometimes!(self.sometimes_hits, "storage.midlog.needsrepair");
-                storage.needs_repair = true;
-                storage.repair_from = Some(*corrupt_index);
-                storage.crashed = false;
+                let failed_index = *corrupt_index;
+                if let Some(storage) = self.storage.get_mut(&node_id) {
+                    storage.needs_repair = true;
+                    storage.repair_from = Some(failed_index);
+                    storage.crashed = false;
+                }
+                self.trace_line(format!(
+                    "{node_id:?} sidelined for repair at {failed_index:?}"
+                ));
                 Ok(recovered)
             }
             LogRecoveryClassification::Clean | LogRecoveryClassification::TornTail { .. } => {
                 // Invariant 2: Recovered log contains all acknowledged entries
+                // that were committed with the acknowledged term. An ack for
+                // a different term (or an uncommitted index) is a stale
+                // record of a legitimately truncated fork, not lost data:
+                // requiring it would make clean restarts impossible.
                 for &(ack_idx, ack_term) in &storage.acknowledged_entries {
+                    if self.checker.committed_term_at(ack_idx) != Some(ack_term) {
+                        continue;
+                    }
                     let entry_opt = recovered.log.entries.iter().find(|e| e.index == ack_idx);
                     assert!(
                         entry_opt.is_some_and(|e| e.term == ack_term),
@@ -962,7 +1000,7 @@ impl SimCluster {
                     &storage.persisted_votes,
                 ) {
                     storage.refused_start = true;
-                    storage.crashed = false;
+                    storage.crashed = true;
                     return Err(StorageError::StaleHardState {
                         recovered_term: recovered.current_term,
                         recovered_vote: recovered.voted_for,
@@ -1038,6 +1076,10 @@ impl SimCluster {
                 storage.refused_start = false;
                 storage.needs_repair = false;
                 storage.repair_from = None;
+                self.trace_line(format!(
+                    "{node_id:?} restarted clean at {:?}",
+                    recovered.log.last_index
+                ));
 
                 self.checker.check_invariants(&self.nodes);
 
@@ -1381,6 +1423,7 @@ impl SimCluster {
     /// Proposes a client command payload to a target node (typically the leader).
     pub fn propose(&mut self, node_id: NodeId, payload: Bytes) {
         if !self.is_node_crashed(node_id) {
+            self.trace_line(format!("{node_id:?} propose {}B", payload.len()));
             self.step_node_internal(node_id, Input::Propose { payload });
         }
     }
@@ -1419,6 +1462,53 @@ impl SimCluster {
     /// Takes completed read results for a node, clearing the buffer.
     pub fn take_completed_reads(&mut self, node: NodeId) -> Vec<anvil_raft::ReadIndexResult> {
         self.completed_reads.remove(&node).unwrap_or_default()
+    }
+
+    /// Appends a timestamped line to the text trace when tracing is on.
+    /// Rendering is plain strings so the trace stays deterministic and
+    /// dependency-free. Takes the owned string because every call site
+    /// formats its line inline.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn trace_line(&mut self, line: String) {
+        if self.trace_enabled {
+            self.trace_lines
+                .push(format!("t={} {line}", self.current_tick));
+        }
+    }
+
+    /// Drains one step's spec projections and role changes into the text
+    /// trace, emitting only transitions (term, role, vote, commit, or log
+    /// digest changed since the node's last line).
+    fn trace_step(&mut self, node_id: NodeId) {
+        if !self.trace_enabled {
+            self.output_scratch.spec_projections.clear();
+            self.output_scratch.role_changes.clear();
+            return;
+        }
+        for change in self.output_scratch.role_changes.drain(..) {
+            self.trace_lines.push(format!(
+                "t={} {node_id:?} role {:?} -> {:?} at {:?}",
+                self.current_tick, change.previous, change.current, change.term
+            ));
+        }
+        for projection in self.output_scratch.spec_projections.drain(..) {
+            let changed = self
+                .last_projection
+                .get(&node_id)
+                .is_none_or(|previous| *previous != projection);
+            if changed {
+                self.trace_lines.push(format!(
+                    "t={} {node_id:?} term={:?} role={:?} vote={:?} commit={:?} log={}",
+                    self.current_tick,
+                    projection.term,
+                    projection.role,
+                    projection.voted_for,
+                    projection.commit_index,
+                    short_digest(&projection.log_digest),
+                ));
+                self.last_projection.insert(node_id, projection);
+            }
+        }
     }
 
     /// Sets a per-node tick rate in ticks per mille (500 to 2000). Models

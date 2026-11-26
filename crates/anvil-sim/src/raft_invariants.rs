@@ -277,6 +277,14 @@ impl RaftInvariantChecker {
         Ok(())
     }
 
+    /// Returns the globally committed term for an index, if any node has
+    /// committed it. Used at restart to tell a stale acknowledgment (for a
+    /// legitimately truncated uncommitted fork) from a lost committed write.
+    #[must_use]
+    pub fn committed_term_at(&self, index: LogIndex) -> Option<Term> {
+        self.committed_terms.get(&index).copied()
+    }
+
     /// 7 & 9. Term monotonicity and vote immutability per term.
     fn check_term_monotonic_and_votes(
         &mut self,

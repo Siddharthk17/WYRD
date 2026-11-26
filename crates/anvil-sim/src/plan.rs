@@ -753,6 +753,12 @@ pub struct PlanRunStats {
 /// election jitter and storage fault draws remain seeded RNG streams, so the
 /// same seed replays identically.
 pub fn run_plan(plan: &Plan) -> PlanRunStats {
+    run_plan_traced(plan, false).0
+}
+
+/// Executes a consensus plan with the text trace recorder on. Returns the
+/// run stats and the trace lines.
+pub fn run_plan_traced(plan: &Plan, trace: bool) -> (PlanRunStats, Vec<String>) {
     use crate::buggify::set_buggify_seed;
     use crate::device::SimDeviceConfig;
     use anvil_storage::SectorSize;
@@ -770,6 +776,7 @@ pub fn run_plan(plan: &Plan) -> PlanRunStats {
         dup_pct: plan.dup_pct,
         max_delay: plan.max_delay,
     });
+    cluster.trace_enabled = trace;
 
     let node_ids: Vec<anvil_types::NodeId> = cluster.nodes.keys().copied().collect();
 
@@ -854,11 +861,12 @@ pub fn run_plan(plan: &Plan) -> PlanRunStats {
         }
     }
 
-    PlanRunStats {
+    let stats = PlanRunStats {
         invariant_checks: cluster.checker.checks(),
         virtual_ticks: cluster.current_tick,
         sometimes: crate::count_sometimes(std::mem::take(&mut cluster.sometimes_hits)),
-    }
+    };
+    (stats, std::mem::take(&mut cluster.trace_lines))
 }
 
 /// Starts one fault event.
@@ -900,6 +908,7 @@ fn begin_event(node_ids: &[anvil_types::NodeId], event: &FaultEvent, cluster: &m
             // the run loop, so overlapping spikes add instead of clobbering.
         }
     }
+    cluster.trace_line(format!("fault begin id={} {:?}", event.id, event.fault));
 }
 
 /// Ends one fault event, restoring the pre-event condition. Partition heals
@@ -947,6 +956,7 @@ fn end_event(
         }
         FaultKind::Transfer { .. } | FaultKind::DelaySpike { .. } => {}
     }
+    cluster.trace_line(format!("fault end id={} {:?}", event.id, event.fault));
 }
 
 /// Collapses digit runs in raw failure text to `#`, capped at a fixed
