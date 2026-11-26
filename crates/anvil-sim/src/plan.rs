@@ -1280,7 +1280,3 @@ fn write_u64(out: &mut [u8], mut value: u64) -> usize {
     }
     len
 }
-
-
-
-
