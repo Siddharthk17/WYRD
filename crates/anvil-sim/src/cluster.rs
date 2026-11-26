@@ -11,7 +11,7 @@
 
 use crate::device::{SimDevice, SimDeviceConfig, StorageFaultAtlas};
 use crate::network::SimNetwork;
-use crate::raft_invariants::RaftInvariantChecker;
+use crate::raft_invariants::{InvariantViolation, RaftInvariantChecker};
 use crate::rng::{DetRng, derive_component_seed};
 use anvil_raft::{
     Input, Message, Output, RaftConfig, RaftCore, ReceivedSnapshot, RecoveredState, Role,
@@ -1043,7 +1043,14 @@ impl SimCluster {
                 // Invariant 3: CommittedNeverLostAcrossCrashes, bounded by the
                 // node's own pre-crash commit index. Entries above it were
                 // uncommitted from this node's perspective and may hold a
-                // legitimate divergent suffix.
+                // legitimate divergent suffix. A mismatch at or below the
+                // bound with a stale acknowledgment is a torn write the
+                // crash exposed: the overwrite reached a quorum in memory
+                // but never reached this disk. The committed archive holds
+                // branch truth, so the node is sidelined for peer-validated
+                // repair instead of rejoining with contradicting bytes.
+                // A mismatch the repair cannot source stays sidelined and
+                // never rejoins, so no silent violation survives.
                 let commit_bound = self
                     .last_commit_before_crash
                     .get(&node_id)
@@ -1054,11 +1061,22 @@ impl SimCluster {
                     &recovered.log.entries,
                     commit_bound,
                 );
-                assert!(
-                    commit_res.is_ok(),
-                    "CommittedNeverLostAcrossCrashes invariant failed: {:?}",
-                    commit_res.err()
-                );
+                if let Err(InvariantViolation::CommittedNeverLostAcrossCrashes {
+                    index: failed_index,
+                    ..
+                }) = commit_res
+                {
+                    sometimes!(self.sometimes_hits, "storage.midlog.needsrepair");
+                    if let Some(storage) = self.storage.get_mut(&node_id) {
+                        storage.needs_repair = true;
+                        storage.repair_from = Some(failed_index);
+                        storage.crashed = false;
+                    }
+                    self.trace_line(format!(
+                        "{node_id:?} sidelined for repair at {failed_index:?} (torn committed write)"
+                    ));
+                    return Ok(recovered);
+                }
 
                 // Re-initialize RaftCore with a restart-aware seed so the
                 // restarted node draws a fresh election-timeout sequence.
@@ -1401,10 +1419,42 @@ impl SimCluster {
         best.map(|(_, term)| term)
     }
 
+    /// Sources branch truth for one frame under repair and encodes it at
+    /// the rebuilt offset, returning the bytes with the chained CRC.
+    /// Returns `None` when no source can supply the index, which aborts
+    /// the file untouched.
+    #[allow(clippy::too_many_arguments)]
+    fn sourced_repair_frame(
+        &self,
+        node_id: NodeId,
+        expected: LogIndex,
+        archive: Option<&BTreeMap<LogIndex, (Term, Option<Bytes>)>>,
+        last_crc: u32,
+        segment_id: u64,
+        offset: u64,
+        sector_size: SectorSize,
+    ) -> Option<(Vec<u8>, u32)> {
+        let entry = self.repair_source(node_id, expected, archive)?;
+        assert!(
+            entry.index == expected,
+            "repair peer returned a different index",
+        );
+        let frame = WalRecordFrame::from_entry(&entry, last_crc, segment_id, offset);
+        let mut frame_bytes = Vec::new();
+        frame.encode_frame(sector_size, &mut frame_bytes);
+        Some((frame_bytes, frame.crc32c))
+    }
+
     /// Repairs one segment file in place, replacing undecodable frames with
     /// committed peer entries and rebuilding an undecodable header from
-    /// known constants, the first frame, and peer terms. Verifies the
-    /// rebuilt layout by re-scanning; any failure leaves the file untouched.
+    /// known constants, the first frame, and peer terms. A frame that
+    /// decodes but disagrees with the committed archive is a stale fork
+    /// the repair must not preserve: implanting only the corrupt tail
+    /// would assemble a log that violates Log Matching (stale prefix
+    /// under branch truth). The replacement re-chains every frame after
+    /// it, so each of those is re-sourced in turn; any frame no source
+    /// can supply aborts the file untouched.
+    /// Verifies the rebuilt layout by re-scanning; any failure leaves the file untouched.
     #[allow(clippy::too_many_lines)]
     fn try_repair_file(
         &mut self,
@@ -1458,52 +1508,55 @@ impl SimCluster {
                     if frame.index != expected {
                         return false;
                     }
-                    rebuilt.extend_from_slice(&data[offset..offset + bytes_consumed]);
-                    last_crc = next_crc;
-                    offset += bytes_consumed;
-                    expected = LogIndex::from_raw(expected.as_u64() + 1);
-                }
-                WalScanResult::Unallocated => break,
-                WalScanResult::Corrupted(_) => {
-                    let Some(entry) = self.repair_source(node_id, expected, archive) else {
-                        return false;
-                    };
-                    assert!(
-                        entry.index == expected,
-                        "repair peer returned a different index",
-                    );
-                    let frame = WalRecordFrame::from_entry(
-                        &entry,
+                    // A valid frame that contradicts the committed archive
+                    // is a stale fork prefix, not branch truth. Keeping it
+                    // under an implanted committed suffix would assemble a
+                    // log no replication could produce, so it is replaced
+                    // exactly like a corrupt frame.
+                    let stale = archive
+                        .as_ref()
+                        .and_then(|archive| archive.get(&expected))
+                        .is_some_and(|(term, _)| *term != frame.term);
+                    if !stale {
+                        rebuilt.extend_from_slice(&data[offset..offset + bytes_consumed]);
+                        last_crc = next_crc;
+                        offset += bytes_consumed;
+                        expected = LogIndex::from_raw(expected.as_u64() + 1);
+                        continue;
+                    }
+                    let Some((frame_bytes, frame_crc)) = self.sourced_repair_frame(
+                        node_id,
+                        expected,
+                        archive,
                         last_crc,
                         header.segment_id,
                         offset as u64,
-                    );
-                    let mut frame_bytes = Vec::new();
-                    frame.encode_frame(sector_size, &mut frame_bytes);
-                    let next_offset = offset + frame_bytes.len();
-                    let layout_ok = match next_offset.cmp(&data.len()) {
-                        std::cmp::Ordering::Equal => true,
-                        std::cmp::Ordering::Greater => false,
-                        std::cmp::Ordering::Less => match decode_wal_frame(
-                            &data[next_offset..],
-                            sector_size,
-                            frame.crc32c,
-                            header.segment_id,
-                            next_offset as u64,
-                        ) {
-                            WalScanResult::Valid { frame: next, .. } => {
-                                next.index.as_u64() == expected.as_u64() + 1
-                            }
-                            WalScanResult::Unallocated => true,
-                            WalScanResult::Corrupted(_) => false,
-                        },
-                    };
-                    if !layout_ok {
+                        sector_size,
+                    ) else {
                         return false;
-                    }
+                    };
                     rebuilt.extend_from_slice(&frame_bytes);
-                    last_crc = frame.crc32c;
-                    offset = next_offset;
+                    last_crc = frame_crc;
+                    offset += frame_bytes.len();
+                    expected = LogIndex::from_raw(expected.as_u64() + 1);
+                    replaced = true;
+                }
+                WalScanResult::Unallocated => break,
+                WalScanResult::Corrupted(_) => {
+                    let Some((frame_bytes, frame_crc)) = self.sourced_repair_frame(
+                        node_id,
+                        expected,
+                        archive,
+                        last_crc,
+                        header.segment_id,
+                        offset as u64,
+                        sector_size,
+                    ) else {
+                        return false;
+                    };
+                    rebuilt.extend_from_slice(&frame_bytes);
+                    last_crc = frame_crc;
+                    offset += frame_bytes.len();
                     expected = LogIndex::from_raw(expected.as_u64() + 1);
                     replaced = true;
                 }
