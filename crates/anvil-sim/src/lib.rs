@@ -25,12 +25,15 @@ pub use buggify::{
 pub use cluster::{InFlightPacket, PlanNet, SimCluster, SimNodeStorage};
 pub use device::{FileState, SimDevice, SimDeviceConfig, SimDeviceStats, StorageFaultAtlas};
 pub use farm::{
-    FarmResult, run_farm_seed, run_farm_seed_with_storage_faults, run_kv_farm, run_kv_farm_seed,
+    FarmOptions, FarmProfile, FarmRange, FarmResult, FarmSummary, SeedOutcome, run_farm_range,
+    run_farm_seed, run_farm_seed_with_storage_faults, run_kv_farm, run_kv_farm_seed,
     run_kv_farm_seed_with_storage, run_seed_farm, run_seed_farm_with_storage_faults,
 };
 pub use kernel::{Actor, ActorContext, SimError, SimKernel, SimReport};
 pub use network::{LatencyModel, NetworkDelayHook, NetworkFilterHook, SimNetwork, TransportMode};
-pub use plan::{FaultEvent, FaultKind, Plan, PlanError, WorkloadSpec, run_plan, shrink_plan};
+pub use plan::{
+    FaultEvent, FaultKind, Plan, PlanError, PlanRunStats, WorkloadSpec, run_plan, shrink_plan,
+};
 pub use queue::{BinaryHeapEventQueue, EventQueue, HierarchicalTimingWheel, ScheduledEvent};
 pub use raft_invariants::{InvariantViolation, RaftInvariantChecker};
 pub use rng::{DetRng, SplitMix64, derive_component_seed};

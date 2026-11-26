@@ -192,6 +192,7 @@ dependencies = [
  "anvil-types",
  "blake3",
  "bytes",
+ "clap",
  "crc32c",
  "proptest",
  "rand_chacha",

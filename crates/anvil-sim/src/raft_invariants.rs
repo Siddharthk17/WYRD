@@ -144,6 +144,9 @@ pub struct RaftInvariantChecker {
     node_votes: BTreeMap<(NodeId, Term), NodeId>,
     /// Set of (term, `entry_index`) committed records.
     committed_terms: BTreeMap<LogIndex, Term>,
+    /// Number of evaluation rounds run. Deterministic bookkeeping only,
+    /// never part of any trace hash.
+    check_count: u64,
 }
 
 impl RaftInvariantChecker {
@@ -157,11 +160,18 @@ impl RaftInvariantChecker {
     ///
     /// Must be called after every transition step of every node in the simulator.
     pub fn check_invariants(&mut self, nodes: &BTreeMap<NodeId, RaftCore>) {
+        self.check_count = self.check_count.saturating_add(1);
         let outcome = self.try_check_invariants(nodes);
         assert!(
             outcome.is_ok(),
             "FATAL RAFT INVARIANT VIOLATION: {outcome:?}"
         );
+    }
+
+    /// Returns how many evaluation rounds have run.
+    #[must_use]
+    pub const fn checks(&self) -> u64 {
+        self.check_count
     }
 
     /// Resets per-node term and vote history after a crash restart.

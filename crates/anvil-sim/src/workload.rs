@@ -247,6 +247,10 @@ pub struct SnapshotStats {
     pub snapshots_taken: u64,
     /// Core-verified snapshots installed into a state machine.
     pub installs: u64,
+    /// Virtual ticks advanced.
+    pub virtual_ticks: u64,
+    /// Invariant evaluation rounds performed.
+    pub invariant_checks: u64,
 }
 
 /// Runs one deterministic KV seed and returns its history.
@@ -476,6 +480,8 @@ fn run_kv_seed_inner(
     let stats = SnapshotStats {
         snapshots_taken: harness.snapshots_taken,
         installs: harness.installs,
+        virtual_ticks: cluster.current_tick,
+        invariant_checks: cluster.checker.checks(),
     };
     (history, audit, stats)
 }

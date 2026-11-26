@@ -674,12 +674,21 @@ fn parse_idx(raw: &str) -> Result<usize, PlanError> {
     usize::try_from(value).map_err(|_| PlanError::BadField("range"))
 }
 
+/// Outcome counters for one consensus-plan run. The farm aggregates these.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlanRunStats {
+    /// Invariant evaluation rounds performed.
+    pub invariant_checks: u64,
+    /// Virtual ticks advanced.
+    pub virtual_ticks: u64,
+}
+
 /// Executes a plan: warm-up with no faults, chaos from the event schedule,
 /// heal with no faults, then a bounded convergence drain and audit.
 /// Network faults are pure hash functions of the plan salt. Consensus
 /// election jitter and storage fault draws remain seeded RNG streams, so the
 /// same seed replays identically.
-pub fn run_plan(plan: &Plan) {
+pub fn run_plan(plan: &Plan) -> PlanRunStats {
     use crate::buggify::set_buggify_seed;
     use crate::device::SimDeviceConfig;
     use anvil_storage::SectorSize;
@@ -778,6 +787,11 @@ pub fn run_plan(plan: &Plan) {
                 }
             }
         }
+    }
+
+    PlanRunStats {
+        invariant_checks: cluster.checker.checks(),
+        virtual_ticks: cluster.current_tick,
     }
 }
 
