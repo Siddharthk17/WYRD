@@ -24,8 +24,9 @@
 //! generator state: network faults come from the plan salt hash, and client
 //! timing comes from the pre-generated schedule.
 
-use crate::cluster::SimCluster;
+use crate::cluster::{PlanNet, SimCluster};
 use crate::device::SimDeviceConfig;
+use crate::plan::{FaultKind, Plan, WorkloadSpec};
 use crate::rng::DetRng;
 use anvil_check::{ClientOp, History, HistoryOp, OpResult};
 use anvil_kv::{KvCommand, KvConfig, KvResponse, KvStore, SnapshotPolicy};
@@ -145,10 +146,12 @@ fn assert_snapshot_equals_replay(
     while idx <= applied {
         if let Some((_, payload)) = archive.get(&LogIndex::from_raw(idx)) {
             if let Some(bytes) = payload {
-                assert!(
-                    replay.apply(LogIndex::from_raw(idx), bytes).is_ok(),
-                    "archived payload must replay cleanly"
-                );
+                // Committed commands can legitimately fail application: a
+                // client may pipeline writes against a session whose
+                // registration was truncated before committing, and every
+                // replica rejects them identically. Only the state hash
+                // must match.
+                let _ = replay.apply(LogIndex::from_raw(idx), bytes);
             }
         }
         idx += 1;
@@ -160,6 +163,24 @@ fn assert_snapshot_equals_replay(
     );
 }
 
+/// Timed plan events flattened into a tick-ordered action list. Built once
+/// before the run; execution draws no generator state.
+struct FaultWindow {
+    actions: Vec<(u64, bool, usize)>,
+}
+
+impl FaultWindow {
+    fn new(plan: &Plan) -> Self {
+        let mut actions = Vec::new();
+        for (index, event) in plan.events.iter().enumerate() {
+            actions.push((event.start, false, index));
+            actions.push((event.end, true, index));
+        }
+        actions.sort_unstable();
+        Self { actions }
+    }
+}
+
 /// Live client session state.
 struct WorkloadClient {
     session: Option<SessionId>,
@@ -167,44 +188,6 @@ struct WorkloadClient {
     acked: u64,
     crashed_until: u64,
     key_versions: BTreeMap<Vec<u8>, u64>,
-}
-
-/// A pre-generated cluster fault: partitions and crashes with heals.
-#[derive(Debug, Clone, Copy)]
-enum KvFault {
-    Isolate { tick: u64, node: usize },
-    Heal { tick: u64 },
-    Crash { tick: u64, node: usize },
-    Restart { tick: u64, node: usize },
-}
-
-fn kv_fault_schedule(seed: u64, size: usize) -> Vec<KvFault> {
-    let mut rng = DetRng::new(seed, "sim/kv-faults");
-    let mut faults = Vec::new();
-    if rng.bernoulli(3, 4) {
-        let node = rng.gen_range(0..size as u64) as usize;
-        let start = rng.gen_range(30..280);
-        let end = start + rng.gen_range(10..40);
-        faults.push(KvFault::Isolate { tick: start, node });
-        faults.push(KvFault::Heal { tick: end });
-    }
-    if rng.bernoulli(1, 2) {
-        let node = rng.gen_range(0..size as u64) as usize;
-        let crash = rng.gen_range(40..260);
-        let restart = crash + rng.gen_range(5..25);
-        faults.push(KvFault::Crash { tick: crash, node });
-        faults.push(KvFault::Restart {
-            tick: restart,
-            node,
-        });
-    }
-    faults.sort_by_key(|fault| match *fault {
-        KvFault::Isolate { tick, .. }
-        | KvFault::Heal { tick }
-        | KvFault::Crash { tick, .. }
-        | KvFault::Restart { tick, .. } => tick,
-    });
-    faults
 }
 
 /// The live replica that has applied the least. A read served from it
@@ -278,6 +261,18 @@ fn run_kv_seed_inner(
     stale_canary: bool,
 ) -> (History, bool, SnapshotStats) {
     let profile = swarm_profile(seed);
+    let workload_spec = WorkloadSpec {
+        clients: profile.clients,
+        keys: profile.keys,
+        ops_per_client: profile.ops_per_client,
+        list_pct: profile.list_pct,
+        think_ticks: profile.think_ticks,
+        timeout_ticks: profile.timeout_ticks,
+        client_crashes: profile.client_crashes,
+        unordered: profile.unordered,
+    };
+    let plan = Plan::generate_for_workload(seed, storage_faults, workload_spec);
+    let fault_window = FaultWindow::new(&plan);
     let mut cluster = if storage_faults {
         let dev =
             SimDeviceConfig::chaotic(anvil_storage::SectorSize::Sector512, 10_000, 5_000, 200);
@@ -301,14 +296,15 @@ fn run_kv_seed_inner(
         .network
         .set_latency_model(crate::network::LatencyModel::Uniform { min: 0, max: 2 });
     cluster.network.set_bandwidth_per_tick(64);
-    cluster.plan_net = Some(crate::cluster::PlanNet {
-        salt: seed,
-        drop_pct: 8,
-        dup_pct: 4,
-        max_delay: 2,
+    cluster.plan_net = Some(PlanNet {
+        salt: plan.salt,
+        drop_pct: plan.drop_pct,
+        dup_pct: plan.dup_pct,
+        max_delay: plan.max_delay,
     });
 
     let node_ids: Vec<NodeId> = cluster.nodes.keys().copied().collect();
+    let mut base_skew = BTreeMap::new();
     for (i, id) in node_ids.iter().enumerate() {
         let rate = match (seed >> (i * 2)) % 4 {
             0 => 500,
@@ -317,6 +313,7 @@ fn run_kv_seed_inner(
             _ => 2000,
         };
         cluster.set_tick_skew(*id, rate);
+        base_skew.insert(*id, rate);
     }
 
     let mut stores: BTreeMap<NodeId, KvStore> = node_ids
@@ -351,7 +348,6 @@ fn run_kv_seed_inner(
     let end_tick = 400;
 
     let mut op_cursor = 0;
-    let faults = kv_fault_schedule(seed, node_ids.len());
     let mut fault_cursor = 0;
     // Canary state: the last two observed register values per key, with the
     // completion tick of the latest write. A canary read returns the older
@@ -376,9 +372,12 @@ fn run_kv_seed_inner(
         &mut harness,
     );
 
-    while tick < end_tick && op_cursor < schedule.len() {
-        let op = &schedule[op_cursor];
-        while tick < op.invoke_tick && tick < end_tick {
+    // Run the full horizon even after the client schedule exhausts: fault
+    // events live in the chaos window and need ticks to fire, and snapshots
+    // need applied entries to trigger.
+    while tick < end_tick {
+        if op_cursor < schedule.len() && tick >= schedule[op_cursor].invoke_tick {
+            let op = &schedule[op_cursor];
             tick = advance_with_faults(
                 &mut cluster,
                 &mut stores,
@@ -386,62 +385,65 @@ fn run_kv_seed_inner(
                 &mut applied_terms,
                 &mut harness,
                 &node_ids,
-                &faults,
+                &plan,
+                &fault_window,
+                &base_skew,
+                &mut fault_cursor,
+                tick,
+            );
+            execute_scheduled(
+                &mut cluster,
+                &mut stores,
+                &mut applied,
+                &mut applied_terms,
+                &mut harness,
+                &mut clients,
+                &profile,
+                list_pct,
+                op,
+                &mut history,
+                tick,
+                stale_canary,
+                &mut canary_last,
+                &mut canary_prev,
+            );
+            op_cursor += 1;
+            cluster.tick();
+            tick += 1;
+            apply_all(
+                &mut cluster,
+                &mut stores,
+                &mut applied,
+                &mut applied_terms,
+                &mut harness,
+            );
+            snapshot_maintenance(
+                &mut cluster,
+                &mut stores,
+                &mut applied,
+                &mut applied_terms,
+                &mut harness,
+            );
+        } else {
+            tick = advance_with_faults(
+                &mut cluster,
+                &mut stores,
+                &mut applied,
+                &mut applied_terms,
+                &mut harness,
+                &node_ids,
+                &plan,
+                &fault_window,
+                &base_skew,
                 &mut fault_cursor,
                 tick,
             );
         }
-        if tick >= end_tick {
-            break;
-        }
-        tick = advance_with_faults(
-            &mut cluster,
-            &mut stores,
-            &mut applied,
-            &mut applied_terms,
-            &mut harness,
-            &node_ids,
-            &faults,
-            &mut fault_cursor,
-            tick,
-        );
-        execute_scheduled(
-            &mut cluster,
-            &mut stores,
-            &mut applied,
-            &mut applied_terms,
-            &mut harness,
-            &mut clients,
-            &profile,
-            list_pct,
-            op,
-            &mut history,
-            tick,
-            stale_canary,
-            &mut canary_last,
-            &mut canary_prev,
-        );
-        op_cursor += 1;
-        cluster.tick();
-        tick += 1;
-        apply_all(
-            &mut cluster,
-            &mut stores,
-            &mut applied,
-            &mut applied_terms,
-            &mut harness,
-        );
-        snapshot_maintenance(
-            &mut cluster,
-            &mut stores,
-            &mut applied,
-            &mut applied_terms,
-            &mut harness,
-        );
     }
 
     cluster.plan_net = None;
     cluster.heal_all();
+    heal_step(&mut cluster, &node_ids, &base_skew);
     snapshot_maintenance(
         &mut cluster,
         &mut stores,
@@ -455,6 +457,19 @@ fn run_kv_seed_inner(
         &mut applied,
         &mut applied_terms,
         &mut harness,
+        &node_ids,
+        &base_skew,
+    );
+
+    liveness_check(
+        &mut cluster,
+        &mut stores,
+        &mut applied,
+        &mut applied_terms,
+        &mut harness,
+        &node_ids,
+        &base_skew,
+        seed,
     );
 
     let audit = convergence_audit(&cluster, &stores, &applied);
@@ -463,6 +478,28 @@ fn run_kv_seed_inner(
         installs: harness.installs,
     };
     (history, audit, stats)
+}
+
+/// Runs one round of post-heal maintenance: heal partitions, resume paused
+/// nodes, restore base tick rates, and restart crashed nodes that can
+/// restart. Storage faults can crash nodes at any time, so convergence and
+/// liveness loops repeat this instead of relying on a single heal.
+fn heal_step(cluster: &mut SimCluster, node_ids: &[NodeId], base_skew: &BTreeMap<NodeId, u64>) {
+    cluster.heal_all();
+    for id in node_ids.iter().copied() {
+        if cluster.is_paused(id) {
+            cluster.resume_node(id);
+        }
+        if let Some(base) = base_skew.get(&id) {
+            cluster.set_tick_skew(id, *base);
+        }
+        if cluster.is_node_crashed(id)
+            && !cluster.is_node_needs_repair(id)
+            && !cluster.is_node_refused_start(id)
+        {
+            let _ = cluster.restart_node(id);
+        }
+    }
 }
 
 /// Ticks a healed cluster until every live replica shares the same commit
@@ -474,8 +511,11 @@ fn drain_to_convergence(
     applied: &mut BTreeMap<NodeId, LogIndex>,
     applied_terms: &mut BTreeMap<NodeId, (LogIndex, anvil_types::Term)>,
     harness: &mut SnapshotHarness,
+    node_ids: &[NodeId],
+    base_skew: &BTreeMap<NodeId, u64>,
 ) {
     for _ in 0..500 {
+        heal_step(cluster, node_ids, base_skew);
         cluster.tick();
         apply_all(cluster, stores, applied, applied_terms, harness);
         snapshot_maintenance(cluster, stores, applied, applied_terms, harness);
@@ -504,7 +544,8 @@ fn drain_to_convergence(
     }
 }
 
-/// Advances one outer tick, firing any due pre-generated faults first.
+/// Advances one outer tick, firing any due pre-generated plan faults first.
+#[allow(clippy::too_many_arguments)]
 fn advance_with_faults(
     cluster: &mut SimCluster,
     stores: &mut BTreeMap<NodeId, KvStore>,
@@ -512,48 +553,136 @@ fn advance_with_faults(
     applied_terms: &mut BTreeMap<NodeId, (LogIndex, anvil_types::Term)>,
     harness: &mut SnapshotHarness,
     node_ids: &[NodeId],
-    faults: &[KvFault],
+    plan: &Plan,
+    fault_window: &FaultWindow,
+    base_skew: &BTreeMap<NodeId, u64>,
     fault_cursor: &mut usize,
     tick: u64,
 ) -> u64 {
-    while *fault_cursor < faults.len() {
-        let due = match faults[*fault_cursor] {
-            KvFault::Isolate { tick: ft, .. }
-            | KvFault::Heal { tick: ft }
-            | KvFault::Crash { tick: ft, .. }
-            | KvFault::Restart { tick: ft, .. } => ft <= tick,
-        };
-        if !due {
+    while *fault_cursor < fault_window.actions.len() {
+        let (at, is_end, index) = fault_window.actions[*fault_cursor];
+        if at > tick {
             break;
         }
-        match faults[*fault_cursor] {
-            KvFault::Isolate { node, .. } => {
-                if let Some(id) = node_ids.get(node) {
-                    let peers: Vec<NodeId> = node_ids.to_vec();
-                    cluster.network.isolate(*id, &peers);
-                }
-            }
-            KvFault::Heal { .. } => cluster.network.heal_all(),
-            KvFault::Crash { node, .. } => {
-                if let Some(id) = node_ids.get(node) {
-                    cluster.crash_node(*id);
-                }
-            }
-            KvFault::Restart { node, .. } => {
-                if let Some(id) = node_ids.get(node)
-                    && !cluster.is_node_needs_repair(*id)
-                    && !cluster.is_node_refused_start(*id)
-                {
-                    let _ = cluster.restart_node(*id);
-                }
-            }
+        let event = &plan.events[index];
+        if is_end {
+            end_workload_event(cluster, node_ids, plan, tick, event, base_skew);
+        } else {
+            begin_workload_event(cluster, node_ids, event);
         }
         *fault_cursor += 1;
     }
+    let spike: u64 = plan
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(event.fault, FaultKind::DelaySpike { .. })
+                && event.start <= tick
+                && tick < event.end
+        })
+        .map(|event| match event.fault {
+            FaultKind::DelaySpike { extra_ticks } => extra_ticks,
+            _ => 0,
+        })
+        .sum();
+    cluster.plan_net = Some(PlanNet {
+        salt: plan.salt,
+        drop_pct: plan.drop_pct,
+        dup_pct: plan.dup_pct,
+        max_delay: plan.max_delay.saturating_add(spike),
+    });
     cluster.tick();
     apply_all(cluster, stores, applied, applied_terms, harness);
     snapshot_maintenance(cluster, stores, applied, applied_terms, harness);
     tick + 1
+}
+
+/// Starts one workload fault event.
+fn begin_workload_event(
+    cluster: &mut SimCluster,
+    node_ids: &[NodeId],
+    event: &crate::plan::FaultEvent,
+) {
+    let at = |member: usize| node_ids[member % node_ids.len()];
+    match event.fault {
+        FaultKind::Partition { member } => {
+            if let Some(id) = node_ids.get(member) {
+                let peers: Vec<NodeId> = node_ids.to_vec();
+                cluster.network.isolate(*id, &peers);
+            }
+        }
+        FaultKind::Asymmetric { from, to } => {
+            cluster.network.cut_one_way(at(from), at(to));
+        }
+        FaultKind::Crash { node } => {
+            if let Some(id) = node_ids.get(node) {
+                cluster.crash_node(*id);
+            }
+        }
+        FaultKind::Pause { node } => {
+            if let Some(id) = node_ids.get(node) {
+                cluster.pause_node(*id);
+            }
+        }
+        FaultKind::SlowClock {
+            node,
+            rate_per_mille,
+        } => {
+            if let Some(id) = node_ids.get(node) {
+                cluster.set_tick_skew(*id, rate_per_mille);
+            }
+        }
+        FaultKind::DelaySpike { .. } => {}
+    }
+}
+
+/// Ends one workload fault event, restoring the pre-event condition.
+#[allow(clippy::too_many_arguments)]
+fn end_workload_event(
+    cluster: &mut SimCluster,
+    node_ids: &[NodeId],
+    plan: &Plan,
+    tick: u64,
+    event: &crate::plan::FaultEvent,
+    base_skew: &BTreeMap<NodeId, u64>,
+) {
+    match event.fault {
+        FaultKind::Partition { .. } | FaultKind::Asymmetric { .. } => {
+            let other_cuts = plan.events.iter().any(|other| {
+                other.id != event.id
+                    && matches!(
+                        other.fault,
+                        FaultKind::Partition { .. } | FaultKind::Asymmetric { .. }
+                    )
+                    && other.start <= tick
+                    && tick < other.end
+            });
+            if !other_cuts {
+                cluster.network.heal_all();
+            }
+        }
+        FaultKind::Crash { node } => {
+            if let Some(id) = node_ids.get(node)
+                && !cluster.is_node_needs_repair(*id)
+                && !cluster.is_node_refused_start(*id)
+            {
+                let _ = cluster.restart_node(*id);
+            }
+        }
+        FaultKind::Pause { node } => {
+            if let Some(id) = node_ids.get(node)
+                && cluster.is_paused(*id)
+            {
+                cluster.resume_node(*id);
+            }
+        }
+        FaultKind::SlowClock { node, .. } => {
+            if let Some(id) = node_ids.get(node) {
+                cluster.set_tick_skew(*id, base_skew.get(id).copied().unwrap_or(1000));
+            }
+        }
+        FaultKind::DelaySpike { .. } => {}
+    }
 }
 
 fn key_bytes(list_pct: u64, keys: usize, key_idx: usize) -> (Bytes, bool) {
@@ -1517,8 +1646,113 @@ fn observe_read(
     }
 }
 
-/// After the heal phase, every live replica must agree on applied index and
-/// state hash.
+/// Liveness checks after the heal phase. A leader must exist within ten
+/// times the maximum election timeout, and a fresh client write must commit
+/// within a bounded virtual time. Anything else is a violation with
+/// diagnostics: the assertion message carries the seed and the stuck state.
+#[allow(clippy::too_many_arguments)]
+fn liveness_check(
+    cluster: &mut SimCluster,
+    stores: &mut BTreeMap<NodeId, KvStore>,
+    applied: &mut BTreeMap<NodeId, LogIndex>,
+    applied_terms: &mut BTreeMap<NodeId, (LogIndex, anvil_types::Term)>,
+    harness: &mut SnapshotHarness,
+    node_ids: &[NodeId],
+    base_skew: &BTreeMap<NodeId, u64>,
+    seed: u64,
+) {
+    let mut waited = 0u64;
+    while cluster.leader().is_none() && waited < 100 {
+        heal_step(cluster, node_ids, base_skew);
+        cluster.tick();
+        waited += 1;
+        apply_all(cluster, stores, applied, applied_terms, harness);
+        snapshot_maintenance(cluster, stores, applied, applied_terms, harness);
+    }
+    assert!(
+        cluster.leader().is_some(),
+        "liveness: no leader within 100 ticks after heal (seed {seed})"
+    );
+    if let Some(leader) = cluster.leader() {
+        let tick_now = stores
+            .get(&leader)
+            .map_or(0, anvil_kv::KvStore::virtual_tick);
+        let mut probe = Vec::new();
+        KvCommand::ClockTick {
+            tick: tick_now.saturating_add(1),
+        }
+        .encode(&mut probe);
+        // Re-propose on leader change: a probe committed anywhere is durable
+        // and every future leader carries it, while an uncommitted probe needs
+        // a fresh proposal on the current leader, exactly like a client retry.
+        // The tick value is constant so retries never run virtual time forward.
+        // The probe index, not the pre-probe commit, is the bar: followers
+        // that merely re-reach the old commit would pass a stale comparison
+        // while still missing the fresh write. Convergence is re-checked with
+        // the drain afterwards so applied indexes even out before the audit.
+        cluster.propose(leader, Bytes::copy_from_slice(&probe));
+        let mut need = cluster
+            .nodes
+            .get(&leader)
+            .map_or(LogIndex::from_raw(0), |core| core.last_log_index());
+        let mut advanced = false;
+        waited = 0;
+        while waited < 200 {
+            heal_step(cluster, node_ids, base_skew);
+            cluster.tick();
+            waited += 1;
+            apply_all(cluster, stores, applied, applied_terms, harness);
+            snapshot_maintenance(cluster, stores, applied, applied_terms, harness);
+            let converged = cluster.nodes.keys().copied().all(|id| {
+                cluster.is_node_crashed(id)
+                    || cluster
+                        .nodes
+                        .get(&id)
+                        .is_some_and(|core| core.commit_index() >= need)
+            });
+            if converged && cluster.leader().is_some() {
+                advanced = true;
+                break;
+            }
+            if let Some(current) = cluster.leader() {
+                // Re-propose only when the current leader lost the probe
+                // (leadership changed and the uncommitted tail went with it):
+                // as long as some leader holds it, waiting is correct and
+                // re-proposing would only chase the bar upward.
+                let lost = cluster
+                    .nodes
+                    .get(&current)
+                    .is_none_or(|core| core.last_log_index() < need);
+                if lost {
+                    cluster.propose(current, Bytes::copy_from_slice(&probe));
+                    need = cluster
+                        .nodes
+                        .get(&current)
+                        .map_or(need, |core| core.last_log_index());
+                }
+            }
+        }
+        assert!(
+            advanced,
+            "liveness: fresh write did not commit within 200 ticks after heal (seed {seed})"
+        );
+        drain_to_convergence(
+            cluster,
+            stores,
+            applied,
+            applied_terms,
+            harness,
+            &cluster.nodes.keys().copied().collect::<Vec<_>>(),
+            &cluster
+                .nodes
+                .keys()
+                .copied()
+                .map(|id| (id, cluster.tick_rate(id)))
+                .collect::<BTreeMap<_, _>>(),
+        );
+    }
+}
+
 pub fn convergence_audit(
     cluster: &SimCluster,
     stores: &BTreeMap<NodeId, KvStore>,

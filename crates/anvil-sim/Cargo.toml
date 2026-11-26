@@ -23,6 +23,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+crc32c = { workspace = true }
 
 [lints]
 workspace = true

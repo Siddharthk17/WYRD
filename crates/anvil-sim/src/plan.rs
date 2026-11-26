@@ -10,6 +10,13 @@
 //! seed replays identically. Any failure replays exactly from the plan
 //! encoding, and the shrinker reduces a failing plan while preserving the
 //! failure.
+//!
+//! Fault generation uses swarm testing: each seed enables a random subset of
+//! fault classes at random intensities. At least thirty percent of seeds
+//! enable only one or two classes, and some seeds run everything at once.
+//! Every event carries a stable id and draws its parameters from a
+//! per-event stream keyed by that id, so removing one event never reshuffles
+//! the others and delta-debugging stays sound.
 
 use crate::cluster::{PlanNet, SimCluster};
 use crate::rng::DetRng;
@@ -19,31 +26,67 @@ use std::fmt::Write as _;
 use std::panic::AssertUnwindSafe;
 
 /// Current plan encoding version.
-pub const PLAN_VERSION: u32 = 1;
+pub const PLAN_VERSION: u32 = 2;
 
 /// Upper bound accepted for tick counts and entry lists on decode.
 const PLAN_LIMIT: u64 = 100_000;
 
-/// A scheduled network partition of one member.
+/// Upper bound on fault events in one plan.
+const MAX_EVENTS: usize = 64;
+
+/// One timed fault. `id` is stable across shrinks; all parameters come from
+/// the per-event stream keyed by `(seed, id)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlanPartition {
-    /// First tick with traffic cut.
+pub struct FaultEvent {
+    /// Stable per-plan event id.
+    pub id: u32,
+    /// First tick the fault is active.
     pub start: u64,
-    /// First tick with traffic restored.
+    /// First tick the fault is lifted.
     pub end: u64,
-    /// Index into the cluster's initial node ordering.
-    pub member: usize,
+    /// What the fault does.
+    pub fault: FaultKind,
 }
 
-/// A scheduled crash and restart of one member.
+/// Fault vocabulary: network, process, clock, and disk faults.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlanCrash {
-    /// Tick on which the node crashes.
-    pub crash_tick: u64,
-    /// Tick on which the node restarts.
-    pub restart_tick: u64,
-    /// Index into the cluster's initial node ordering.
-    pub node_idx: usize,
+pub enum FaultKind {
+    /// Cut both directions of one member's links.
+    Partition { member: usize },
+    /// Cut one direction of a link.
+    Asymmetric { from: usize, to: usize },
+    /// Crash a node; it restarts at the event end.
+    Crash { node: usize },
+    /// Pause a node with stale timers firing on resume.
+    Pause { node: usize },
+    /// Skew one node's tick rate in ticks per mille (500 to 2000).
+    SlowClock { node: usize, rate_per_mille: u64 },
+    /// Add delivery delay in ticks while active.
+    DelaySpike { extra_ticks: u64 },
+}
+
+/// Swarm client-profile parameters. The client operation list expands
+/// deterministically from `(seed, profile)` before the run starts, so the
+/// profile is the materialized form of the workload choice. The fields
+/// mirror the workload's swarm profile one to one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkloadSpec {
+    /// Number of clients.
+    pub clients: usize,
+    /// Key space size.
+    pub keys: usize,
+    /// Operations per client.
+    pub ops_per_client: usize,
+    /// Percentage of list-append keys.
+    pub list_pct: u64,
+    /// Think ticks between operations.
+    pub think_ticks: u64,
+    /// Timeout ticks before an operation is indeterminate.
+    pub timeout_ticks: u64,
+    /// Whether clients crash mid-run.
+    pub client_crashes: bool,
+    /// Whether the unordered transport is used.
+    pub unordered: bool,
 }
 
 /// A materialized fault schedule and workload for one deterministic run.
@@ -59,10 +102,12 @@ pub struct Plan {
     pub ticks: u64,
     /// Ticks carrying a client proposal when a leader exists.
     pub proposals: Vec<u64>,
-    /// Scheduled partitions.
-    pub partitions: Vec<PlanPartition>,
-    /// Scheduled crashes.
-    pub crashes: Vec<PlanCrash>,
+    /// Ticks at or below this carry no faults (warm-up).
+    pub warmup_end: u64,
+    /// Ticks at or above this carry no faults (heal).
+    pub heal_start: u64,
+    /// Timed fault events, sorted by `(start, id)`.
+    pub events: Vec<FaultEvent>,
     /// Network drop percentage in `[0, 100]`.
     pub drop_pct: u64,
     /// Network duplicate percentage in `[0, 100]`.
@@ -73,6 +118,8 @@ pub struct Plan {
     pub salt: u64,
     /// Storage fault injection enabled for the run.
     pub storage_faults: bool,
+    /// Swarm workload parameters, if this plan drives a KV run.
+    pub workload: Option<WorkloadSpec>,
 }
 
 /// Failure to decode a plan encoding.
@@ -89,44 +136,130 @@ pub enum PlanError {
     BadField(&'static str),
 }
 
+/// Fault classes the swarm sampler enables per seed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FaultClass {
+    Partition,
+    Asymmetric,
+    Crash,
+    Pause,
+    Clock,
+    Delay,
+    Loss,
+}
+
+impl FaultClass {
+    const ALL: [Self; 7] = [
+        Self::Partition,
+        Self::Asymmetric,
+        Self::Crash,
+        Self::Pause,
+        Self::Clock,
+        Self::Delay,
+        Self::Loss,
+    ];
+}
+
 impl Plan {
-    /// Generates the canonical plan for a seed. All sampling happens here,
-    /// through an isolated `DetRng` stream, before the run starts.
+    /// Generates the canonical plan for a seed: a short consensus run with
+    /// no workload profile. All sampling happens here, through isolated
+    /// `DetRng` streams, before the run starts.
     #[must_use]
     pub fn generate(seed: u64, storage_faults: bool) -> Self {
-        let mut rng = DetRng::new(seed, "sim/plan");
+        let mut rng = DetRng::new(seed, "sim/plan/size");
         let sizes = [3, 5, 7];
         let size_idx = usize::try_from(rng.gen_range(0..3)).unwrap_or(0);
         let cluster_size = sizes[size_idx % sizes.len()];
-        let ticks = 30;
+        Self::generate_inner(seed, storage_faults, 30, None, cluster_size)
+    }
+
+    /// Generates a workload plan: a longer run whose client operations expand
+    /// from the embedded swarm profile.
+    #[must_use]
+    pub fn generate_for_workload(seed: u64, storage_faults: bool, workload: WorkloadSpec) -> Self {
+        // The KV workload always runs three nodes.
+        Self::generate_inner(seed, storage_faults, 400, Some(workload), 3)
+    }
+
+    fn generate_inner(
+        seed: u64,
+        storage_faults: bool,
+        ticks: u64,
+        workload: Option<WorkloadSpec>,
+        cluster_size: usize,
+    ) -> Self {
+        let mut rng = DetRng::new(seed, "sim/plan");
+        let warmup_end = (ticks / 8).max(5);
+        let heal_start = ticks.saturating_sub(ticks / 8).max(warmup_end + 1);
+
+        let classes = Self::pick_classes(&mut rng);
+        let lossy = classes.contains(&FaultClass::Loss);
+        let (drop_pct, dup_pct, max_delay) = if lossy {
+            (
+                rng.gen_range(0..16),
+                rng.gen_range(0..10),
+                rng.gen_range(0..6),
+            )
+        } else {
+            (0, 0, rng.gen_range(0..3))
+        };
+
+        let mut events = Vec::new();
+        let mut next_id = 0u32;
+        for class in &classes {
+            if *class == FaultClass::Loss {
+                continue;
+            }
+            let count = match class {
+                FaultClass::Crash => rng.gen_range(1..3),
+                _ => rng.gen_range(0..3),
+            };
+            for _ in 0..count {
+                if events.len() >= MAX_EVENTS {
+                    break;
+                }
+                let id = next_id;
+                next_id = next_id.saturating_add(1);
+                let mut erng = DetRng::new(seed, &format!("sim/plan/event/{id}"));
+                let span = heal_start.saturating_sub(warmup_end + 1).max(1);
+                let start = warmup_end + 1 + erng.gen_range(0..span) % span;
+                let len = 2 + erng.gen_range(0..span / 2 + 2);
+                let end = (start + len).min(heal_start);
+                let fault = Self::sample_fault(*class, cluster_size, &mut erng);
+                events.push(FaultEvent {
+                    id,
+                    start,
+                    end,
+                    fault,
+                });
+            }
+        }
+        // Every fourth workload seed runs a partition spanning the whole
+        // chaos window. Short faults rarely push a follower more than the
+        // retain window behind a compacted leader, so without a long
+        // partition the snapshot-install path would almost never execute.
+        // It is an ordinary event: serializable, shrinkable, and drawn at
+        // generation time like everything else.
+        if workload.is_some() && seed.is_multiple_of(4) {
+            let id = next_id;
+            let member =
+                usize::try_from(rng.gen_range(0..cluster_size as u64)).unwrap_or(0) % cluster_size;
+            events.push(FaultEvent {
+                id,
+                start: warmup_end + 1,
+                end: heal_start,
+                fault: FaultKind::Partition { member },
+            });
+        }
+        events.sort_by_key(|event| (event.start, event.id));
+
         let mut proposals = Vec::new();
-        let mut tick = 6;
+        let mut tick = warmup_end + 1;
         while tick <= ticks {
             proposals.push(tick);
             tick += 6;
         }
-        let mut partitions = Vec::new();
-        if cluster_size > 3 {
-            let member_raw = rng.gen_range(0..cluster_size as u64);
-            let member = usize::try_from(member_raw).unwrap_or(0) % cluster_size;
-            partitions.push(PlanPartition {
-                start: 12,
-                end: 20,
-                member,
-            });
-        }
-        let victim_raw = rng.gen_range(0..cluster_size as u64);
-        let victim = usize::try_from(victim_raw).unwrap_or(0) % cluster_size;
-        let crash_tick = rng.gen_range(10..16);
-        let restart_tick = crash_tick + rng.gen_range(2..6);
-        let crashes = vec![PlanCrash {
-            crash_tick,
-            restart_tick,
-            node_idx: victim,
-        }];
-        let drop_pct = rng.gen_range(0..16);
-        let dup_pct = rng.gen_range(0..10);
-        let max_delay = rng.gen_range(0..6);
+
         let salt = rng.next_u64();
         Self {
             version: PLAN_VERSION,
@@ -134,13 +267,79 @@ impl Plan {
             cluster_size,
             ticks,
             proposals,
-            partitions,
-            crashes,
+            warmup_end,
+            heal_start,
+            events,
             drop_pct,
             dup_pct,
             max_delay,
             salt,
             storage_faults,
+            workload,
+        }
+    }
+
+    /// Swarm class selection: at least thirty percent of seeds run one or
+    /// two classes, a few run everything, the rest run a random subset.
+    fn pick_classes(rng: &mut DetRng) -> Vec<FaultClass> {
+        let roll = rng.gen_range(0..100);
+        if roll < 30 {
+            let a = usize::try_from(rng.gen_range(0..7)).unwrap_or(0);
+            let mut out = vec![FaultClass::ALL[a % 7]];
+            if rng.gen_range(0..2) == 0 {
+                let b = usize::try_from(rng.gen_range(0..7)).unwrap_or(0);
+                let class = FaultClass::ALL[b % 7];
+                if !out.contains(&class) {
+                    out.push(class);
+                }
+            }
+            out
+        } else if roll < 40 {
+            FaultClass::ALL.to_vec()
+        } else {
+            let mut out = Vec::new();
+            for class in FaultClass::ALL {
+                if rng.gen_range(0..2) == 0 {
+                    out.push(class);
+                }
+            }
+            if out.is_empty() {
+                out.push(FaultClass::Crash);
+            }
+            out
+        }
+    }
+
+    fn sample_fault(class: FaultClass, cluster_size: usize, rng: &mut DetRng) -> FaultKind {
+        let member = |rng: &mut DetRng| {
+            usize::try_from(rng.gen_range(0..cluster_size as u64)).unwrap_or(0) % cluster_size
+        };
+        match class {
+            FaultClass::Partition => FaultKind::Partition {
+                member: member(rng),
+            },
+            FaultClass::Asymmetric => {
+                let from = member(rng);
+                let mut to = member(rng);
+                if to == from {
+                    to = (to + 1) % cluster_size;
+                }
+                FaultKind::Asymmetric { from, to }
+            }
+            FaultClass::Crash => FaultKind::Crash { node: member(rng) },
+            FaultClass::Pause => FaultKind::Pause { node: member(rng) },
+            FaultClass::Clock => {
+                let rates = [500u64, 750, 1000, 1500, 2000];
+                let pick = usize::try_from(rng.gen_range(0..5)).unwrap_or(0);
+                FaultKind::SlowClock {
+                    node: member(rng),
+                    rate_per_mille: rates[pick % rates.len()],
+                }
+            }
+            FaultClass::Delay => FaultKind::DelaySpike {
+                extra_ticks: rng.gen_range(2..12),
+            },
+            FaultClass::Loss => FaultKind::DelaySpike { extra_ticks: 0 },
         }
     }
 
@@ -148,11 +347,13 @@ impl Plan {
     #[must_use]
     pub fn encode(&self) -> String {
         let mut out = format!(
-            "anvil-plan/{};seed={};size={};ticks={};net={},{},{};salt={};storage={}",
+            "anvil-plan/{};seed={};size={};ticks={};warm={};heal={};net={},{},{};salt={};storage={}",
             self.version,
             self.seed,
             self.cluster_size,
             self.ticks,
+            self.warmup_end,
+            self.heal_start,
             self.drop_pct,
             self.dup_pct,
             self.max_delay,
@@ -170,14 +371,21 @@ impl Plan {
                     .join(","),
             );
         }
-        for part in &self.partitions {
-            let _ = write!(out, ";part={}-{}:{}", part.start, part.end, part.member);
+        for event in &self.events {
+            let _ = write!(out, ";ev={}", encode_event(event));
         }
-        for crash in &self.crashes {
+        if let Some(workload) = &self.workload {
             let _ = write!(
                 out,
-                ";crash={}-{}:{}",
-                crash.crash_tick, crash.restart_tick, crash.node_idx
+                ";workload={},{},{},{},{},{},{},{}",
+                workload.clients,
+                workload.keys,
+                workload.ops_per_client,
+                workload.list_pct,
+                workload.think_ticks,
+                workload.timeout_ticks,
+                u8::from(workload.client_crashes),
+                u8::from(workload.unordered),
             );
         }
         out
@@ -212,18 +420,90 @@ impl Plan {
     }
 }
 
+/// Encodes one fault event as `id:start-end:kind:params`.
+fn encode_event(event: &FaultEvent) -> String {
+    let (kind, params) = match event.fault {
+        FaultKind::Partition { member } => ("part", member.to_string()),
+        FaultKind::Asymmetric { from, to } => ("asym", format!("{from}-{to}")),
+        FaultKind::Crash { node } => ("crash", node.to_string()),
+        FaultKind::Pause { node } => ("pause", node.to_string()),
+        FaultKind::SlowClock {
+            node,
+            rate_per_mille,
+        } => ("clock", format!("{node}-{rate_per_mille}")),
+        FaultKind::DelaySpike { extra_ticks } => ("delay", extra_ticks.to_string()),
+    };
+    format!("{}:{}-{}:{kind}:{params}", event.id, event.start, event.end)
+}
+
+/// Decodes one `id:start-end:kind:params` event.
+fn decode_event(raw: &str) -> Result<FaultEvent, PlanError> {
+    let (id_raw, rest) = raw.split_once(':').ok_or(PlanError::BadField("event"))?;
+    let (range, rest) = rest.split_once(':').ok_or(PlanError::BadField("event"))?;
+    let (kind, params) = rest.split_once(':').ok_or(PlanError::BadField("event"))?;
+    let id: u32 = id_raw.parse().map_err(|_| PlanError::BadField("event"))?;
+    let (start_raw, end_raw) = range.split_once('-').ok_or(PlanError::BadField("event"))?;
+    let start = parse_bounded(start_raw)?;
+    let end = parse_bounded(end_raw)?;
+    if end < start || u64::from(id) > PLAN_LIMIT {
+        return Err(PlanError::BadField("event"));
+    }
+    let fault = match kind {
+        "part" => FaultKind::Partition {
+            member: parse_idx(params)?,
+        },
+        "asym" => {
+            let (from_raw, to_raw) = params.split_once('-').ok_or(PlanError::BadField("event"))?;
+            FaultKind::Asymmetric {
+                from: parse_idx(from_raw)?,
+                to: parse_idx(to_raw)?,
+            }
+        }
+        "crash" => FaultKind::Crash {
+            node: parse_idx(params)?,
+        },
+        "pause" => FaultKind::Pause {
+            node: parse_idx(params)?,
+        },
+        "clock" => {
+            let (node_raw, rate_raw) =
+                params.split_once('-').ok_or(PlanError::BadField("event"))?;
+            let rate = parse_bounded(rate_raw)?;
+            if !(500..=2000).contains(&rate) {
+                return Err(PlanError::BadField("event"));
+            }
+            FaultKind::SlowClock {
+                node: parse_idx(node_raw)?,
+                rate_per_mille: rate,
+            }
+        }
+        "delay" => FaultKind::DelaySpike {
+            extra_ticks: parse_bounded(params)?,
+        },
+        _ => return Err(PlanError::BadField("event")),
+    };
+    Ok(FaultEvent {
+        id,
+        start,
+        end,
+        fault,
+    })
+}
+
 /// Partially decoded plan fields, assembled one `key=value` pair at a time.
 #[derive(Default)]
 struct DecodedPlan {
     seed: Option<u64>,
     size: Option<usize>,
     ticks: Option<u64>,
+    warmup_end: Option<u64>,
+    heal_start: Option<u64>,
     faults: (u64, u64, u64),
     salt: Option<u64>,
     storage: bool,
     proposals: Vec<u64>,
-    partitions: Vec<PlanPartition>,
-    crashes: Vec<PlanCrash>,
+    events: Vec<FaultEvent>,
+    workload: Option<WorkloadSpec>,
 }
 
 impl DecodedPlan {
@@ -238,6 +518,8 @@ impl DecodedPlan {
                 self.size = Some(raw);
             }
             "ticks" => self.ticks = Some(parse_bounded(value)?),
+            "warm" => self.warmup_end = Some(parse_bounded(value)?),
+            "heal" => self.heal_start = Some(parse_bounded(value)?),
             "net" => {
                 let parts: Vec<&str> = value.split(',').collect();
                 if parts.len() != 3 {
@@ -264,38 +546,50 @@ impl DecodedPlan {
                     }
                 }
             }
-            "part" => {
-                let (range, member) = value.split_once(':').ok_or(PlanError::BadField("part"))?;
-                let (start, end) = range.split_once('-').ok_or(PlanError::BadField("part"))?;
-                let start = parse_bounded(start)?;
-                let end = parse_bounded(end)?;
-                let member = parse_idx(member)?;
-                if end < start {
-                    return Err(PlanError::BadField("part"));
+            "ev" => {
+                if self.events.len() >= MAX_EVENTS {
+                    return Err(PlanError::BadField("too many entries"));
                 }
-                self.partitions.push(PlanPartition { start, end, member });
+                self.events.push(decode_event(value)?);
             }
-            "crash" => {
-                let (range, node) = value.split_once(':').ok_or(PlanError::BadField("crash"))?;
-                let (crash_tick, restart_tick) =
-                    range.split_once('-').ok_or(PlanError::BadField("crash"))?;
-                let crash_tick = parse_bounded(crash_tick)?;
-                let restart_tick = parse_bounded(restart_tick)?;
-                let node_idx = parse_idx(node)?;
-                if restart_tick < crash_tick {
-                    return Err(PlanError::BadField("crash"));
+            "workload" => {
+                let parts: Vec<&str> = value.split(',').collect();
+                if parts.len() != 8 {
+                    return Err(PlanError::BadField("workload"));
                 }
-                self.crashes.push(PlanCrash {
-                    crash_tick,
-                    restart_tick,
-                    node_idx,
+                let clients = parse_idx(parts[0])?;
+                let keys = parse_idx(parts[1])?;
+                let ops = parse_idx(parts[2])?;
+                let list_pct = parse_pct(parts[3])?;
+                let think = parse_bounded(parts[4])?;
+                let timeout = parse_bounded(parts[5])?;
+                let crashes = match parts[6] {
+                    "0" => false,
+                    "1" => true,
+                    _ => return Err(PlanError::BadField("workload")),
+                };
+                let unordered = match parts[7] {
+                    "0" => false,
+                    "1" => true,
+                    _ => return Err(PlanError::BadField("workload")),
+                };
+                if clients == 0 || keys == 0 || ops == 0 || think == 0 || timeout == 0 {
+                    return Err(PlanError::BadField("workload"));
+                }
+                self.workload = Some(WorkloadSpec {
+                    clients,
+                    keys,
+                    ops_per_client: ops,
+                    list_pct,
+                    think_ticks: think,
+                    timeout_ticks: timeout,
+                    client_crashes: crashes,
+                    unordered,
                 });
             }
             _ => return Err(PlanError::BadField("key")),
         }
-        if u64::try_from(self.proposals.len() + self.partitions.len() + self.crashes.len())
-            .is_ok_and(|n| n > PLAN_LIMIT)
-        {
+        if u64::try_from(self.proposals.len() + self.events.len()).is_ok_and(|n| n > PLAN_LIMIT) {
             return Err(PlanError::BadField("too many entries"));
         }
         Ok(())
@@ -303,27 +597,52 @@ impl DecodedPlan {
 
     fn build(mut self, version: u32) -> Result<Plan, PlanError> {
         let size = self.size.ok_or(PlanError::BadField("size"))?;
-        if self.partitions.iter().any(|part| part.member >= size)
-            || self.crashes.iter().any(|crash| crash.node_idx >= size)
-        {
+        let ticks = self.ticks.ok_or(PlanError::BadField("ticks"))?;
+        let warmup_end = self.warmup_end.ok_or(PlanError::BadField("warm"))?;
+        let heal_start = self.heal_start.ok_or(PlanError::BadField("heal"))?;
+        if warmup_end > heal_start || heal_start > ticks {
+            return Err(PlanError::BadField("phase"));
+        }
+        if self.events.iter().any(|event| event_member(event) >= size) {
             return Err(PlanError::BadField("member"));
+        }
+        let mut ids: Vec<u32> = self.events.iter().map(|event| event.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.len() != self.events.len() {
+            return Err(PlanError::BadField("event"));
         }
         self.proposals.sort_unstable();
         self.proposals.dedup();
+        self.events.sort_by_key(|event| (event.start, event.id));
         Ok(Plan {
             version,
             seed: self.seed.ok_or(PlanError::BadField("seed"))?,
             cluster_size: size,
-            ticks: self.ticks.ok_or(PlanError::BadField("ticks"))?,
+            ticks,
             proposals: self.proposals,
-            partitions: self.partitions,
-            crashes: self.crashes,
+            warmup_end,
+            heal_start,
+            events: self.events,
             drop_pct: self.faults.0,
             dup_pct: self.faults.1,
             max_delay: self.faults.2,
             salt: self.salt.ok_or(PlanError::BadField("salt"))?,
             storage_faults: self.storage,
+            workload: self.workload,
         })
+    }
+}
+
+/// Highest member or node index referenced by an event.
+fn event_member(event: &FaultEvent) -> usize {
+    match event.fault {
+        FaultKind::Partition { member }
+        | FaultKind::Crash { node: member }
+        | FaultKind::Pause { node: member }
+        | FaultKind::SlowClock { node: member, .. } => member,
+        FaultKind::Asymmetric { from, to } => from.max(to),
+        FaultKind::DelaySpike { .. } => 0,
     }
 }
 
@@ -340,7 +659,7 @@ fn parse_u64(raw: &str) -> Result<u64, PlanError> {
 }
 
 fn parse_pct(raw: &str) -> Result<u64, PlanError> {
-    let value: u64 = raw.parse().map_err(|_| PlanError::BadField("number"))?;
+    let value: u64 = raw.parse().map_err(|_| PlanError::BadField("percent"))?;
     if value > 100 {
         return Err(PlanError::BadField("percent"));
     }
@@ -355,8 +674,9 @@ fn parse_idx(raw: &str) -> Result<usize, PlanError> {
     usize::try_from(value).map_err(|_| PlanError::BadField("range"))
 }
 
-/// Executes a plan: fault schedule and workload come from the plan, and
-/// network faults are pure hash functions of the plan salt. Consensus
+/// Executes a plan: warm-up with no faults, chaos from the event schedule,
+/// heal with no faults, then a bounded convergence drain and audit.
+/// Network faults are pure hash functions of the plan salt. Consensus
 /// election jitter and storage fault draws remain seeded RNG streams, so the
 /// same seed replays identically.
 pub fn run_plan(plan: &Plan) {
@@ -381,32 +701,42 @@ pub fn run_plan(plan: &Plan) {
     let node_ids: Vec<anvil_types::NodeId> = cluster.nodes.keys().copied().collect();
 
     for tick in 1..=plan.ticks {
-        for part in &plan.partitions {
-            if part.start == tick {
-                let member = node_ids[part.member % node_ids.len()];
-                cluster.network.isolate(member, &node_ids);
+        for event in &plan.events {
+            if event.start == tick && tick > plan.warmup_end && tick < plan.heal_start {
+                begin_event(&node_ids, event, &mut cluster);
             }
-            if part.end == tick {
-                cluster.network.heal_all();
-            }
-        }
-        for crash in &plan.crashes {
-            if crash.crash_tick == tick {
-                let victim = node_ids[crash.node_idx % node_ids.len()];
-                if !cluster.is_node_crashed(victim) {
-                    cluster.crash_node(victim);
-                }
-            }
-            if crash.restart_tick == tick {
-                let victim = node_ids[crash.node_idx % node_ids.len()];
-                if cluster.is_node_crashed(victim)
-                    && !cluster.is_node_refused_start(victim)
-                    && !cluster.is_node_needs_repair(victim)
-                {
-                    let _ = cluster.restart_node(victim);
-                }
+            if event.end == tick {
+                end_event(&node_ids, plan, tick, event, &mut cluster);
             }
         }
+        if tick == plan.heal_start {
+            cluster.heal_all();
+            for id in &node_ids {
+                if cluster.is_paused(*id) {
+                    cluster.resume_node(*id);
+                }
+                cluster.set_tick_skew(*id, 1000);
+            }
+        }
+        let spike: u64 = plan
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(event.fault, FaultKind::DelaySpike { .. })
+                    && event.start <= tick
+                    && tick < event.end
+            })
+            .map(|event| match event.fault {
+                FaultKind::DelaySpike { extra_ticks } => extra_ticks,
+                _ => 0,
+            })
+            .sum();
+        cluster.plan_net = Some(PlanNet {
+            salt: plan.salt,
+            drop_pct: plan.drop_pct,
+            dup_pct: plan.dup_pct,
+            max_delay: plan.max_delay.saturating_add(spike),
+        });
 
         cluster.tick();
 
@@ -451,18 +781,99 @@ pub fn run_plan(plan: &Plan) {
     }
 }
 
+/// Starts one fault event.
+fn begin_event(node_ids: &[anvil_types::NodeId], event: &FaultEvent, cluster: &mut SimCluster) {
+    let at = |member: usize| node_ids[member % node_ids.len()];
+    match event.fault {
+        FaultKind::Partition { member } => {
+            cluster.isolate_node(at(member));
+        }
+        FaultKind::Asymmetric { from, to } => {
+            cluster.network.cut_one_way(at(from), at(to));
+        }
+        FaultKind::Crash { node } => {
+            let victim = at(node);
+            if !cluster.is_node_crashed(victim) {
+                cluster.crash_node(victim);
+            }
+        }
+        FaultKind::Pause { node } => {
+            cluster.pause_node(at(node));
+        }
+        FaultKind::SlowClock {
+            node,
+            rate_per_mille,
+        } => {
+            cluster.set_tick_skew(at(node), rate_per_mille);
+        }
+        FaultKind::DelaySpike { .. } => {
+            // Delay spikes compose through the per-tick plan_net override in
+            // the run loop, so overlapping spikes add instead of clobbering.
+        }
+    }
+}
+
+/// Ends one fault event, restoring the pre-event condition. Partition heals
+/// wait until no other partition event is active so overlapping cuts keep
+/// their full duration.
+fn end_event(
+    node_ids: &[anvil_types::NodeId],
+    plan: &Plan,
+    tick: u64,
+    event: &FaultEvent,
+    cluster: &mut SimCluster,
+) {
+    let at = |member: usize| node_ids[member % node_ids.len()];
+    match event.fault {
+        FaultKind::Partition { .. } | FaultKind::Asymmetric { .. } => {
+            let other_cuts = plan.events.iter().any(|other| {
+                other.id != event.id
+                    && matches!(
+                        other.fault,
+                        FaultKind::Partition { .. } | FaultKind::Asymmetric { .. }
+                    )
+                    && other.start <= tick
+                    && tick < other.end
+            });
+            if !other_cuts {
+                cluster.heal_all();
+            }
+        }
+        FaultKind::Crash { node } => {
+            let victim = at(node);
+            if cluster.is_node_crashed(victim)
+                && !cluster.is_node_refused_start(victim)
+                && !cluster.is_node_needs_repair(victim)
+            {
+                let _ = cluster.restart_node(victim);
+            }
+        }
+        FaultKind::Pause { node } => {
+            if cluster.is_paused(at(node)) {
+                cluster.resume_node(at(node));
+            }
+        }
+        FaultKind::SlowClock { node, .. } => {
+            cluster.set_tick_skew(at(node), 1000);
+        }
+        FaultKind::DelaySpike { .. } => {}
+    }
+}
+
 /// Shrinks a failing plan with greedy delta debugging: each candidate
-/// removes one fault, shortens the run, or zeroes network faults, and is
-/// kept only when the failure still reproduces.
+/// removes one event, shortens one event, zeroes network faults, or shortens
+/// the run, and is kept only when the failure still reproduces. Events draw
+/// from per-event streams keyed by id, so removing one never reshuffles the
+/// others.
 pub fn shrink_plan(plan: &Plan, fails: &dyn Fn(&Plan) -> bool) -> Plan {
     let mut best = plan.clone();
     loop {
         let mut improved = false;
-        if let Some(shrunk) = shrink_crashes(&best, fails) {
+        if let Some(shrunk) = shrink_events(&best, fails) {
             best = shrunk;
             improved = true;
         }
-        if let Some(shrunk) = shrink_partitions(&best, fails) {
+        if let Some(shrunk) = shrink_event_windows(&best, fails) {
             best = shrunk;
             improved = true;
         }
@@ -488,10 +899,10 @@ fn still_fails(plan: &Plan, fails: &dyn Fn(&Plan) -> bool) -> bool {
     std::panic::catch_unwind(AssertUnwindSafe(|| fails(plan))).unwrap_or(true)
 }
 
-fn shrink_crashes(plan: &Plan, fails: &dyn Fn(&Plan) -> bool) -> Option<Plan> {
-    for i in 0..plan.crashes.len() {
+fn shrink_events(plan: &Plan, fails: &dyn Fn(&Plan) -> bool) -> Option<Plan> {
+    for i in 0..plan.events.len() {
         let mut candidate = plan.clone();
-        candidate.crashes.remove(i);
+        candidate.events.remove(i);
         if still_fails(&candidate, fails) {
             return Some(candidate);
         }
@@ -499,12 +910,15 @@ fn shrink_crashes(plan: &Plan, fails: &dyn Fn(&Plan) -> bool) -> Option<Plan> {
     None
 }
 
-fn shrink_partitions(plan: &Plan, fails: &dyn Fn(&Plan) -> bool) -> Option<Plan> {
-    for i in 0..plan.partitions.len() {
-        let mut candidate = plan.clone();
-        candidate.partitions.remove(i);
-        if still_fails(&candidate, fails) {
-            return Some(candidate);
+fn shrink_event_windows(plan: &Plan, fails: &dyn Fn(&Plan) -> bool) -> Option<Plan> {
+    for i in 0..plan.events.len() {
+        let event = &plan.events[i];
+        if event.end > event.start + 1 {
+            let mut candidate = plan.clone();
+            candidate.events[i].end = event.start + 1;
+            if still_fails(&candidate, fails) {
+                return Some(candidate);
+            }
         }
     }
     None
@@ -544,13 +958,13 @@ fn shrink_ticks(plan: &Plan, fails: &dyn Fn(&Plan) -> bool) -> Option<Plan> {
         .iter()
         .copied()
         .filter(|p| *p <= plan.ticks)
-        .chain(plan.partitions.iter().map(|p| p.end))
-        .chain(plan.crashes.iter().map(|c| c.restart_tick))
+        .chain(plan.events.iter().map(|event| event.end))
         .max()
         .unwrap_or(plan.ticks);
-    if last < plan.ticks {
+    if last < plan.ticks && last >= plan.warmup_end {
         let mut candidate = plan.clone();
         candidate.ticks = last;
+        candidate.heal_start = candidate.heal_start.min(last).max(candidate.warmup_end);
         if still_fails(&candidate, fails) {
             return Some(candidate);
         }

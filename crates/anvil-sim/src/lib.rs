@@ -30,7 +30,7 @@ pub use farm::{
 };
 pub use kernel::{Actor, ActorContext, SimError, SimKernel, SimReport};
 pub use network::{LatencyModel, NetworkDelayHook, NetworkFilterHook, SimNetwork, TransportMode};
-pub use plan::{Plan, PlanCrash, PlanError, PlanPartition, run_plan, shrink_plan};
+pub use plan::{FaultEvent, FaultKind, Plan, PlanError, WorkloadSpec, run_plan, shrink_plan};
 pub use queue::{BinaryHeapEventQueue, EventQueue, HierarchicalTimingWheel, ScheduledEvent};
 pub use raft_invariants::{InvariantViolation, RaftInvariantChecker};
 pub use rng::{DetRng, SplitMix64, derive_component_seed};
