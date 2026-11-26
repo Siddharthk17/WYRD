@@ -687,6 +687,116 @@ impl SimCluster {
             .map(|storage| storage.engine.last_entry_index())
     }
 
+    /// Replaces a stale divergent disk prefix the snapshot at `base` just
+    /// superseded. Installing a snapshot wipes the core log but not the
+    /// disk, so frames at or below the snapshot may still carry terms from
+    /// a fork the installer never joined; a later crash would replay them
+    /// and contradict the committed oracle. The committed archive is branch
+    /// truth for the covered prefix, so the first divergent index rewinds
+    /// the engine through the existing truncate path and restages archive
+    /// truth: committed suffix entries come from the archive, uncommitted
+    /// ones the core still holds are preserved, and only frames neither
+    /// source can supply are dropped for the leader to re-replicate.
+    /// Acknowledged writes above the restaged tip are pruned so recovery
+    /// never demands a frame the reconcile intentionally discarded.
+    /// Nodes that are not live keep their bytes for the repair path.
+    pub fn reconcile_snapshot_prefix(
+        &mut self,
+        node_id: NodeId,
+        archive: &BTreeMap<LogIndex, (Term, Option<Bytes>)>,
+        base: LogIndex,
+    ) {
+        if self.is_node_crashed(node_id)
+            || self.is_node_needs_repair(node_id)
+            || self.is_node_refused_start(node_id)
+        {
+            return;
+        }
+        let Some(tip) = self.engine_last_index(node_id) else {
+            return;
+        };
+        let end = base.min(tip);
+        let mut divergent = None;
+        for raw in 1..=end.as_u64() {
+            let at = LogIndex::from_raw(raw);
+            let disk_term = self
+                .storage
+                .get(&node_id)
+                .and_then(|storage| storage.engine.term_at(at));
+            let archive_term = archive.get(&at).map(|(term, _)| *term);
+            match (disk_term, archive_term) {
+                (Some(disk), Some(archived)) if disk == archived => {}
+                _ => {
+                    divergent = Some(at);
+                    break;
+                }
+            }
+        }
+        let Some(first) = divergent else {
+            return;
+        };
+        let mut entries = Vec::new();
+        let mut idx = first.as_u64();
+        while idx <= tip.as_u64() {
+            let at = LogIndex::from_raw(idx);
+            if let Some((term, payload)) = archive.get(&at) {
+                let (kind, bytes) = match payload {
+                    Some(bytes) => (anvil_types::EntryKind::Normal, bytes.clone()),
+                    None => (anvil_types::EntryKind::NoOp, Bytes::new()),
+                };
+                entries.push(Entry {
+                    index: at,
+                    term: *term,
+                    kind,
+                    payload: bytes,
+                });
+            } else if let Some(core) = self.nodes.get(&node_id)
+                && let Some(entry) = core.log().entry_at(at)
+            {
+                entries.push(entry.clone());
+            } else {
+                break;
+            }
+            idx += 1;
+        }
+        assert!(
+            !entries.is_empty(),
+            "snapshot reconcile found nothing to restage"
+        );
+        let new_tip = first.as_u64() + entries.len() as u64 - 1;
+        let Some(storage) = self.storage.get_mut(&node_id) else {
+            return;
+        };
+        storage.engine_output.clear();
+        storage.engine.step(
+            EngineInput::TruncateAndAppend {
+                from_index: first,
+                entries,
+                token: 0,
+            },
+            &mut storage.engine_output,
+        );
+        let ops = std::mem::take(&mut storage.engine_output.device_ops);
+        for op in ops {
+            storage.device.submit(op);
+        }
+        while let Some(comp) = storage.device.poll_completion() {
+            storage
+                .engine
+                .step(EngineInput::Completion(comp), &mut storage.engine_output);
+        }
+        storage.engine_output.clear();
+        if self.drive_storage(node_id) {
+            self.crash_node(node_id);
+            return;
+        }
+        if let Some(storage) = self.storage.get_mut(&node_id) {
+            storage
+                .acknowledged_entries
+                .retain(|(acked, _)| acked.as_u64() <= new_tip);
+        }
+    }
+
     /// Tells the core a log entry was applied to the state machine, keeping
     /// the never-beyond-applied bound exact for compaction checks.
     pub fn notify_applied(&mut self, node_id: NodeId, index: LogIndex) {

@@ -1608,6 +1608,7 @@ fn install_snapshot_state(
         .snapshots
         .insert(id, (snap.last_included_index, snap.data.clone()));
     backfill_engine_from_archive(cluster, harness, id, snap.last_included_index);
+    cluster.reconcile_snapshot_prefix(id, &harness.archive, snap.last_included_index);
     if let Some(core) = cluster.nodes.get(&id) {
         let capped = snap.last_included_index.min(core.commit_index());
         if !capped.is_zero() {
