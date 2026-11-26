@@ -1,8 +1,19 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
-//! `anvil-check`: History model and linearizability checker.
+//! `anvil-check`: history model and deterministic linearizability checker.
 //!
-//! Weeks 1-3 validate safety with the online invariant checker in `anvil-sim`.
-//! The offline history checker arrives in a later week; this crate reserves
-//! the module path so the dependency direction stays fixed.
+//! Single-threaded Wing-Gong-Lowe search with memoization and
+//! P-compositionality (partition by key). The farm parallelizes across seeds.
+
+pub mod history;
+pub mod list;
+pub mod output;
+pub mod porcupine;
+pub mod register;
+pub mod wgl;
+
+pub use history::{ClientOp, History, HistoryOp, OpResult};
+pub use output::{CheckFailure, check_history};
+pub use wgl::{check_key_history, check_range_history};
