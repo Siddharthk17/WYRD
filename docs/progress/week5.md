@@ -66,11 +66,31 @@
   checker's verdict. Identical bytes on reruns.
 
 ### H. Peer-Validated Disk Repair (ADRs 0027, 0028)
-
 - A sidelined node rewrites corrupt frames from committed peer data with
   re-chained CRCs, verifies the rebuilt layout, and rejoins through the
   normal restart path. The storage fault atlas enforces a per-index
   corruption budget plus crash-fate and dir-loss gating.
+
+### I. Snapshot Reconcile and Follower Commit Bound (ADR 0029)
+
+- A follower commit on `AppendEntries` stops at the matched prefix
+  (`new_match`): an empty append no longer commits the divergent tail
+  past it.
+- Snapshot install reconciles the engine prefix against the committed
+  archive through the existing truncate path, so the disk agrees with
+  the committed oracle on the covered prefix. Pinned seeds 89738,
+  132635, 136637, 144041, 163047 and 178942 failed before and pass
+  after; the pinned-seed regression test fails with the call removed.
+
+### J. Repair Cascade and Torn-Write Sideline (ADR 0030)
+
+- Repair replaces valid frames that contradict the committed archive
+  and re-chains (re-sources) every frame after the replacement; the
+  first unsourcable index aborts the file untouched.
+- Restart sidelines a torn committed write for peer-validated repair
+  instead of asserting, rejoining through the normal restart path.
+  Ten of the eleven remaining kv-storage seeds heal through the
+  cascade, one through the sideline.
 
 ---
 
@@ -84,7 +104,7 @@ TBD - farm running.
 
 ## 4. Architecture Decisions Taken
 
-- ADR 0019 through ADR 0028 (see docs/adr/).
+- ADR 0019 through ADR 0030 (see docs/adr/).
 
 ## 5. Open Items and Future Work
 
