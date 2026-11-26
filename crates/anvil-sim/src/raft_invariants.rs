@@ -533,23 +533,31 @@ impl RaftInvariantChecker {
 
     /// Verifies that a recovered log does not contradict the global committed oracle.
     ///
-    /// A restarted node may lag behind the cluster commit index; entries it never
-    /// held are absent from its log and will arrive via replication. Absence alone
-    /// is not a violation. Presence with a different term means the node forgot
-    /// a committed entry it once held, which breaks safety.
+    /// Only entries at or below the node's pre-crash commit index are
+    /// checked. A restarted node legitimately holds conflicting uncommitted
+    /// entries above its commit index (Raft Figure 7): it missed the
+    /// winning suffix while partitioned, crashed, and kept its divergent
+    /// tail. The new leader overwrites that tail through conflict repair,
+    /// and the node cannot disrupt the cluster with it (log comparison in
+    /// voting, match-index-driven replication). Entries the node itself had
+    /// committed, however, are final cluster-wide and must match the oracle.
     ///
     /// # Errors
-    /// Returns `InvariantViolation::CommittedNeverLostAcrossCrashes` if a recovered entry contradicts the oracle term.
+    /// Returns `InvariantViolation::CommittedNeverLostAcrossCrashes` if a recovered entry at or below the commit bound contradicts the oracle term.
     pub fn check_recovered_log_against_oracle(
         &self,
         _node: NodeId,
         recovered_entries: &[Entry],
+        committed_up_to: LogIndex,
     ) -> Result<(), InvariantViolation> {
         let mut map = BTreeMap::new();
         for entry in recovered_entries {
             map.insert(entry.index, entry.term);
         }
         for (&idx, oracle_entry) in &self.committed_oracle {
+            if idx > committed_up_to {
+                continue;
+            }
             if let Some(&term) = map.get(&idx)
                 && term != oracle_entry.term
             {

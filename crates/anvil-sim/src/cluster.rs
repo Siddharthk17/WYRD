@@ -85,6 +85,22 @@ pub struct SimCluster {
     /// Restart count per node, mixed into the restart RNG seed so a restarted
     /// node continues a fresh election-timeout sequence instead of replaying it.
     pub restart_counts: BTreeMap<NodeId, u64>,
+    /// Last commit index observed per node before its crash. Bounds the
+    /// recovery oracle check to entries the node itself had committed.
+    last_commit_before_crash: BTreeMap<NodeId, LogIndex>,
+    /// Completed linearizable read results per node, drained from the core
+    /// after every step so workloads can serve reads.
+    pub completed_reads: BTreeMap<NodeId, Vec<anvil_raft::ReadIndexResult>>,
+    /// Per-node tick rate in ticks per mille. 1000 is real time, 500 is half
+    /// speed, 2000 is double speed. Models clock drift between 0.5x and 2x.
+    pub tick_rate_per_mille: BTreeMap<NodeId, u64>,
+    /// Fractional tick credit accumulated for skewed nodes.
+    tick_credit_mille: BTreeMap<NodeId, u64>,
+    /// Nodes currently paused. A paused node steps no ticks and drops no
+    /// state; missed ticks fire as a burst on resume.
+    paused: BTreeSet<NodeId>,
+    /// Missed tick count per paused node.
+    paused_missed: BTreeMap<NodeId, u64>,
     /// Scratch output buffer reused across steps to eliminate allocations.
     output_scratch: Output,
 }
@@ -207,14 +223,20 @@ impl SimCluster {
             checker: RaftInvariantChecker::new(),
             fault_atlas: atlas,
             restart_counts: BTreeMap::new(),
+            tick_rate_per_mille: BTreeMap::new(),
+            tick_credit_mille: BTreeMap::new(),
+            paused: BTreeSet::new(),
+            paused_missed: BTreeMap::new(),
+            completed_reads: BTreeMap::new(),
+            last_commit_before_crash: BTreeMap::new(),
             output_scratch: Output::new(),
         }
     }
 
     /// Advances the cluster by one logical tick.
     ///
-    /// 1. Steps `Input::Tick` on all live nodes.
-    /// 2. Delivers packets scheduled for `current_tick`.
+    /// 1. Steps `Input::Tick` on all live nodes, honoring per-node tick-rate
+    ///    skew and pause. 2. Delivers packets scheduled for `current_tick`.
     /// 3. Evaluates online invariants across all nodes.
     pub fn tick(&mut self) {
         self.current_tick = self.current_tick.saturating_add(1);
@@ -227,7 +249,26 @@ impl SimCluster {
 
         let node_ids: Vec<NodeId> = self.nodes.keys().copied().collect();
         for node_id in node_ids {
-            if !self.is_node_crashed(node_id) {
+            if self.is_node_crashed(node_id) || self.paused.contains(&node_id) {
+                if self.paused.contains(&node_id) {
+                    let missed = self.paused_missed.entry(node_id).or_insert(0);
+                    *missed = missed.saturating_add(1);
+                }
+                continue;
+            }
+            let rate = self
+                .tick_rate_per_mille
+                .get(&node_id)
+                .copied()
+                .unwrap_or(1000);
+            let credit = self.tick_credit_mille.entry(node_id).or_insert(0);
+            *credit = credit.saturating_add(rate);
+            let mut steps = *credit / 1000;
+            *credit %= 1000;
+            if steps > 4 {
+                steps = 4;
+            }
+            for _ in 0..steps {
                 self.step_node_internal(node_id, Input::Tick);
             }
         }
@@ -319,16 +360,19 @@ impl SimCluster {
         if self.is_node_crashed(node_id)
             || self.is_node_refused_start(node_id)
             || self.is_node_needs_repair(node_id)
+            || self.paused.contains(&node_id)
         {
             return;
         }
 
         self.sync_node_storage_with_core(node_id);
         self.output_scratch.clear();
+        let mut fresh_reads = Vec::new();
 
         if let Some(core) = self.nodes.get_mut(&node_id) {
             core.step(input, &mut self.output_scratch);
         }
+        fresh_reads.append(&mut self.output_scratch.completed_reads);
 
         let outbound = std::mem::take(&mut self.output_scratch.messages);
         for msg in outbound {
@@ -404,6 +448,10 @@ impl SimCluster {
                 for msg in follow_up {
                     self.route_message(node_id, msg.to, msg.message);
                 }
+                let reads = std::mem::take(&mut self.output_scratch.completed_reads);
+                if !reads.is_empty() {
+                    fresh_reads.extend(reads);
+                }
                 self.checker.check_invariants(&self.nodes);
             }
         }
@@ -441,6 +489,7 @@ impl SimCluster {
                     ));
                 }
                 all_follow_ups.append(&mut self.output_scratch.messages);
+                fresh_reads.append(&mut self.output_scratch.completed_reads);
             }
 
             if let (Some((entries, term, vote)), Some(storage)) =
@@ -465,6 +514,19 @@ impl SimCluster {
                 self.route_message(node_id, msg.to, msg.message);
             }
             self.checker.check_invariants(&self.nodes);
+        }
+        if !fresh_reads.is_empty() {
+            self.completed_reads
+                .entry(node_id)
+                .or_default()
+                .extend(fresh_reads);
+        }
+        let extra_reads = std::mem::take(&mut self.output_scratch.completed_reads);
+        if !extra_reads.is_empty() {
+            self.completed_reads
+                .entry(node_id)
+                .or_default()
+                .extend(extra_reads);
         }
     }
 
@@ -520,6 +582,10 @@ impl SimCluster {
     /// Crashes a specific node: invokes `SimDevice::crash()`, removes volatile `RaftCore`,
     /// and drops all in-flight network messages to/from this node.
     pub fn crash_node(&mut self, node_id: NodeId) {
+        if let Some(core) = self.nodes.get(&node_id) {
+            self.last_commit_before_crash
+                .insert(node_id, core.commit_index());
+        }
         if let Some(storage) = self.storage.get_mut(&node_id) {
             storage.crashed = true;
             storage.device.crash();
@@ -675,10 +741,20 @@ impl SimCluster {
                     );
                 }
 
-                // Invariant 3: CommittedNeverLostAcrossCrashes
-                let commit_res = self
-                    .checker
-                    .check_recovered_log_against_oracle(node_id, &recovered.log.entries);
+                // Invariant 3: CommittedNeverLostAcrossCrashes, bounded by the
+                // node's own pre-crash commit index. Entries above it were
+                // uncommitted from this node's perspective and may hold a
+                // legitimate divergent suffix.
+                let commit_bound = self
+                    .last_commit_before_crash
+                    .get(&node_id)
+                    .copied()
+                    .unwrap_or(LogIndex::from_raw(0));
+                let commit_res = self.checker.check_recovered_log_against_oracle(
+                    node_id,
+                    &recovered.log.entries,
+                    commit_bound,
+                );
                 assert!(
                     commit_res.is_ok(),
                     "CommittedNeverLostAcrossCrashes invariant failed: {:?}",
@@ -948,6 +1024,57 @@ impl SimCluster {
     /// Heals all network partitions, restoring full peer connectivity.
     pub fn heal_all(&mut self) {
         self.network.heal_all();
+    }
+
+    /// Takes completed read results for a node, clearing the buffer.
+    pub fn take_completed_reads(&mut self, node: NodeId) -> Vec<anvil_raft::ReadIndexResult> {
+        self.completed_reads.remove(&node).unwrap_or_default()
+    }
+
+    /// Sets a per-node tick rate in ticks per mille (500 to 2000). Models
+    /// clock drift: a node at 500 advances once every two global ticks,
+    /// a node at 2000 advances twice per global tick.
+    pub fn set_tick_skew(&mut self, node: NodeId, rate_per_mille: u64) {
+        assert!(
+            (500..=2000).contains(&rate_per_mille),
+            "tick skew must be within 0.5x to 2x (500 to 2000 per mille)"
+        );
+        self.tick_rate_per_mille.insert(node, rate_per_mille);
+    }
+
+    /// Returns the tick rate for a node, defaulting to real time.
+    #[must_use]
+    pub fn tick_rate(&self, node: NodeId) -> u64 {
+        self.tick_rate_per_mille.get(&node).copied().unwrap_or(1000)
+    }
+
+    /// Pauses a node: it steps no ticks and processes no messages while its
+    /// timers go stale.
+    pub fn pause_node(&mut self, node: NodeId) {
+        self.paused.insert(node);
+        self.paused_missed.entry(node).or_insert(0);
+    }
+
+    /// Returns true while a node is paused.
+    #[must_use]
+    pub fn is_paused(&self, node: NodeId) -> bool {
+        self.paused.contains(&node)
+    }
+
+    /// Resumes a paused node, firing stale timers as a bounded burst of ticks
+    /// so an expired election timer triggers promptly.
+    pub fn resume_node(&mut self, node: NodeId) {
+        if !self.paused.remove(&node) {
+            return;
+        }
+        let missed = self.paused_missed.remove(&node).unwrap_or(0);
+        let burst = missed.min(100);
+        for _ in 0..burst {
+            if self.is_node_crashed(node) {
+                break;
+            }
+            self.step_node_internal(node, Input::Tick);
+        }
     }
 
     /// Helper to tick the cluster until a leader is elected, up to `max_ticks`.
