@@ -345,6 +345,8 @@ fn coverage_floors() -> Vec<(&'static str, f64)> {
         ("anvil-types", 95.0),
         ("anvil-raft", 95.0),
         ("anvil-storage", 95.0),
+        ("anvil-kv", 95.0),
+        ("anvil-check", 95.0),
         ("anvil-sim", 90.0),
     ]
 }

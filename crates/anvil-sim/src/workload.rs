@@ -679,11 +679,7 @@ fn execute_scheduled(
                     client: op.client as u64,
                     key,
                     op: if effective_kind == ScheduledKind::Get {
-                        if is_list {
-                            ClientOp::Get
-                        } else {
-                            ClientOp::Get
-                        }
+                        ClientOp::Get
                     } else {
                         ClientOp::Range { limit: 8 }
                     },
