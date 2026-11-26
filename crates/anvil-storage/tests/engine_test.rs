@@ -894,3 +894,53 @@ fn test_engine_truncate_discards_replaced_gap_tail() {
         &mut output,
     );
 }
+
+#[test]
+fn test_engine_term_at_tracks_staged_and_truncated_terms() {
+    let config = StorageConfig::for_test(SectorSize::Sector512, 1024 * 1024);
+    let mut engine = StorageEngine::new_empty(config);
+    let mut output = EngineOutput::default();
+    assert_eq!(engine.term_at(LogIndex::from_raw(1)), None);
+    engine.step(
+        EngineInput::AppendEntries {
+            prev_index: LogIndex::from_raw(0),
+            entries: vec![
+                overlap_entry(1, 1, b"a"),
+                overlap_entry(2, 1, b"b"),
+                overlap_entry(3, 2, b"c"),
+            ],
+            token: 1,
+        },
+        &mut output,
+    );
+    assert_eq!(engine.term_at(LogIndex::from_raw(0)), None);
+    assert_eq!(
+        engine.term_at(LogIndex::from_raw(1)),
+        Some(Term::from_raw(1))
+    );
+    assert_eq!(
+        engine.term_at(LogIndex::from_raw(3)),
+        Some(Term::from_raw(2))
+    );
+    assert_eq!(engine.term_at(LogIndex::from_raw(4)), None);
+    engine.step(
+        EngineInput::TruncateAndAppend {
+            from_index: LogIndex::from_raw(2),
+            entries: vec![overlap_entry(2, 3, b"b"), overlap_entry(3, 3, b"c")],
+            token: 2,
+        },
+        &mut output,
+    );
+    assert_eq!(
+        engine.term_at(LogIndex::from_raw(1)),
+        Some(Term::from_raw(1))
+    );
+    assert_eq!(
+        engine.term_at(LogIndex::from_raw(2)),
+        Some(Term::from_raw(3))
+    );
+    assert_eq!(
+        engine.term_at(LogIndex::from_raw(3)),
+        Some(Term::from_raw(3))
+    );
+}

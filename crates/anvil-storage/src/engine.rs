@@ -410,6 +410,18 @@ impl StorageEngine {
         self.last_entry_index
     }
 
+    /// Returns the term staged at `index`, or `None` when the engine holds
+    /// no frame there. The journal covers every live frame from index 1,
+    /// so a gap inside the staged range reads as a divergence the caller
+    /// must heal by restaging.
+    #[must_use]
+    pub fn term_at(&self, index: LogIndex) -> Option<Term> {
+        let pos = index.as_u64().checked_sub(1)?;
+        let slot = usize::try_from(pos).ok()?;
+        let placement = self.index_journal.get(slot)?;
+        (placement.index == index).then_some(placement.term)
+    }
+
     /// Pre-reserves capacity for pending tokens and write buffers to guarantee steady-state zero allocation.
     pub fn reserve_pending_capacity(&mut self, additional_tokens: usize, additional_bytes: usize) {
         self.pending_tokens.reserve(additional_tokens);
