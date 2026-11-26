@@ -21,7 +21,7 @@ use anvil_storage::{
     Device, DeviceOp, EngineInput, EngineOutput, FileId, HardStateSlot, LogRecoveryClassification,
     RecoveredStorageState, SectorSize, StorageConfig, StorageEngine, StorageError, WalRecordFrame,
     WalSegmentHeader,
-    format::wal::{WalScanResult, decode_wal_frame},
+    format::wal::{WAL_RECORD_HEADER_FIXED_LEN, WalScanResult, decode_wal_frame},
 };
 use anvil_types::{Entry, LogIndex, NodeId, Term, sometimes};
 use bytes::Bytes;
@@ -1218,9 +1218,84 @@ impl SimCluster {
         repaired_any
     }
 
+    /// Rebuilds an undecodable segment header from known constants, the
+    /// first frame's index, and a live peer's term for the junction.
+    /// Verifies the anchor frame decodes under the rebuilt chain; anything
+    /// else leaves the file alone.
+    fn rebuild_segment_header(
+        &self,
+        node_id: NodeId,
+        file_id: FileId,
+        data: &[u8],
+        sector_size: SectorSize,
+    ) -> Option<WalSegmentHeader> {
+        let sector_len = sector_size.as_usize();
+        let segment_id = file_id.wal_segment_id()?;
+        if data.len() < sector_len + WAL_RECORD_HEADER_FIXED_LEN {
+            return None;
+        }
+        let mut index_bytes = [0u8; 8];
+        index_bytes.copy_from_slice(&data[sector_len..sector_len + 8]);
+        let first_index = LogIndex::from_raw(u64::from_le_bytes(index_bytes));
+        if first_index.is_zero() {
+            return None;
+        }
+        let prev_term = if first_index == LogIndex::from_raw(1) {
+            Term::from_raw(0)
+        } else {
+            match self.junction_term(node_id, first_index) {
+                Some(t) => t,
+                None => {
+                    return None;
+                }
+            }
+        };
+        let header = WalSegmentHeader::new(sector_size, segment_id, first_index, prev_term);
+        match decode_wal_frame(
+            &data[sector_len..],
+            sector_size,
+            header.header_crc,
+            segment_id,
+            sector_len as u64,
+        ) {
+            WalScanResult::Valid { frame, .. } if frame.index == first_index => Some(header),
+            _ => None,
+        }
+    }
+
+    /// Finds a live peer's term for the entry just before `first_index`,
+    /// preferring peers that already committed it.
+    fn junction_term(&self, node_id: NodeId, first_index: LogIndex) -> Option<Term> {
+        let want = first_index.prev().unwrap_or(LogIndex::from_raw(0));
+        if want.is_zero() {
+            return Some(Term::from_raw(0));
+        }
+        let mut best: Option<(LogIndex, Term)> = None;
+        for (peer_id, core) in &self.nodes {
+            if *peer_id == node_id
+                || self.is_node_crashed(*peer_id)
+                || self.is_node_needs_repair(*peer_id)
+                || self.is_node_refused_start(*peer_id)
+            {
+                continue;
+            }
+            let term = core.log().term_at(want)?;
+            if best
+                .as_ref()
+                .is_some_and(|(best_commit, _)| *best_commit >= core.commit_index())
+            {
+                continue;
+            }
+            best = Some((core.commit_index(), term));
+        }
+        best.map(|(_, term)| term)
+    }
+
     /// Repairs one segment file in place, replacing undecodable frames with
-    /// committed peer entries. Verifies the rebuilt layout by re-scanning;
-    /// any failure leaves the file untouched.
+    /// committed peer entries and rebuilding an undecodable header from
+    /// known constants, the first frame, and peer terms. Verifies the
+    /// rebuilt layout by re-scanning; any failure leaves the file untouched.
+    #[allow(clippy::too_many_lines)]
     fn try_repair_file(
         &mut self,
         node_id: NodeId,
@@ -1240,14 +1315,23 @@ impl SimCluster {
         if data.len() < sector_len {
             return false;
         }
-        let Ok(header) = WalSegmentHeader::decode(&data[..sector_len], sector_size) else {
-            return false;
+        let header = match WalSegmentHeader::decode(&data[..sector_len], sector_size) {
+            Ok(header) => header,
+            Err(_) => match self.rebuild_segment_header(node_id, file_id, &data, sector_size) {
+                Some(header) => header,
+                None => return false,
+            },
         };
-        let mut rebuilt = data[..sector_len].to_vec();
+        let mut rebuilt = vec![0u8; sector_len];
+        if header.encode(&mut rebuilt).is_err() {
+            return false;
+        }
+        // A rebuilt header alone is a repair even when every frame below
+        // already verifies: the on-disk header was undecodable.
+        let mut replaced = rebuilt != data[..sector_len].to_vec();
         let mut last_crc = header.header_crc;
         let mut offset = sector_len;
         let mut expected = header.first_index;
-        let mut replaced = false;
         while offset + sector_len <= data.len() {
             match decode_wal_frame(
                 &data[offset..],
