@@ -22,9 +22,9 @@ pub mod types;
 pub use crate::core::RaftCore;
 pub use crate::log::RaftLog;
 pub use crate::messages::Message;
-pub use crate::progress::{PeerProgress, ProgressState};
+pub use crate::progress::{PeerProgress, ProgressState, SnapshotProgress};
 pub use crate::types::OutboundMessage;
 pub use crate::types::{
-    Input, Output, PersistOp, PersistToken, RaftConfig, ReadIndexResult, RecoveredState, Role,
-    RoleChangeEvent, SpecProjection,
+    Input, Output, PersistOp, PersistToken, RaftConfig, ReadIndexResult, ReceivedSnapshot,
+    RecoveredState, Role, RoleChangeEvent, SnapshotChunkData, SnapshotRequest, SpecProjection,
 };

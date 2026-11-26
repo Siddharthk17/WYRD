@@ -5,15 +5,29 @@
 use crate::log::RaftLog;
 use crate::messages::Message;
 use crate::progress::PeerProgress;
+use crate::progress::SnapshotProgress;
 use crate::types::{
     Input, OutboundMessage, Output, PersistOp, PersistToken, RaftConfig, ReadIndexResult,
-    RecoveredState, Role, RoleChangeEvent, SpecProjection,
+    ReceivedSnapshot, RecoveredState, Role, RoleChangeEvent, SnapshotChunkData, SnapshotRequest,
+    SpecProjection,
 };
 use anvil_types::{Entry, LogIndex, NodeId, Term};
 use bytes::Bytes;
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::Rng;
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Returns the smallest not-yet-received chunk index, or `total_chunks` when complete.
+fn first_missing(pending: &FollowerSnapshot) -> u32 {
+    let mut idx = 0u32;
+    for slot in &pending.chunks {
+        if slot.is_none() {
+            return idx;
+        }
+        idx = idx.saturating_add(1);
+    }
+    pending.total_chunks
+}
 
 /// Pending actions awaiting storage persistence completion before being released.
 #[derive(Debug, Clone)]
@@ -31,6 +45,35 @@ struct PendingRead {
     read_index: LogIndex,
     acks: BTreeSet<NodeId>,
 }
+
+/// Snapshot bytes the node supplied for this leader to stream.
+#[derive(Debug, Clone)]
+struct LeaderSnapshot {
+    last_included_index: LogIndex,
+    last_included_term: Term,
+    snapshot_bytes: u64,
+    snapshot_digest: [u8; 32],
+    chunks: Vec<SnapshotChunkData>,
+}
+
+/// Partially received snapshot stream on a follower.
+#[derive(Debug, Clone)]
+struct FollowerSnapshot {
+    leader: NodeId,
+    term: Term,
+    last_included_index: LogIndex,
+    last_included_term: Term,
+    total_chunks: u32,
+    snapshot_bytes: u64,
+    snapshot_digest: [u8; 32],
+    chunks: Vec<Option<Bytes>>,
+    received: u32,
+}
+
+/// Hard bounds on snapshot streams, checked before any additional reservation.
+const MAX_SNAPSHOT_CHUNKS: usize = 65_536;
+const MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_SNAPSHOT_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
 /// The sans-IO consensus core implementing election, replication, and safety.
 #[derive(Debug)]
@@ -56,6 +99,9 @@ pub struct RaftCore {
     pending_persists: Vec<(PersistToken, PendingAction)>,
     leader_persisted_index: LogIndex,
     leader_sticky: bool,
+    leader_snapshot: Option<LeaderSnapshot>,
+    follower_snapshot: Option<FollowerSnapshot>,
+    snapshot_requested: BTreeMap<NodeId, LogIndex>,
 }
 
 impl RaftCore {
@@ -117,6 +163,9 @@ impl RaftCore {
             pending_persists: Vec::with_capacity(64),
             leader_persisted_index: last_log_idx,
             leader_sticky: false,
+            leader_snapshot: None,
+            follower_snapshot: None,
+            snapshot_requested: BTreeMap::new(),
         }
     }
 
@@ -129,7 +178,22 @@ impl RaftCore {
             Input::ReadIndex { context } => self.handle_read_index(context, output),
             Input::Persisted { token } => self.handle_persisted(token, output),
             Input::Applied { index } => self.handle_applied(index),
+            Input::CompactLog { up_to } => self.handle_compact_log(up_to),
             Input::TransferLeader { to } => self.handle_transfer_leader(to, output),
+            Input::SnapshotReady {
+                last_included_index,
+                last_included_term,
+                snapshot_bytes,
+                snapshot_digest,
+                chunks,
+            } => self.handle_snapshot_ready(
+                last_included_index,
+                last_included_term,
+                snapshot_bytes,
+                snapshot_digest,
+                chunks,
+                output,
+            ),
         }
         self.emit_spec_projection(output);
     }
@@ -225,6 +289,21 @@ impl RaftCore {
                 if self.heartbeat_elapsed_ticks >= self.config.heartbeat_interval_ticks {
                     self.heartbeat_elapsed_ticks = 0;
                     self.broadcast_heartbeat(output);
+                }
+
+                // Pump snapshot streams within the flow-control window so a
+                // full window is in flight even before the first ack returns.
+                if self.config.peers.len() < 16 {
+                    let mut peers = [NodeId::from_nonzero(core::num::NonZeroU64::MIN); 16];
+                    let peer_len = self.peer_array(&mut peers);
+                    for &peer in &peers[..peer_len] {
+                        self.send_snapshot_chunk(peer, output);
+                    }
+                } else {
+                    let peers: Vec<NodeId> = self.config.peers.iter().copied().collect();
+                    for peer in peers {
+                        self.send_snapshot_chunk(peer, output);
+                    }
                 }
 
                 if self.config.check_quorum
@@ -449,6 +528,11 @@ impl RaftCore {
         self.heartbeat_elapsed_ticks = 0;
         self.election_elapsed_ticks = 0;
         self.heartbeat_acks.clear();
+        // Snapshot streams abort on leader change. A new leader streams only
+        // snapshots its own node supplies for this term.
+        self.leader_snapshot = None;
+        self.follower_snapshot = None;
+        self.snapshot_requested.clear();
 
         assert!(
             self.log.last_index().next().is_some(),
@@ -553,6 +637,18 @@ impl RaftCore {
         }
     }
 
+    /// Copies peer ids into a stack buffer without allocating.
+    fn peer_array(&self, peers: &mut [NodeId; 16]) -> usize {
+        let mut peer_len = 0usize;
+        for &peer in &self.config.peers {
+            if peer_len < peers.len() {
+                peers[peer_len] = peer;
+                peer_len += 1;
+            }
+        }
+        peer_len
+    }
+
     fn broadcast_append_entries(&mut self, output: &mut Output) {
         if self.role != Role::Leader {
             return;
@@ -560,23 +656,130 @@ impl RaftCore {
 
         if self.config.peers.len() < 16 {
             let mut peers = [NodeId::from_nonzero(core::num::NonZeroU64::MIN); 16];
-            let mut peer_len = 0usize;
-            for &peer in &self.config.peers {
-                if peer_len < peers.len() {
-                    peers[peer_len] = peer;
-                    peer_len += 1;
-                }
-            }
-
+            let peer_len = self.peer_array(&mut peers);
             for &peer in &peers[..peer_len] {
-                self.send_append_entries(peer, output);
+                self.replicate_to(peer, output);
             }
         } else {
             let peers: Vec<NodeId> = self.config.peers.iter().copied().collect();
             for peer in peers {
-                self.send_append_entries(peer, output);
+                self.replicate_to(peer, output);
             }
         }
+    }
+
+    /// Sends to one peer, preferring the log whenever the follower is
+    /// reachable by log and falling back to a snapshot stream only when the
+    /// needed prefix is compacted away.
+    fn replicate_to(&mut self, peer: NodeId, output: &mut Output) {
+        let needs_snapshot = self
+            .progress
+            .get(&peer)
+            .is_some_and(|progress| progress.next_index <= self.log.base_index());
+        if needs_snapshot {
+            self.ensure_snapshot(peer, output);
+            self.send_snapshot_chunk(peer, output);
+        } else {
+            self.send_append_entries(peer, output);
+        }
+    }
+
+    /// Enters snapshot streaming for a peer behind the compacted prefix, or
+    /// asks the node for snapshot bytes when none usable is buffered.
+    fn ensure_snapshot(&mut self, peer: NodeId, output: &mut Output) {
+        let least = self
+            .progress
+            .get(&peer)
+            .map_or(LogIndex::from_raw(0), |progress| progress.next_index);
+        let usable = self.leader_snapshot.as_ref().is_some_and(|snap| {
+            snap.last_included_index >= least.prev().unwrap_or(LogIndex::from_raw(0))
+                && snap.last_included_index >= self.log.base_index()
+        });
+        if usable {
+            let already = self.progress.get(&peer).is_some_and(|progress| {
+                matches!(progress.state, crate::progress::ProgressState::Snapshot(_))
+            });
+            if !already
+                && let Some(snap) = self.leader_snapshot.as_ref()
+                && let Some(progress) = self.progress.get_mut(&peer)
+            {
+                let total = u32::try_from(snap.chunks.len()).unwrap_or(u32::MAX);
+                progress.enter_snapshot(snap.last_included_index, total, 0);
+            }
+            return;
+        }
+        let requested = self.snapshot_requested.get(&peer);
+        if requested.is_none_or(|known| *known != least) {
+            self.snapshot_requested.insert(peer, least);
+            output.snapshot_requests.push(SnapshotRequest {
+                to: peer,
+                least_index: least,
+            });
+        }
+    }
+
+    /// Sends the next snapshot chunk permitted by the flow-control window.
+    fn send_snapshot_chunk(&mut self, peer: NodeId, output: &mut Output) {
+        let state = self.progress.get(&peer).and_then(|progress| {
+            if !progress.can_send_snapshot() {
+                return None;
+            }
+            if let crate::progress::ProgressState::Snapshot(state) = progress.state {
+                Some(state)
+            } else {
+                None
+            }
+        });
+        let Some(mut cursor) = state else {
+            return;
+        };
+        let Some(snap) = self.leader_snapshot.clone() else {
+            return;
+        };
+        let total = u32::try_from(snap.chunks.len()).unwrap_or(u32::MAX);
+        if total == 0 {
+            return;
+        }
+        if cursor.last_included_index == snap.last_included_index {
+            cursor.total_chunks = total;
+        } else {
+            cursor = SnapshotProgress {
+                last_included_index: snap.last_included_index,
+                next_chunk: 0,
+                total_chunks: total,
+            };
+        }
+        let mut chunk_idx = cursor.next_chunk.min(total.saturating_sub(1));
+        let slot = usize::try_from(chunk_idx).unwrap_or(usize::MAX);
+        let cached = snap.chunks.get(slot).cloned();
+        let data = if let Some(entry) = cached {
+            entry
+        } else {
+            chunk_idx = 0;
+            let Some(first) = snap.chunks.first().cloned() else {
+                return;
+            };
+            first
+        };
+        if let Some(progress) = self.progress.get_mut(&peer) {
+            progress.state = crate::progress::ProgressState::Snapshot(cursor);
+            progress.on_snapshot_send(chunk_idx.saturating_add(1).min(total));
+        }
+        output.messages.push(OutboundMessage {
+            to: peer,
+            message: Message::InstallSnapshotRequest {
+                term: self.term,
+                leader_id: self.config.node_id,
+                last_included_index: cursor.last_included_index,
+                last_included_term: snap.last_included_term,
+                chunk_index: chunk_idx,
+                total_chunks: total,
+                chunk: data.chunk,
+                chunk_crc: data.chunk_crc,
+                snapshot_digest: snap.snapshot_digest,
+                snapshot_bytes: snap.snapshot_bytes,
+            },
+        });
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -1002,7 +1205,7 @@ impl RaftCore {
         };
 
         if should_send_append {
-            self.send_append_entries(from, output);
+            self.replicate_to(from, output);
         }
 
         if let Some(ctx) = read_context {
@@ -1060,6 +1263,328 @@ impl RaftCore {
                     read_context: Some(context.clone()),
                 },
             });
+        }
+    }
+
+    fn handle_compact_log(&mut self, up_to: LogIndex) {
+        let base = self.log.base_index().as_u64();
+        let raw = up_to.as_u64();
+        if raw <= base || raw > self.applied_index.as_u64() || raw > self.log.last_index().as_u64()
+        {
+            return;
+        }
+        self.log.compact(up_to);
+    }
+
+    fn handle_snapshot_ready(
+        &mut self,
+        last_included_index: LogIndex,
+        last_included_term: Term,
+        snapshot_bytes: u64,
+        snapshot_digest: [u8; 32],
+        chunks: Vec<SnapshotChunkData>,
+        output: &mut Output,
+    ) {
+        if self.role != Role::Leader {
+            return;
+        }
+        if last_included_index.is_zero()
+            || chunks.is_empty()
+            || chunks.len() > MAX_SNAPSHOT_CHUNKS
+            || snapshot_bytes == 0
+            || snapshot_bytes > MAX_SNAPSHOT_BYTES
+        {
+            return;
+        }
+        let mut total: u64 = 0;
+        for entry in &chunks {
+            if entry.chunk.is_empty() || entry.chunk.len() > MAX_SNAPSHOT_CHUNK_BYTES {
+                return;
+            }
+            total = total.saturating_add(entry.chunk.len() as u64);
+        }
+        if total != snapshot_bytes {
+            return;
+        }
+        self.leader_snapshot = Some(LeaderSnapshot {
+            last_included_index,
+            last_included_term,
+            snapshot_bytes,
+            snapshot_digest,
+            chunks,
+        });
+        let peers: Vec<NodeId> = self.config.peers.iter().copied().collect();
+        for peer in peers {
+            self.replicate_to(peer, output);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn handle_install_snapshot_request(
+        &mut self,
+        from: NodeId,
+        term: Term,
+        leader_id: NodeId,
+        last_included_index: LogIndex,
+        last_included_term: Term,
+        chunk_index: u32,
+        total_chunks: u32,
+        chunk: Bytes,
+        chunk_crc: u32,
+        snapshot_digest: [u8; 32],
+        snapshot_bytes: u64,
+        output: &mut Output,
+    ) {
+        if term < self.term {
+            output.messages.push(OutboundMessage {
+                to: from,
+                message: Message::InstallSnapshotResponse {
+                    term: self.term,
+                    success: false,
+                    match_index: LogIndex::from_raw(0),
+                    next_chunk: 0,
+                    from: self.config.node_id,
+                },
+            });
+            return;
+        }
+        let mut term_persist_token: Option<PersistToken> = None;
+        if term > self.term {
+            term_persist_token = self.transition_to_follower(term, output);
+        }
+        if term >= self.term {
+            self.election_elapsed_ticks = 0;
+            self.leader_sticky = true;
+            if self.role != Role::Follower {
+                let same_term_token = self.transition_to_follower(term, output);
+                assert!(
+                    same_term_token.is_none(),
+                    "same-term follower transition must not require persistence"
+                );
+            }
+        }
+
+        let valid = !last_included_index.is_zero()
+            && total_chunks > 0
+            && usize::try_from(total_chunks).is_ok_and(|n| n <= MAX_SNAPSHOT_CHUNKS)
+            && snapshot_bytes > 0
+            && snapshot_bytes <= MAX_SNAPSHOT_BYTES
+            && chunk_index < total_chunks
+            && chunk.len() <= MAX_SNAPSHOT_CHUNK_BYTES
+            && (chunk.len() as u64) <= snapshot_bytes;
+        if !valid {
+            let rejection = OutboundMessage {
+                to: from,
+                message: Message::InstallSnapshotResponse {
+                    term: self.term,
+                    success: false,
+                    match_index: LogIndex::from_raw(0),
+                    next_chunk: 0,
+                    from: self.config.node_id,
+                },
+            };
+            if let Some(token) = term_persist_token {
+                self.queue_pending_action(token, PendingAction::SendMessage(rejection));
+            } else {
+                output.messages.push(rejection);
+            }
+            return;
+        }
+
+        if last_included_index <= self.commit_index {
+            let ack = OutboundMessage {
+                to: from,
+                message: Message::InstallSnapshotResponse {
+                    term: self.term,
+                    success: true,
+                    match_index: last_included_index,
+                    next_chunk: total_chunks,
+                    from: self.config.node_id,
+                },
+            };
+            if let Some(token) = term_persist_token {
+                self.queue_pending_action(token, PendingAction::SendMessage(ack));
+            } else {
+                output.messages.push(ack);
+            }
+            return;
+        }
+
+        let same_stream = self.follower_snapshot.as_ref().is_some_and(|pending| {
+            pending.leader == leader_id
+                && pending.term == term
+                && pending.last_included_index == last_included_index
+                && pending.last_included_term == last_included_term
+                && pending.total_chunks == total_chunks
+                && pending.snapshot_digest == snapshot_digest
+                && pending.snapshot_bytes == snapshot_bytes
+        });
+        if !same_stream {
+            let total = usize::try_from(total_chunks).unwrap_or(0);
+            let mut slots = Vec::new();
+            slots.resize_with(total, || None);
+            self.follower_snapshot = Some(FollowerSnapshot {
+                leader: leader_id,
+                term,
+                last_included_index,
+                last_included_term,
+                total_chunks,
+                snapshot_bytes,
+                snapshot_digest,
+                chunks: slots,
+                received: 0,
+            });
+        }
+
+        let mut wanted = total_chunks;
+        let mut complete = false;
+        let mut chunk_ok = true;
+        if let Some(pending) = self.follower_snapshot.as_mut() {
+            let crc_ok = crc32c::crc32c(&chunk) == chunk_crc;
+            chunk_ok = crc_ok;
+            if crc_ok {
+                let slot = usize::try_from(chunk_index).unwrap_or(pending.chunks.len());
+                if slot < pending.chunks.len() && pending.chunks[slot].is_none() {
+                    pending.chunks[slot] = Some(chunk);
+                    pending.received = pending.received.saturating_add(1);
+                }
+                if pending.received >= pending.total_chunks {
+                    complete = true;
+                } else {
+                    wanted = first_missing(pending);
+                }
+            }
+        }
+
+        if complete {
+            let assembled = self.follower_snapshot.as_ref().map(|pending| {
+                let mut full = Vec::new();
+                for bytes in pending.chunks.iter().flatten() {
+                    full.extend_from_slice(bytes);
+                }
+                Bytes::from(full)
+            });
+            if let Some(data) = assembled {
+                if *blake3::hash(&data).as_bytes() != snapshot_digest {
+                    self.follower_snapshot = None;
+                    let rejection = OutboundMessage {
+                        to: from,
+                        message: Message::InstallSnapshotResponse {
+                            term: self.term,
+                            success: false,
+                            match_index: LogIndex::from_raw(0),
+                            next_chunk: 0,
+                            from: self.config.node_id,
+                        },
+                    };
+                    if let Some(token) = term_persist_token {
+                        self.queue_pending_action(token, PendingAction::SendMessage(rejection));
+                    } else {
+                        output.messages.push(rejection);
+                    }
+                    return;
+                }
+                self.log
+                    .install_snapshot(last_included_index, last_included_term);
+                if last_included_index > self.commit_index {
+                    self.commit_index = last_included_index;
+                }
+                output.ready_snapshots.push(ReceivedSnapshot {
+                    last_included_index,
+                    last_included_term,
+                    data,
+                });
+                self.follower_snapshot = None;
+                let ack = OutboundMessage {
+                    to: from,
+                    message: Message::InstallSnapshotResponse {
+                        term: self.term,
+                        success: true,
+                        match_index: last_included_index,
+                        next_chunk: total_chunks,
+                        from: self.config.node_id,
+                    },
+                };
+                if let Some(token) = term_persist_token {
+                    self.queue_pending_action(token, PendingAction::SendMessage(ack));
+                } else {
+                    output.messages.push(ack);
+                }
+                return;
+            }
+        }
+
+        let ack = OutboundMessage {
+            to: from,
+            message: Message::InstallSnapshotResponse {
+                term: self.term,
+                success: chunk_ok,
+                match_index: LogIndex::from_raw(0),
+                next_chunk: wanted,
+                from: self.config.node_id,
+            },
+        };
+        if let Some(token) = term_persist_token {
+            self.queue_pending_action(token, PendingAction::SendMessage(ack));
+        } else {
+            output.messages.push(ack);
+        }
+    }
+
+    fn handle_install_snapshot_response(
+        &mut self,
+        from: NodeId,
+        term: Term,
+        success: bool,
+        match_index: LogIndex,
+        next_chunk: u32,
+        output: &mut Output,
+    ) {
+        if term > self.term {
+            self.transition_to_follower(term, output);
+            return;
+        }
+        if self.role != Role::Leader || term != self.term {
+            return;
+        }
+        let snapshot_state = self.progress.get(&from).and_then(|progress| {
+            if let crate::progress::ProgressState::Snapshot(state) = progress.state {
+                Some(state)
+            } else {
+                None
+            }
+        });
+        let Some(state) = snapshot_state else {
+            return;
+        };
+        if let Some(progress) = self.progress.get_mut(&from) {
+            progress.inflight_count = progress.inflight_count.saturating_sub(1);
+        }
+        if success && match_index >= state.last_included_index {
+            if let Some(progress) = self.progress.get_mut(&from) {
+                progress.exit_snapshot(match_index);
+            }
+            self.heartbeat_acks.insert(from);
+            self.maybe_advance_commit(output);
+            self.replicate_to(from, output);
+            return;
+        }
+        let total = state.total_chunks;
+        let mut wanted = next_chunk.min(total);
+        if wanted >= total {
+            wanted = total.saturating_sub(1);
+        }
+        if let Some(progress) = self.progress.get_mut(&from)
+            && let crate::progress::ProgressState::Snapshot(snapshot) = &mut progress.state
+        {
+            snapshot.next_chunk = wanted;
+        }
+        while self
+            .progress
+            .get(&from)
+            .is_some_and(crate::progress::PeerProgress::can_send_snapshot)
+        {
+            self.send_snapshot_chunk(from, output);
         }
     }
 
@@ -1128,6 +1653,7 @@ impl RaftCore {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_message(&mut self, from: NodeId, message: Message, output: &mut Output) {
         match message {
             Message::PreVoteRequest {
@@ -1214,6 +1740,45 @@ impl RaftCore {
             Message::TimeoutNow { term, leader_id } => {
                 self.handle_timeout_now(term, leader_id, output);
             }
+            Message::InstallSnapshotRequest {
+                term,
+                leader_id,
+                last_included_index,
+                last_included_term,
+                chunk_index,
+                total_chunks,
+                chunk,
+                chunk_crc,
+                snapshot_digest,
+                snapshot_bytes,
+            } => self.handle_install_snapshot_request(
+                from,
+                term,
+                leader_id,
+                last_included_index,
+                last_included_term,
+                chunk_index,
+                total_chunks,
+                chunk,
+                chunk_crc,
+                snapshot_digest,
+                snapshot_bytes,
+                output,
+            ),
+            Message::InstallSnapshotResponse {
+                term,
+                success,
+                match_index,
+                next_chunk,
+                ..
+            } => self.handle_install_snapshot_response(
+                from,
+                term,
+                success,
+                match_index,
+                next_chunk,
+                output,
+            ),
         }
     }
 
@@ -1241,6 +1806,11 @@ impl RaftCore {
         self.lead_transferee = None;
         self.pre_votes_granted.clear();
         self.votes_granted.clear();
+        self.leader_snapshot = None;
+        self.snapshot_requested.clear();
+        if term_changed {
+            self.follower_snapshot = None;
+        }
 
         if term_changed {
             let token = self.next_token();

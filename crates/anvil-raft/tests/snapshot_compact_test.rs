@@ -26,7 +26,7 @@ fn test_log_compact_drops_prefix_and_keeps_suffix() {
     assert_eq!(log.base_index(), LogIndex::from_raw(6));
     assert_eq!(log.last_index(), LogIndex::from_raw(10));
     assert_eq!(log.len(), 4);
-    assert!(log.term_at(LogIndex::from_raw(6)).is_none());
+    assert_eq!(log.term_at(LogIndex::from_raw(6)), Some(Term::from_raw(1)));
     assert!(log.entry_at(LogIndex::from_raw(6)).is_none());
     assert_eq!(log.term_at(LogIndex::from_raw(7)), Some(Term::from_raw(1)));
     let sliced = log.slice_from(LogIndex::from_raw(1), usize::MAX);

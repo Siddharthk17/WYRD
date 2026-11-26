@@ -16,6 +16,7 @@ pub struct RaftLog {
     entries: Vec<Entry>,
     hasher: blake3::Hasher,
     base_index: LogIndex,
+    base_term: Term,
 }
 
 impl Default for RaftLog {
@@ -59,10 +60,12 @@ impl RaftLog {
         for entry in &entries {
             Self::hash_entry(&mut hasher, entry);
         }
+        let base_term = Term::from_raw(0);
         Self {
             entries,
             hasher,
             base_index,
+            base_term,
         }
     }
 
@@ -82,6 +85,12 @@ impl RaftLog {
     #[must_use]
     pub const fn base_index(&self) -> LogIndex {
         self.base_index
+    }
+
+    /// Returns the term of the highest compacted index, 0 when nothing is compacted.
+    #[must_use]
+    pub const fn base_term(&self) -> Term {
+        self.base_term
     }
 
     /// Returns the highest log index present in the log, or the base when empty.
@@ -109,7 +118,10 @@ impl RaftLog {
         }
         let raw = index.as_u64();
         let base = self.base_index.as_u64();
-        if raw <= base {
+        if raw == base {
+            return Some(self.base_term);
+        }
+        if raw < base {
             return None;
         }
         let offset = raw - base - 1;
@@ -173,6 +185,18 @@ impl RaftLog {
     /// snapshot index minus the retained window, and never beyond the applied
     /// index. Callers enforce durability; this enforces the index bound.
     pub fn compact(&mut self, up_to: LogIndex) {
+        assert!(
+            self.term_at(up_to).is_some(),
+            "compaction target must have a known term"
+        );
+        let up_to_term = self.term_at(up_to).unwrap_or(Term::from_raw(0));
+        self.compact_with_term(up_to, up_to_term);
+    }
+
+    /// Drops the log prefix at or below `up_to`, recording its term so that
+    /// later `AppendEntries` previous-entry checks still resolve. Callers
+    /// enforce durability and the never-beyond-applied bound.
+    pub fn compact_with_term(&mut self, up_to: LogIndex, up_to_term: Term) {
         let raw = up_to.as_u64();
         let base = self.base_index.as_u64();
         let last = self.last_index().as_u64();
@@ -181,6 +205,17 @@ impl RaftLog {
         let drop = (raw - base) as usize;
         self.entries.drain(..drop);
         self.base_index = up_to;
+        self.base_term = up_to_term;
+        self.rebuild_hasher();
+    }
+
+    /// Atomically installs a verified snapshot: the log is replaced by the
+    /// snapshot's last included index and term. All earlier entries are gone,
+    /// so the caller must have persisted the snapshot state first.
+    pub fn install_snapshot(&mut self, last_included_index: LogIndex, last_included_term: Term) {
+        self.entries.clear();
+        self.base_index = last_included_index;
+        self.base_term = last_included_term;
         self.rebuild_hasher();
     }
 
