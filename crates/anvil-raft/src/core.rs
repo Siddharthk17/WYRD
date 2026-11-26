@@ -1066,7 +1066,12 @@ impl RaftCore {
         }
 
         if leader_commit > self.commit_index {
-            let target_commit = std::cmp::min(leader_commit, self.log.last_index());
+            // Commit only up to the matched prefix: an empty AppendEntries
+            // (or a duplicate resend) carries no new entries, so the
+            // follower's tail beyond `new_match` is still divergent and
+            // must not be committed. `new_match` is the last index the
+            // leader and follower are known to agree on.
+            let target_commit = std::cmp::min(leader_commit, new_match);
             if target_commit > self.commit_index {
                 self.commit_to(target_commit, output);
             }

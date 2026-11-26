@@ -1699,6 +1699,58 @@ fn test_heartbeat_commits_only_when_entry_matches_leader_term() {
 }
 
 #[test]
+fn test_empty_append_does_not_commit_divergent_tail() {
+    let divergent = vec![
+        Entry::normal(
+            LogIndex::from_raw(1),
+            Term::from_raw(1),
+            Bytes::from_static(b"a"),
+        ),
+        Entry::normal(
+            LogIndex::from_raw(2),
+            Term::from_raw(1),
+            Bytes::from_static(b"b"),
+        ),
+        Entry::normal(
+            LogIndex::from_raw(3),
+            Term::from_raw(1),
+            Bytes::from_static(b"divergent"),
+        ),
+    ];
+    let mut follower = make_core_with_log(2, &[1], Term::from_raw(1), divergent);
+    let mut output = Output::new();
+    let leader = NodeId::new(1).expect("leader");
+    follower.step(
+        Input::Recv {
+            from: leader,
+            message: Message::AppendEntriesRequest {
+                term: Term::from_raw(2),
+                leader_id: leader,
+                prev_log_index: LogIndex::from_raw(2),
+                prev_log_term: Term::from_raw(1),
+                entries: Vec::new(),
+                leader_commit: LogIndex::from_raw(4),
+            },
+        },
+        &mut output,
+    );
+    for token in persisted_tokens(&output) {
+        output.clear();
+        follower.step(Input::Persisted { token }, &mut output);
+    }
+    assert_eq!(
+        follower.commit_index(),
+        LogIndex::from_raw(2),
+        "empty append must commit only the matched prefix, not the divergent tail"
+    );
+    assert_eq!(
+        follower.log().term_at(LogIndex::from_raw(3)),
+        Some(Term::from_raw(1)),
+        "divergent tail must survive until the leader overwrites it"
+    );
+}
+
+#[test]
 fn test_heartbeat_response_drives_replication_only_when_behind() {
     let mut config = base_config(1, &[2]);
     config.max_inflight_messages = 1;
