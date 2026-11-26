@@ -52,3 +52,6 @@ MC.tla
 MC.cfg
 *.class
 *.dot
+
+# Go cross-check build output
+crates/anvil-check/tests/porcupine/anvilporcupine
