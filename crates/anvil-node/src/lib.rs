@@ -31,7 +31,7 @@ pub enum ReadConsistency {
 }
 
 /// Node behavior switches.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct NodeConfig {
     /// State machine limits.
     pub kv: KvConfig,
@@ -48,6 +48,24 @@ pub struct NodeConfig {
     /// answer leader reads immediately. The checker must catch the stale
     /// read. Never enabled in production.
     pub skip_read_confirmation: bool,
+    /// Bound on queued linearizable and follower reads waiting for quorum
+    /// confirmation or apply. When full the oldest waiter is shed (its
+    /// client times out and retries) instead of growing without bound.
+    pub max_pending_reads: usize,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            kv: KvConfig::default(),
+            snapshot_policy: SnapshotPolicy::default(),
+            lease_enabled: false,
+            lease_ticks: 0,
+            drift_bound_ticks: 0,
+            skip_read_confirmation: false,
+            max_pending_reads: 512,
+        }
+    }
 }
 
 /// A client write request. `RegisterSession` carries no session yet.
@@ -320,7 +338,7 @@ impl Node {
             ReadConsistency::Lease => self.read_lease(&read),
             ReadConsistency::Linearizable => self.read_leader(&read, output),
             ReadConsistency::FollowerLinearizable => {
-                self.pending_reads.push(PendingRead {
+                self.enqueue_pending_read(PendingRead {
                     read,
                     consistency,
                     read_index: Some(self.raft.commit_index()),
@@ -337,6 +355,12 @@ impl Node {
     /// the same call after contacting the leader.
     pub fn follower_read_target(&self) -> LogIndex {
         self.raft.commit_index()
+    }
+
+    /// Returns the number of reads currently waiting for confirmation.
+    #[must_use]
+    pub fn pending_read_count(&self) -> usize {
+        self.pending_reads.len()
     }
 
     /// Notifies the storage layer that a persist operation completed.
@@ -372,6 +396,15 @@ impl Node {
         self.kv.apply(index, payload).unwrap_or(KvResponse::Ok)
     }
 
+    /// Queues a pending read, shedding the oldest waiter when the
+    /// bounded wait queue is full.
+    fn enqueue_pending_read(&mut self, pending: PendingRead) {
+        while self.pending_reads.len() >= self.config.max_pending_reads.max(1) {
+            self.pending_reads.remove(0);
+        }
+        self.pending_reads.push(pending);
+    }
+
     fn read_lease(&mut self, read: &NodeRead) -> Option<ClientResponse> {
         if !self.config.lease_enabled {
             return None;
@@ -404,7 +437,7 @@ impl Node {
         ctx.extend_from_slice(&self.read_seq.to_le_bytes());
         ctx.extend_from_slice(&self.now_tick.to_le_bytes());
         let context = Bytes::from(ctx);
-        self.pending_reads.push(PendingRead {
+        self.enqueue_pending_read(PendingRead {
             read: read.clone(),
             consistency: ReadConsistency::Linearizable,
             read_index: None,

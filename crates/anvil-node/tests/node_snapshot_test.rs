@@ -240,3 +240,44 @@ fn test_node_snapshot_supply_install_and_rejoin() {
         KvResponse::Value { value: Some(_), .. }
     ));
 }
+
+#[test]
+fn test_follower_read_wait_queue_is_bounded() {
+    let mut nodes: BTreeMap<NodeId, Node> = [(1, make_node(1, &[2])), (2, make_node(2, &[1]))]
+        .into_iter()
+        .map(|(n, node)| (node_id(n), node))
+        .collect();
+    let mut outs: BTreeMap<NodeId, NodeOutput> = [1, 2]
+        .iter()
+        .map(|n| (node_id(*n), NodeOutput::default()))
+        .collect();
+    let mut isolated: Vec<NodeId> = Vec::new();
+
+    for _ in 0..10 {
+        pump_round(&mut nodes, &mut outs, &isolated);
+        if nodes[&node_id(1)].role() == Role::Leader {
+            break;
+        }
+    }
+    assert_eq!(nodes[&node_id(1)].role(), Role::Leader);
+
+    // Node 2 goes silent: quorum acks stop arriving, so every linearizable
+    // read on node 1 queues instead of completing.
+    isolated.push(node_id(2));
+    let bound = NodeConfig::default().max_pending_reads;
+    let mut leader_out = NodeOutput::default();
+    for _ in 0..bound + 5 {
+        let _ = nodes.get_mut(&node_id(1)).expect("leader").client_read(
+            NodeRead::Get {
+                key: Bytes::from_static(b"k"),
+            },
+            ReadConsistency::Linearizable,
+            &mut leader_out,
+        );
+    }
+    let queued = nodes[&node_id(1)].pending_read_count();
+    assert_eq!(
+        queued, bound,
+        "wait queue must hold exactly the bound, shedding the oldest"
+    );
+}

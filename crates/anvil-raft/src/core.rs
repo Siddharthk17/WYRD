@@ -99,6 +99,7 @@ pub struct RaftCore {
     pending_persists: Vec<(PersistToken, PendingAction)>,
     leader_persisted_index: LogIndex,
     leader_sticky: bool,
+    transfer_elapsed: u64,
     leader_snapshot: Option<LeaderSnapshot>,
     follower_snapshot: Option<FollowerSnapshot>,
     snapshot_requested: BTreeMap<NodeId, LogIndex>,
@@ -163,6 +164,7 @@ impl RaftCore {
             pending_persists: Vec::with_capacity(64),
             leader_persisted_index: last_log_idx,
             leader_sticky: false,
+            transfer_elapsed: 0,
             leader_snapshot: None,
             follower_snapshot: None,
             snapshot_requested: BTreeMap::new(),
@@ -285,6 +287,17 @@ impl RaftCore {
             Role::Leader => {
                 self.heartbeat_elapsed_ticks = self.heartbeat_elapsed_ticks.saturating_add(1);
                 self.election_elapsed_ticks = self.election_elapsed_ticks.saturating_add(1);
+
+                // A transfer that cannot finish within one election timeout
+                // aborts so proposals resume: the transferee is partitioned,
+                // too far behind, or gone.
+                if self.lead_transferee.is_some() {
+                    self.transfer_elapsed = self.transfer_elapsed.saturating_add(1);
+                    if self.transfer_elapsed >= self.config.election_timeout_ticks {
+                        self.lead_transferee = None;
+                        self.transfer_elapsed = 0;
+                    }
+                }
 
                 if self.heartbeat_elapsed_ticks >= self.config.heartbeat_interval_ticks {
                     self.heartbeat_elapsed_ticks = 0;
@@ -527,6 +540,7 @@ impl RaftCore {
     fn become_leader(&mut self, output: &mut Output) {
         self.transition_role(Role::Leader, output);
         self.lead_transferee = None;
+        self.transfer_elapsed = 0;
         self.heartbeat_elapsed_ticks = 0;
         self.election_elapsed_ticks = 0;
         self.heartbeat_acks.clear();
@@ -1083,6 +1097,7 @@ impl RaftCore {
                     },
                 });
                 self.lead_transferee = None;
+                self.transfer_elapsed = 0;
             }
         } else {
             let last_idx_fn = |term| self.log.find_last_index_of_term(term);
@@ -1678,8 +1693,12 @@ impl RaftCore {
         if self.role != Role::Leader || to == self.config.node_id {
             return;
         }
+        if !self.progress.contains_key(&to) {
+            return;
+        }
 
         self.lead_transferee = Some(to);
+        self.transfer_elapsed = 0;
 
         if let Some(peer) = self.progress.get(&to) {
             if peer.match_index >= self.log.last_index() {
@@ -1691,6 +1710,7 @@ impl RaftCore {
                     },
                 });
                 self.lead_transferee = None;
+                self.transfer_elapsed = 0;
             } else {
                 self.broadcast_append_entries(output);
             }
@@ -1890,6 +1910,7 @@ impl RaftCore {
             self.voted_for = None;
         }
         self.lead_transferee = None;
+        self.transfer_elapsed = 0;
         self.pre_votes_granted.clear();
         self.votes_granted.clear();
         self.leader_snapshot = None;
