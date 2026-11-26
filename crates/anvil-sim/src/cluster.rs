@@ -61,7 +61,27 @@ pub struct SimNodeStorage {
     /// Whether this node refused to start due to unrecoverable hard-state corruption.
     pub refused_start: bool,
     /// Record of all log entries whose persistence has been acknowledged.
+    /// Entries land here only when their own persist operation completes:
+    /// a hard-state completion never acknowledges log entries, and an
+    /// in-flight batch is never counted early. The restart check treats
+    /// this as the durable record, so overstating it would demand bytes
+    /// the disk never saw.
     pub acknowledged_entries: Vec<(LogIndex, Term)>,
+    /// Log entries staged but not yet acknowledged, keyed by persist
+    /// token. Core tokens belong to one core persist operation each;
+    /// internal tokens (allocated from `next_internal_token`) belong to
+    /// one sim-internal staging each. Cleared on crash: completions from
+    /// a dead engine incarnation never arrive.
+    pub pending_ack_entries: BTreeMap<u64, Vec<(LogIndex, Term)>>,
+    /// Hard-state votes staged but not yet acknowledged, keyed by persist
+    /// token. A vote counts as persisted only when its own write
+    /// completes, never when an unrelated batch does.
+    pub pending_ack_votes: BTreeMap<u64, (Term, Option<NodeId>)>,
+    /// Next sim-internal persist token, allocated downward from `u64::MAX`
+    /// so it never collides with core tokens. Sim-internal stagings
+    /// (sync, backfill, reconcile) need completion granularity the shared
+    /// token zero cannot give.
+    pub next_internal_token: u64,
     /// Record of all votes persisted to disk per term.
     pub persisted_votes: BTreeMap<Term, Option<NodeId>>,
     /// Active storage configuration.
@@ -242,6 +262,9 @@ impl SimCluster {
                     repair_from: None,
                     refused_start: false,
                     acknowledged_entries: Vec::new(),
+                    pending_ack_entries: BTreeMap::new(),
+                    pending_ack_votes: BTreeMap::new(),
+                    next_internal_token: u64::MAX,
                     persisted_votes: BTreeMap::new(),
                     config: storage_config,
                 },
@@ -372,14 +395,22 @@ impl SimCluster {
                         entries_to_sync.push(entry.clone());
                     }
                 }
+                let mut completed = Vec::new();
                 if !entries_to_sync.is_empty() {
                     let sync_prev = LogIndex::from_raw(sync_from.saturating_sub(1));
+                    let token = storage.next_internal_token;
+                    storage.next_internal_token =
+                        storage.next_internal_token.saturating_sub(1);
+                    storage.pending_ack_entries.insert(
+                        token,
+                        entries_to_sync.iter().map(|e| (e.index, e.term)).collect(),
+                    );
                     storage.engine_output.clear();
                     storage.engine.step(
                         EngineInput::AppendEntries {
                             prev_index: sync_prev,
                             entries: entries_to_sync,
-                            token: 0,
+                            token,
                         },
                         &mut storage.engine_output,
                     );
@@ -392,16 +423,11 @@ impl SimCluster {
                             .engine
                             .step(EngineInput::Completion(comp), &mut storage.engine_output);
                     }
+                    completed = std::mem::take(&mut storage.engine_output.persisted_tokens);
                     storage.engine_output.clear();
-                    storage.acknowledged_entries = core
-                        .log()
-                        .entries()
-                        .iter()
-                        .map(|e| (e.index, e.term))
-                        .collect();
-                    if let Some(v) = core.voted_for() {
-                        storage.persisted_votes.insert(core.term(), Some(v));
-                    }
+                }
+                for token_val in completed {
+                    self.acknowledge_token(node_id, token_val);
                 }
             }
         }
@@ -463,6 +489,7 @@ impl SimCluster {
                 for op in persist_ops {
                     match op {
                         anvil_raft::PersistOp::HardState { term, vote, token } => {
+                            storage.pending_ack_votes.insert(token.0, (term, vote));
                             storage.engine.step(
                                 EngineInput::WriteHardState {
                                     term,
@@ -477,6 +504,10 @@ impl SimCluster {
                             entries,
                             token,
                         } => {
+                            storage.pending_ack_entries.insert(
+                                token.0,
+                                entries.iter().map(|e| (e.index, e.term)).collect(),
+                            );
                             storage.engine.step(
                                 EngineInput::AppendEntries {
                                     prev_index,
@@ -491,6 +522,10 @@ impl SimCluster {
                             entries,
                             token,
                         } => {
+                            storage.pending_ack_entries.insert(
+                                token.0,
+                                entries.iter().map(|e| (e.index, e.term)).collect(),
+                            );
                             storage.engine.step(
                                 EngineInput::TruncateAndAppend {
                                     from_index,
@@ -547,22 +582,12 @@ impl SimCluster {
 
         if !completed_tokens.is_empty() {
             let mut all_follow_ups = Vec::new();
-            let mut latest_log_and_vote = None;
 
-            for token_val in completed_tokens {
+            for &token_val in &completed_tokens {
                 let token = anvil_raft::PersistToken(token_val);
                 self.output_scratch.clear();
                 if let Some(core) = self.nodes.get_mut(&node_id) {
                     core.step(Input::Persisted { token }, &mut self.output_scratch);
-                    latest_log_and_vote = Some((
-                        core.log()
-                            .entries()
-                            .iter()
-                            .map(|entry| (entry.index, entry.term))
-                            .collect::<Vec<_>>(),
-                        core.term(),
-                        core.voted_for(),
-                    ));
                 }
                 all_follow_ups.append(&mut self.output_scratch.messages);
                 self.sometimes_hits
@@ -571,13 +596,12 @@ impl SimCluster {
                 self.stash_snapshot_outputs(node_id);
             }
 
-            if let (Some((entries, term, vote)), Some(storage)) =
-                (latest_log_and_vote, self.storage.get_mut(&node_id))
-            {
-                storage.acknowledged_entries = entries;
-                if let Some(cand) = vote {
-                    storage.persisted_votes.insert(term, Some(cand));
-                }
+            // Acknowledge exactly what each completed operation persisted:
+            // log entries staged under a completed WAL token, votes under
+            // a completed hard-state token. Anything else is still
+            // in flight and must not read as durable.
+            for token_val in completed_tokens {
+                self.acknowledge_token(node_id, token_val);
             }
 
             if let Some(atlas) = &self.fault_atlas
@@ -649,16 +673,23 @@ impl SimCluster {
         if entries.is_empty() {
             return !self.is_node_crashed(node_id);
         }
+        let token = self.internal_persist_token(node_id);
+        let Some(token) = token else {
+            return false;
+        };
+        let pending: Vec<(LogIndex, Term)> =
+            entries.iter().map(|e| (e.index, e.term)).collect();
         let Some(storage) = self.storage.get_mut(&node_id) else {
             return false;
         };
+        storage.pending_ack_entries.insert(token, pending);
         let prev_index = entries[0].index.prev().unwrap_or(LogIndex::from_raw(0));
         storage.engine_output.clear();
         storage.engine.step(
             EngineInput::AppendEntries {
                 prev_index,
                 entries,
-                token: 0,
+                token,
             },
             &mut storage.engine_output,
         );
@@ -671,12 +702,54 @@ impl SimCluster {
                 .engine
                 .step(EngineInput::Completion(comp), &mut storage.engine_output);
         }
+        let completed: Vec<u64> = std::mem::take(&mut storage.engine_output.persisted_tokens);
         storage.engine_output.clear();
+        for token_val in completed {
+            self.acknowledge_token(node_id, token_val);
+        }
         if self.drive_storage(node_id) {
             self.crash_node(node_id);
             return false;
         }
+        if let Some(storage) = self.storage.get_mut(&node_id) {
+            let completed: Vec<u64> =
+                std::mem::take(&mut storage.engine_output.persisted_tokens);
+            storage.engine_output.clear();
+            for token_val in completed {
+                self.acknowledge_token(node_id, token_val);
+            }
+        }
         !self.is_node_crashed(node_id)
+    }
+
+    /// Allocates a sim-internal persist token for one staging, or `None`
+    /// when the node has no storage. Counts down from `u64::MAX` so it
+    /// never collides with core tokens.
+    fn internal_persist_token(&mut self, node_id: NodeId) -> Option<u64> {
+        let storage = self.storage.get_mut(&node_id)?;
+        let token = storage.next_internal_token;
+        storage.next_internal_token = storage.next_internal_token.saturating_sub(1);
+        Some(token)
+    }
+
+    /// Moves one completed persist token into the durable record: staged
+    /// log entries join the acknowledgments, staged votes join the
+    /// persisted votes. Unknown tokens (core-internal or already
+    /// consumed) are ignored. The atlas learns the full vector in the
+    /// main completion flow, which re-records idempotently.
+    pub fn acknowledge_token(&mut self, node_id: NodeId, token: u64) {
+        if let Some(storage) = self.storage.get_mut(&node_id) {
+            if let Some(entries) = storage.pending_ack_entries.remove(&token) {
+                for acked in entries {
+                    if !storage.acknowledged_entries.contains(&acked) {
+                        storage.acknowledged_entries.push(acked);
+                    }
+                }
+            }
+            if let Some((term, vote)) = storage.pending_ack_votes.remove(&token) {
+                storage.persisted_votes.insert(term, vote);
+            }
+        }
     }
 
     /// Returns the engine's durable tip for one node.
@@ -764,15 +837,22 @@ impl SimCluster {
             "snapshot reconcile found nothing to restage"
         );
         let new_tip = first.as_u64() + entries.len() as u64 - 1;
+        let token = self.internal_persist_token(node_id);
+        let Some(token) = token else {
+            return;
+        };
+        let pending: Vec<(LogIndex, Term)> =
+            entries.iter().map(|e| (e.index, e.term)).collect();
         let Some(storage) = self.storage.get_mut(&node_id) else {
             return;
         };
+        storage.pending_ack_entries.insert(token, pending);
         storage.engine_output.clear();
         storage.engine.step(
             EngineInput::TruncateAndAppend {
                 from_index: first,
                 entries,
-                token: 0,
+                token,
             },
             &mut storage.engine_output,
         );
@@ -785,15 +865,25 @@ impl SimCluster {
                 .engine
                 .step(EngineInput::Completion(comp), &mut storage.engine_output);
         }
+        let completed: Vec<u64> = std::mem::take(&mut storage.engine_output.persisted_tokens);
         storage.engine_output.clear();
+        for token_val in completed {
+            self.acknowledge_token(node_id, token_val);
+        }
         if self.drive_storage(node_id) {
             self.crash_node(node_id);
             return;
         }
         if let Some(storage) = self.storage.get_mut(&node_id) {
+            let completed: Vec<u64> =
+                std::mem::take(&mut storage.engine_output.persisted_tokens);
+            storage.engine_output.clear();
             storage
                 .acknowledged_entries
                 .retain(|(acked, _)| acked.as_u64() <= new_tip);
+            for token_val in completed {
+                self.acknowledge_token(node_id, token_val);
+            }
         }
     }
 
@@ -862,6 +952,11 @@ impl SimCluster {
         if let Some(storage) = self.storage.get_mut(&node_id) {
             storage.crashed = true;
             storage.device.crash();
+            // Completions from the dead engine incarnation never arrive:
+            // staged-but-unacknowledged entries and votes stay unacked.
+            // The durable acknowledgment record survives the crash.
+            storage.pending_ack_entries.clear();
+            storage.pending_ack_votes.clear();
         }
         self.nodes.remove(&node_id);
         self.network
