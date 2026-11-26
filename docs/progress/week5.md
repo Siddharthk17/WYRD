@@ -92,6 +92,21 @@
   Ten of the eleven remaining kv-storage seeds heal through the
   cascade, one through the sideline.
 
+### K. Durable Acknowledgments and Directory Sync (ADR 0031)
+
+- Staged entries and votes are acknowledged on their own persist
+  completion only; uncompleted work clears on crash.
+- The engine syncs the directory after the data batch covering new
+  files, and read-path rot lands on durable media so repair observes
+  exactly what recovery observed.
+
+### L. Hard-State Survivor Budget (ADR 0032)
+
+- The atlas records refused nodes and vetoes further hard-state loss
+  once the survivor budget is spent, so a second permanent loss
+  cannot take the last electable quorum. All four dead-cluster seeds
+  pass with the vetoed fault skipped.
+
 ---
 
 ## 2. Exit-Gate Commands and Real Output
@@ -104,7 +119,7 @@ TBD - farm running.
 
 ## 4. Architecture Decisions Taken
 
-- ADR 0019 through ADR 0030 (see docs/adr/).
+- ADR 0019 through ADR 0032 (see docs/adr/).
 
 ## 5. Open Items and Future Work
 
