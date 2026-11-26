@@ -37,12 +37,16 @@ fn test_engine_natural_batching_group_commit() {
         &mut output,
     );
 
-    assert_eq!(output.device_ops.len(), 2);
+    assert_eq!(output.device_ops.len(), 3);
     assert!(matches!(output.device_ops[0], DeviceOp::Write { .. }));
     let sync_op_id = match output.device_ops[1] {
         DeviceOp::Fdatasync { op_id, .. } => op_id,
         ref other => panic!("expected Fdatasync, got {other:?}"),
     };
+    assert!(
+        matches!(output.device_ops[2], DeviceOp::SyncDir { .. }),
+        "first batch must sync the directory covering pre-engine files"
+    );
     assert!(output.persisted_tokens.is_empty());
     output.clear();
 
@@ -141,6 +145,14 @@ fn test_engine_segment_rotation_and_preallocation() {
         },
         &mut output,
     );
+    let first_sync = output
+        .device_ops
+        .iter()
+        .find_map(|op| match op {
+            DeviceOp::Fdatasync { op_id, .. } => Some(*op_id),
+            _ => None,
+        })
+        .expect("first batch must sync data");
     output.clear();
 
     engine.step(
@@ -170,11 +182,48 @@ fn test_engine_segment_rotation_and_preallocation() {
         .iter()
         .any(|op| matches!(op, DeviceOp::SyncDir { .. }));
     assert!(
-        has_syncdir,
-        "engine must issue SyncDir after creating segment file"
+        !has_syncdir,
+        "directory sync waits for the batch flush so data lands before its entry"
     );
 
     assert_eq!(engine.active_segment_id(), 2);
+
+    let entry4 = Entry {
+        index: LogIndex::from_raw(4),
+        term: Term::from_raw(1),
+        kind: EntryKind::Normal,
+        payload: Bytes::from(vec![4u8; 100]),
+    };
+    output.clear();
+    engine.step(
+        EngineInput::AppendEntries {
+            prev_index: LogIndex::from_raw(3),
+            entries: vec![entry4],
+            token: 3,
+        },
+        &mut output,
+    );
+    // Completing the first sync flushes the staged suffix: header, entry,
+    // data sync, then the directory sync covering the new file.
+    output.clear();
+    engine.step(
+        EngineInput::Completion(DeviceCompletion {
+            op_id: first_sync,
+            result: Ok(CompletionPayload::Synced),
+        }),
+        &mut output,
+    );
+    let sync_pos = output
+        .device_ops
+        .iter()
+        .position(|op| matches!(op, DeviceOp::Fdatasync { .. }))
+        .expect("batch flush must sync data");
+    assert!(
+        output.device_ops[sync_pos + 1..]
+            .iter()
+            .any(|op| matches!(op, DeviceOp::SyncDir { .. })),
+        "engine must issue SyncDir after the data sync covering the new file"
+    );
 }
 
 #[test]

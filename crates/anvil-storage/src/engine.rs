@@ -128,6 +128,11 @@ pub struct StorageEngine {
     hard_state_syncs: Vec<HardStateSync>,
     // In-flight hard state verification reads awaiting comparison
     hard_state_verifies: Vec<HardStateVerify>,
+    // Directory entries changed since the last durable `SyncDir` (file
+    // creates, unlinks). Starts set: files predating the engine, written
+    // by node init, may never have been synced. Cleared when the sync is
+    // emitted with a WAL batch, so data lands before its directory entry.
+    dir_sync_pending: bool,
 
     // Pending coalesced batch (while sync is in flight)
     pending_tokens: Vec<u64>,
@@ -216,6 +221,7 @@ impl StorageEngine {
             completed_wal_syncs: std::collections::BTreeSet::new(),
             hard_state_syncs: Vec::with_capacity(4),
             hard_state_verifies: Vec::with_capacity(4),
+            dir_sync_pending: true,
             pending_tokens: Vec::with_capacity(64),
             pending_write_buffer: Vec::with_capacity(64 * 1024),
             pending_write_start_offset: segment_write_offset,
@@ -366,6 +372,7 @@ impl StorageEngine {
             completed_wal_syncs: std::collections::BTreeSet::new(),
             hard_state_syncs: Vec::with_capacity(4),
             hard_state_verifies: Vec::with_capacity(4),
+            dir_sync_pending: true,
             pending_tokens: Vec::with_capacity(64),
             pending_write_buffer: Vec::with_capacity(64 * 1024),
             pending_write_start_offset: sector_size.as_u64(),
@@ -810,6 +817,7 @@ impl StorageEngine {
                 true
             }
         });
+        let dir_changed = !unlinked.is_empty();
         for seg_id in unlinked {
             let unlink_op_id = self.next_op_id();
             output.device_ops.push(DeviceOp::Unlink {
@@ -818,13 +826,9 @@ impl StorageEngine {
             });
             self.seg_header_crcs.remove(&seg_id);
         }
-        if self.config.sync_directories && self.active_segment_id > new_seg {
-            let sync_dir_op_id = self.next_op_id();
-            output.device_ops.push(DeviceOp::SyncDir {
-                op_id: sync_dir_op_id,
-            });
+        if dir_changed {
+            self.dir_sync_pending = true;
         }
-
         // Truncate the surviving active file when rewound bytes were flushed.
         assert!(
             self.seg_header_crcs.contains_key(&new_seg),
@@ -952,13 +956,10 @@ impl StorageEngine {
             file_id: self.active_segment_file_id,
             preallocate_bytes: self.config.segment_capacity_bytes,
         });
-
-        if self.config.sync_directories {
-            let sync_dir_op_id = self.next_op_id();
-            output.device_ops.push(DeviceOp::SyncDir {
-                op_id: sync_dir_op_id,
-            });
-        }
+        // The new file needs a directory sync once its header lands. The
+        // next batch flush emits it after the data sync, so the directory
+        // entry never precedes the bytes it names.
+        self.dir_sync_pending = true;
 
         let sector_size = self.config.sector_size;
         let header = WalSegmentHeader::new(
@@ -1018,6 +1019,17 @@ impl StorageEngine {
             op_id: sync_op_id,
             file_id: self.active_segment_file_id,
         });
+
+        // Directory entries (segment creates, rewind unlinks, files that
+        // predate the engine) go durable after the data sync that covers
+        // them, never before.
+        if self.config.sync_directories && self.dir_sync_pending {
+            let sync_dir_op_id = self.next_op_id();
+            output.device_ops.push(DeviceOp::SyncDir {
+                op_id: sync_dir_op_id,
+            });
+            self.dir_sync_pending = false;
+        }
 
         self.in_flight_wal_syncs
             .push_back((sync_op_id, std::mem::take(&mut self.pending_tokens)));
