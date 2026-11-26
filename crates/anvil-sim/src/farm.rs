@@ -710,6 +710,8 @@ fn summary_json(profile: FarmProfile, summary: &FarmSummary) -> String {
 }
 
 /// Saves a failing seed's plan and failure report next to the JSONL output.
+/// The report carries the failing plan encoding plus a file-based repro
+/// command, so `cargo xtask repro` reruns it from a clean checkout.
 fn save_failure_artifact(dir: &std::path::Path, seed: u64, plan: &Plan, failure: &str) {
     use std::fmt::Write as _;
     let _ = std::fs::create_dir_all(dir);
@@ -719,10 +721,12 @@ fn save_failure_artifact(dir: &std::path::Path, seed: u64, plan: &Plan, failure:
     report.push_str(&seed.to_string());
     report.push_str(",\"failure\":\"");
     json_escape_into(&mut report, failure);
+    report.push_str("\",\"plan\":\"");
+    json_escape_into(&mut report, &plan.encode());
     let _ = write!(
         report,
-        "\",\"repro\":\"cargo xtask repro '{}'\",\"plan_file\":\"{}\"}}",
-        plan.encode(),
+        "\",\"repro\":\"cargo xtask repro {}\",\"plan_file\":\"{}\"}}",
+        plan_path.display(),
         plan_path.display()
     );
     let _ = std::fs::write(dir.join(format!("seed_{seed}.json")), report);

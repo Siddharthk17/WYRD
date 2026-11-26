@@ -62,9 +62,13 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         storage_faults: bool,
     },
-    /// Replay a plan encoding, shrinking it on failure
+    /// Replay a plan encoding or plan file, shrinking it on failure.
+    /// Accepts a literal `anvil-plan/...` encoding, a path to a file
+    /// holding one, or a path to a JSON failure report with a "plan" field
+    /// (the farm's `seed_N.json` shape), so `cargo xtask repro plan.json`
+    /// works from a clean checkout.
     Repro {
-        /// Plan encoding as printed by `xtask plan`
+        /// Plan encoding or path to a plan file.
         plan: String,
     },
     /// Build and verify documentation
@@ -106,25 +110,107 @@ fn run_farm_command(seeds: usize, storage_faults: bool, kv: bool) -> ExitCode {
     }
 }
 
-fn run_repro_command(plan: &str) -> ExitCode {
-    let decoded = match anvil_sim::Plan::decode(plan) {
+fn run_repro_command(arg: &str) -> ExitCode {
+    let (plan, source) = match load_repro_plan(arg) {
         Err(err) => {
-            eprintln!("Repro error: invalid plan encoding: {err}");
+            eprintln!("{err}");
             return ExitCode::FAILURE;
         }
-        Ok(decoded) => decoded,
+        Ok(loaded) => loaded,
     };
-    if std::panic::catch_unwind(|| anvil_sim::run_plan(&decoded)).is_ok() {
-        println!("REPRO PASSED: plan completed with zero invariant violations.");
-        ExitCode::SUCCESS
-    } else {
-        let shrunk = anvil_sim::shrink_plan(&decoded, &|candidate| {
-            std::panic::catch_unwind(|| anvil_sim::run_plan(candidate)).is_err()
-        });
-        eprintln!("REPRO FAILED: plan reproduced the failure.");
-        eprintln!("Shrunk plan: {}", shrunk.encode());
-        ExitCode::FAILURE
+    // Workload plans replay through the KV runner, consensus plans through
+    // the consensus runner; either way the classifier names the failure and
+    // the shrinker must preserve it.
+    let runner = |candidate: &anvil_sim::Plan| {
+        if candidate.workload.is_some() {
+            anvil_sim::kv_plan_failure_class(candidate, false)
+        } else {
+            anvil_sim::consensus_failure_class(candidate)
+        }
+    };
+    match runner(&plan) {
+        None => {
+            println!("REPRO PASSED: plan completed with zero invariant violations.");
+            ExitCode::SUCCESS
+        }
+        Some(class) => {
+            let shrunk = anvil_sim::shrink_plan_same_class(&plan, &runner);
+            eprintln!("REPRO FAILED: {class}");
+            eprintln!(
+                "Shrunk plan ({} events): {}",
+                shrunk.events.len(),
+                shrunk.encode()
+            );
+            if let Some(path) = source {
+                let minimal = format!("{path}.minimal.plan");
+                match std::fs::write(&minimal, shrunk.encode()) {
+                    Ok(()) => eprintln!("cargo xtask repro {minimal}"),
+                    Err(err) => eprintln!("repro note: cannot write {minimal}: {err}"),
+                }
+            }
+            ExitCode::FAILURE
+        }
     }
+}
+
+/// Loads a plan from a literal encoding or from a file. Returns the plan
+/// and, when the input was a file path, that path for artifact output.
+fn load_repro_plan(arg: &str) -> Result<(anvil_sim::Plan, Option<String>), String> {
+    let trimmed = arg.trim();
+    let (content, source) = if std::path::Path::new(trimmed).exists() {
+        let text = std::fs::read_to_string(trimmed)
+            .map_err(|err| format!("Repro error: cannot read {trimmed}: {err}"))?;
+        (text, Some(trimmed.to_string()))
+    } else {
+        (trimmed.to_string(), None)
+    };
+    let content = content.trim();
+    let encoding = if content.starts_with('{') {
+        extract_plan_field(content)?
+    } else {
+        content.to_string()
+    };
+    anvil_sim::Plan::decode(&encoding)
+        .map_err(|err| format!("Repro error: invalid plan encoding: {err}"))
+        .map(|plan| (plan, source))
+}
+
+/// Extracts the `"plan"` string field from a JSON failure report.
+fn extract_plan_field(json: &str) -> Result<String, String> {
+    let key = json
+        .find("\"plan\"")
+        .ok_or_else(|| String::from("Repro error: JSON report has no \"plan\" field"))?;
+    let rest = &json[key + 6..];
+    let colon = rest
+        .find(':')
+        .ok_or_else(|| String::from("Repro error: malformed \"plan\" field"))?;
+    let mut chars = rest[colon + 1..].trim_start().chars();
+    if chars.next() != Some('"') {
+        return Err(String::from("Repro error: malformed \"plan\" field"));
+    }
+    let mut out = String::new();
+    let mut escaped = false;
+    for ch in chars {
+        if escaped {
+            match ch {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'u' => return Err(String::from("Repro error: unsupported unicode escape")),
+                _ => return Err(String::from("Repro error: bad string escape")),
+            }
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return Ok(out);
+        } else {
+            out.push(ch);
+        }
+    }
+    Err(String::from("Repro error: unterminated \"plan\" string"))
 }
 
 fn main() -> ExitCode {
@@ -216,5 +302,60 @@ fn main() -> ExitCode {
             );
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod repro_tests {
+    use super::{extract_plan_field, load_repro_plan, run_repro_command};
+    use std::process::ExitCode;
+
+    #[test]
+    fn test_extract_plan_field_reads_report_json() {
+        let encoding = anvil_sim::Plan::generate(7, false).encode();
+        let json = format!("{{\"seed\":7,\"failure\":\"boom\",\"plan\":\"{encoding}\"}}");
+        assert_eq!(extract_plan_field(&json).expect("plan field"), encoding);
+    }
+
+    #[test]
+    fn test_extract_plan_field_rejects_json_without_plan() {
+        assert!(extract_plan_field("{\"seed\":7}").is_err());
+        assert!(extract_plan_field("{\"plan\":7}").is_err());
+        assert!(extract_plan_field("{\"plan\":\"unterminated").is_err());
+    }
+
+    #[test]
+    fn test_repro_passes_on_quiet_plan() {
+        let encoding = anvil_sim::Plan::generate(4242, false).encode();
+        assert_eq!(run_repro_command(&encoding), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn test_repro_reads_plan_file() {
+        let dir = std::env::temp_dir().join("anvil-repro-file-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("seed_4242.plan");
+        let encoding = anvil_sim::Plan::generate(4242, false).encode();
+        std::fs::write(&path, &encoding).expect("write plan file");
+        let (plan, source) = load_repro_plan(&path.to_string_lossy()).expect("file loads");
+        assert_eq!(plan.encode(), encoding);
+        assert_eq!(source, Some(path.to_string_lossy().into_owned()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_repro_reads_json_report() {
+        let encoding = anvil_sim::Plan::generate(4242, false).encode();
+        let dir = std::env::temp_dir().join("anvil-repro-json-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("seed_4242.json");
+        std::fs::write(&path, format!("{{\"seed\":4242,\"plan\":\"{encoding}\"}}"))
+            .expect("write report");
+        assert_eq!(
+            run_repro_command(&path.to_string_lossy()),
+            ExitCode::SUCCESS
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

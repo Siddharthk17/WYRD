@@ -874,6 +874,113 @@ fn end_event(
     }
 }
 
+/// Collapses digit runs in raw failure text to `#`, capped at a fixed
+/// length. Indexes, ticks, and counts vary between runs of one violation
+/// kind; the surrounding words identify the kind.
+#[must_use]
+pub fn normalize_failure_class(raw: &str) -> String {
+    let mut out = String::new();
+    let mut in_digits = false;
+    for ch in raw.chars() {
+        if ch.is_ascii_digit() {
+            if !in_digits {
+                out.push('#');
+                in_digits = true;
+            }
+        } else {
+            in_digits = false;
+            out.push(ch);
+        }
+        if out.len() >= 240 {
+            break;
+        }
+    }
+    out
+}
+
+/// Names the failure kind carried by a caught panic payload.
+#[must_use]
+pub fn panic_failure_class(payload: &(dyn std::any::Any + Send)) -> String {
+    let raw = if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else {
+        String::from("non-string panic payload")
+    };
+    format!("panic:{}", normalize_failure_class(&raw))
+}
+
+/// Failure class of one consensus-plan run: `None` on success, otherwise
+/// the normalized panic text. Callers compare classes for equality, so one
+/// violation kind stays one class while the shrinker removes events.
+#[must_use]
+pub fn consensus_failure_class(plan: &Plan) -> Option<String> {
+    match std::panic::catch_unwind(AssertUnwindSafe(|| run_plan(plan))) {
+        Ok(_) => None,
+        Err(payload) => Some(panic_failure_class(&payload)),
+    }
+}
+
+/// Shrinks a failing plan with greedy delta debugging while preserving the
+/// failure class: each candidate is re-run through `run`, which returns
+/// `Some(class)` on failure, and only candidates reporting the original
+/// class are kept. A candidate that passes or fails differently is
+/// rejected, so the minimal plan still demonstrates the same violation.
+///
+/// Soundness comes from per-event RNG streams keyed by event id: removing
+/// one event never reshuffles another's parameters, and runtime draws are
+/// per-node streams and salt hashes, never positional, so a smaller plan
+/// replays its shared prefix exactly.
+pub fn shrink_plan_same_class(plan: &Plan, run: &dyn Fn(&Plan) -> Option<String>) -> Plan {
+    let Some(expected) = run(plan) else {
+        return plan.clone();
+    };
+    let keep = |candidate: &Plan| run(candidate).is_some_and(|class| class == expected);
+    let mut best = plan.clone();
+    loop {
+        let mut improved = false;
+        if let Some(shrunk) = shrink_events(&best, &keep) {
+            best = shrunk;
+            improved = true;
+        }
+        if let Some(shrunk) = shrink_event_windows(&best, &keep) {
+            best = shrunk;
+            improved = true;
+        }
+        if let Some(shrunk) = shrink_cluster_size(&best, &keep) {
+            best = shrunk;
+            improved = true;
+        }
+        if let Some(shrunk) = shrink_net(&best, &keep) {
+            best = shrunk;
+            improved = true;
+        }
+        if best.workload.is_some() {
+            if let Some(shrunk) = shrink_dead_proposals(&best, &keep) {
+                best = shrunk;
+                improved = true;
+            }
+            if let Some(shrunk) = shrink_workload(&best, &keep) {
+                best = shrunk;
+                improved = true;
+            }
+        } else {
+            if let Some(shrunk) = shrink_proposals(&best, &keep) {
+                best = shrunk;
+                improved = true;
+            }
+            if let Some(shrunk) = shrink_ticks(&best, &keep) {
+                best = shrunk;
+                improved = true;
+            }
+        }
+        if !improved {
+            return best;
+        }
+    }
+}
+
 /// Shrinks a failing plan with greedy delta debugging: each candidate
 /// removes one event, shortens one event, zeroes network faults, or shortens
 /// the run, and is kept only when the failure still reproduces. Events draw
@@ -934,6 +1041,64 @@ fn shrink_event_windows(plan: &Plan, fails: &dyn Fn(&Plan) -> bool) -> Option<Pl
                 return Some(candidate);
             }
         }
+    }
+    None
+}
+
+/// Shrinks the cluster to three nodes where allowed: every event member
+/// reference must already fit, so no fault is silently retargeted.
+fn shrink_cluster_size(plan: &Plan, fails: &dyn Fn(&Plan) -> bool) -> Option<Plan> {
+    if plan.cluster_size <= 3 {
+        return None;
+    }
+    if plan.events.iter().any(|event| event_member(event) >= 3) {
+        return None;
+    }
+    let mut candidate = plan.clone();
+    candidate.cluster_size = 3;
+    if still_fails(&candidate, fails) {
+        return Some(candidate);
+    }
+    None
+}
+
+/// Shrinks a workload plan's client count, then its operations per client.
+/// Client operations expand deterministically from the profile, so dropping
+/// them shortens durations without reshuffling the survivors.
+fn shrink_workload(plan: &Plan, fails: &dyn Fn(&Plan) -> bool) -> Option<Plan> {
+    let workload = plan.workload.clone()?;
+    if workload.clients > 1 {
+        let mut candidate = plan.clone();
+        if let Some(entry) = candidate.workload.as_mut() {
+            entry.clients = workload.clients - 1;
+        }
+        if still_fails(&candidate, fails) {
+            return Some(candidate);
+        }
+    }
+    if workload.ops_per_client > 1 {
+        let mut candidate = plan.clone();
+        if let Some(entry) = candidate.workload.as_mut() {
+            entry.ops_per_client = workload.ops_per_client / 2;
+        }
+        if still_fails(&candidate, fails) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Drops client proposals a workload run never consumes: the KV schedule
+/// expands from the embedded profile, so proposals are inert text. One
+/// re-run confirms the failure survives without them.
+fn shrink_dead_proposals(plan: &Plan, fails: &dyn Fn(&Plan) -> bool) -> Option<Plan> {
+    if plan.workload.is_none() || plan.proposals.is_empty() {
+        return None;
+    }
+    let mut candidate = plan.clone();
+    candidate.proposals.clear();
+    if still_fails(&candidate, fails) {
+        return Some(candidate);
     }
     None
 }

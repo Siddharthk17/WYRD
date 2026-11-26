@@ -258,6 +258,57 @@ pub fn run_kv_seed_with_stats(seed: u64, storage_faults: bool) -> (History, bool
     run_kv_seed_inner(seed, storage_faults, false)
 }
 
+/// Executes a materialized workload plan with the given read model.
+///
+/// The client schedule and tick skew derive from the plan seed while every
+/// fault and network rate comes from the plan itself, so shrink candidates
+/// replay exactly. A plan without an embedded workload falls back to the
+/// seed's swarm profile.
+pub fn run_kv_plan(plan: &Plan, stale_canary: bool) -> (History, bool, SnapshotStats) {
+    let profile = match &plan.workload {
+        Some(workload) => SwarmProfile {
+            clients: workload.clients,
+            keys: workload.keys,
+            ops_per_client: workload.ops_per_client,
+            list_pct: workload.list_pct,
+            think_ticks: workload.think_ticks,
+            timeout_ticks: workload.timeout_ticks,
+            client_crashes: workload.client_crashes,
+            unordered: workload.unordered,
+        },
+        None => swarm_profile(plan.seed),
+    };
+    run_kv_plan_inner(plan.seed, plan, &profile, plan.storage_faults, stale_canary)
+}
+
+/// Failure class of a workload plan: `None` when the run converges and its
+/// history is linearizable, otherwise a stable string naming the violation
+/// kind. Panics, audit failures, and checker violations are distinct
+/// classes, and numeric details collapse so one kind stays one class while
+/// the shrinker removes events around it.
+#[must_use]
+pub fn kv_plan_failure_class(plan: &Plan, stale_canary: bool) -> Option<String> {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_kv_plan(plan, stale_canary)
+    }));
+    match outcome {
+        Ok((history, audit, _)) => {
+            if !audit {
+                return Some(String::from("convergence-audit"));
+            }
+            match anvil_check::check_history(&history) {
+                Ok(()) => None,
+                Err(failure) => Some(format!(
+                    "linearizability:{}:{}",
+                    failure.failing_ids.len(),
+                    failure.longest_prefix.len()
+                )),
+            }
+        }
+        Err(payload) => Some(crate::plan::panic_failure_class(&payload)),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_kv_seed_inner(
     seed: u64,
@@ -276,6 +327,17 @@ fn run_kv_seed_inner(
         unordered: profile.unordered,
     };
     let plan = Plan::generate_for_workload(seed, storage_faults, workload_spec);
+    run_kv_plan_inner(seed, &plan, &profile, storage_faults, stale_canary)
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_kv_plan_inner(
+    seed: u64,
+    plan: &Plan,
+    profile: &SwarmProfile,
+    storage_faults: bool,
+    stale_canary: bool,
+) -> (History, bool, SnapshotStats) {
     let fault_window = FaultWindow::new(&plan);
     let mut cluster = if storage_faults {
         let dev =
@@ -341,7 +403,7 @@ fn run_kv_seed_inner(
         })
         .collect();
 
-    let schedule = build_schedule(seed, &profile);
+    let schedule = build_schedule(seed, profile);
     let list_pct = if schedule.iter().any(|op| op.kind == ScheduledKind::Range) {
         0
     } else {
@@ -1319,6 +1381,15 @@ fn take_snapshot_for(
     let Some(store) = stores.get(&id) else {
         return;
     };
+    // The stream is identified by the state it carries, not the applied
+    // marker: a trailing NoOp advances the marker without touching state,
+    // and a snapshot labeled past its bytes installs nowhere while the
+    // core log still truncates.
+    let snap_at = store.snapshot_index();
+    assert!(snap_at <= at, "snapshot state beyond the applied marker");
+    if snap_at.is_zero() {
+        return;
+    }
     let handle = store.snapshot_handle();
     assert_snapshot_equals_replay(&handle, &harness.archive);
     let full = handle.encode_snapshot();
@@ -1333,14 +1404,14 @@ fn take_snapshot_for(
             chunk_crc: chunk.crc,
         });
     }
-    let snapped_term = applied_term_for(cluster, id, at);
-    cluster.supply_snapshot(id, at, snapped_term, total, digest, data);
+    let snapped_term = applied_term_for(cluster, id, snap_at);
+    cluster.supply_snapshot(id, snap_at, snapped_term, total, digest, data);
     harness.snapshots_taken = harness.snapshots_taken.saturating_add(1);
-    harness.snapshots.insert(id, (at, full.clone()));
+    harness.snapshots.insert(id, (snap_at, full.clone()));
     harness.since_entries.insert(id, 0);
     harness.since_bytes.insert(id, 0);
-    harness.last_snapshot.insert(id, at);
-    if let Some(up_to) = harness.policy.compaction_index(at, at, true) {
+    harness.last_snapshot.insert(id, snap_at);
+    if let Some(up_to) = harness.policy.compaction_index(at, snap_at, true) {
         cluster.compact_log(id, up_to);
     }
 }

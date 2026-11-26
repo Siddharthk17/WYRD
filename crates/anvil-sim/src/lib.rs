@@ -32,7 +32,8 @@ pub use farm::{
 pub use kernel::{Actor, ActorContext, SimError, SimKernel, SimReport};
 pub use network::{LatencyModel, NetworkDelayHook, NetworkFilterHook, SimNetwork, TransportMode};
 pub use plan::{
-    FaultEvent, FaultKind, Plan, PlanError, PlanRunStats, WorkloadSpec, run_plan, shrink_plan,
+    FaultEvent, FaultKind, Plan, PlanError, PlanRunStats, WorkloadSpec, consensus_failure_class,
+    normalize_failure_class, panic_failure_class, run_plan, shrink_plan, shrink_plan_same_class,
 };
 pub use queue::{BinaryHeapEventQueue, EventQueue, HierarchicalTimingWheel, ScheduledEvent};
 pub use raft_invariants::{InvariantViolation, RaftInvariantChecker};
@@ -42,6 +43,6 @@ pub use time::SimTime;
 pub use trace::{TraceEvent, TraceRecorder};
 pub use watchdog::{Watchdog, WatchdogError};
 pub use workload::{
-    SnapshotStats, SwarmProfile, convergence_audit, run_kv_seed, run_kv_seed_with_stats,
-    run_kv_seed_with_storage, swarm_profile,
+    SnapshotStats, SwarmProfile, convergence_audit, kv_plan_failure_class, run_kv_plan,
+    run_kv_seed, run_kv_seed_with_stats, run_kv_seed_with_storage, swarm_profile,
 };
