@@ -640,3 +640,133 @@ fn test_snapshot_stream_aborts_on_leader_change() {
     assert!(stale_rejected, "old-term stream must abort");
     assert!(third_out.ready_snapshots.is_empty());
 }
+
+/// Chunked snapshot transfer must not stall the consensus path: while one
+/// follower streams a multi-window snapshot, heartbeats keep flowing to the
+/// healthy follower every heartbeat interval, and the stream finishes well
+/// within a bounded tick budget. This is the virtual-time half of the Week 5
+/// performance gate (chunking off the consensus path).
+#[test]
+fn test_snapshot_stream_does_not_stall_heartbeats() {
+    let (mut leader, mut second, mut third, mut leader_out, mut second_out, mut third_out) =
+        three_cores();
+    elect_leader(&mut leader, &mut leader_out, node_id(2));
+    sync_follower(
+        node_id(1),
+        &mut leader,
+        &mut leader_out,
+        node_id(2),
+        &mut second,
+        &mut second_out,
+    );
+    for i in 0..5u64 {
+        propose_and_replicate(
+            &mut leader,
+            &mut leader_out,
+            &mut second,
+            &mut second_out,
+            format!("entry-{i}").as_bytes(),
+        );
+    }
+    sync_commit(&mut leader, &mut leader_out, &mut second, &mut second_out);
+    leader.step(
+        Input::CompactLog {
+            up_to: LogIndex::from_raw(4),
+        },
+        &mut leader_out,
+    );
+    assert_eq!(leader.log().base_index(), LogIndex::from_raw(4));
+    leader_out.clear();
+
+    // Twelve chunks over a window of four: several fill-and-ack rounds,
+    // long enough that heartbeat cadence is observable mid-stream.
+    let (full, chunks, digest) = fake_snapshot(2400, 12);
+    leader.step(
+        Input::SnapshotReady {
+            last_included_index: LogIndex::from_raw(4),
+            last_included_term: Term::from_raw(1),
+            snapshot_bytes: full.len() as u64,
+            snapshot_digest: digest,
+            chunks,
+        },
+        &mut leader_out,
+    );
+    assert!(!install_requests(&leader_out).is_empty());
+
+    let mut heartbeats_to_second = 0u32;
+    let mut silent_ticks = 0u32;
+    let mut completed = false;
+    for _ in 0..48 {
+        leader.step(Input::Tick, &mut leader_out);
+        ack_all(&mut leader, &mut leader_out);
+        let mut contacted_second = false;
+        for outbound in std::mem::take(&mut leader_out.messages) {
+            match &outbound.message {
+                Message::AppendEntriesRequest { .. } | Message::HeartbeatRequest { .. }
+                    if outbound.to == node_id(2) =>
+                {
+                    contacted_second = true;
+                    second.step(
+                        Input::Recv {
+                            from: node_id(1),
+                            message: outbound.message,
+                        },
+                        &mut second_out,
+                    );
+                }
+                Message::InstallSnapshotRequest { .. } | Message::AppendEntriesRequest { .. } => {
+                    third.step(
+                        Input::Recv {
+                            from: node_id(1),
+                            message: outbound.message,
+                        },
+                        &mut third_out,
+                    );
+                }
+                _ => {}
+            }
+        }
+        if contacted_second {
+            heartbeats_to_second += 1;
+            silent_ticks = 0;
+        } else {
+            silent_ticks += 1;
+        }
+        assert!(
+            silent_ticks <= 4,
+            "healthy follower starved of heartbeats during snapshot stream"
+        );
+        ack_all(&mut second, &mut second_out);
+        ack_all(&mut third, &mut third_out);
+        apply_all(&mut second, &mut second_out);
+        apply_all(&mut third, &mut third_out);
+        for outbound in second_out
+            .messages
+            .drain(..)
+            .chain(third_out.messages.drain(..))
+            .collect::<Vec<_>>()
+        {
+            leader.step(
+                Input::Recv {
+                    from: if matches!(outbound.message, Message::InstallSnapshotResponse { .. }) {
+                        node_id(3)
+                    } else {
+                        node_id(2)
+                    },
+                    message: outbound.message,
+                },
+                &mut leader_out,
+            );
+        }
+        ack_all(&mut leader, &mut leader_out);
+        if !third_out.ready_snapshots.is_empty() {
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed, "12-chunk stream finishes within 48 ticks");
+    assert!(
+        heartbeats_to_second >= 3,
+        "heartbeats must flow during the stream, saw {heartbeats_to_second}"
+    );
+}
