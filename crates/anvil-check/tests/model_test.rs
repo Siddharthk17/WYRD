@@ -1,5 +1,10 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::assert_is_empty,
+    clippy::cast_possible_truncation,
+    clippy::too_many_lines
+)]
 
 use anvil_check::list::ListState;
 use anvil_check::register::RegisterState;
@@ -25,17 +30,17 @@ fn op(
         indeterminate: ind,
     }
 }
-fn val(v: &[u8], version: u64) -> Option<OpResult> {
-    Some(OpResult::Value {
+fn val(v: &[u8], version: u64) -> OpResult {
+    OpResult::Value {
         value: Some(Bytes::copy_from_slice(v)),
         version,
-    })
+    }
 }
-fn lst(v: &[&[u8]], version: u64) -> Option<OpResult> {
-    Some(OpResult::List {
+fn lst(v: &[&[u8]], version: u64) -> OpResult {
+    OpResult::List {
         values: v.iter().map(|b| Bytes::copy_from_slice(b)).collect(),
         version,
-    })
+    }
 }
 
 #[test]
@@ -62,7 +67,7 @@ fn test_register_every_apply_arm() {
         },
         0,
         Some(1),
-        val(b"a", 1),
+        Some(val(b"a", 1)),
         false
     )));
     // Completed op with no result is accepted.
@@ -100,7 +105,7 @@ fn test_register_every_apply_arm() {
         },
         8,
         Some(9),
-        val(b"c", 10),
+        Some(val(b"c", 10)),
         false
     )));
     let conflict = HistoryOp {
@@ -168,7 +173,7 @@ fn test_register_every_apply_arm() {
         },
         8,
         Some(9),
-        val(b"q", 4),
+        Some(val(b"q", 4)),
         false,
     ));
     u.apply_indeterminate(&op(
@@ -206,7 +211,7 @@ fn test_register_every_apply_arm() {
         },
         0,
         Some(1),
-        val(&vec![7u8; 100], 3),
+        Some(val(&[7u8; 100], 3)),
         false,
     ));
     let _ = long.state_hash();
@@ -223,7 +228,7 @@ fn test_list_every_apply_arm() {
         },
         2,
         Some(3),
-        val(b"a", 1),
+        Some(val(b"a", 1)),
         false
     )));
     assert!(s.apply(&HistoryOp {
@@ -235,7 +240,7 @@ fn test_list_every_apply_arm() {
         },
         invoke: 4,
         ret: Some(5),
-        result: lst(&[b"a"], 6),
+        result: Some(lst(&[b"a"], 6)),
         indeterminate: false
     }));
     assert!(!s.apply(&HistoryOp {
@@ -247,7 +252,7 @@ fn test_list_every_apply_arm() {
         },
         invoke: 6,
         ret: Some(7),
-        result: lst(&[b"a"], 6),
+        result: Some(lst(&[b"a"], 6)),
         indeterminate: false
     }));
     assert!(s.apply(&HistoryOp {
@@ -257,7 +262,7 @@ fn test_list_every_apply_arm() {
         op: ClientOp::Get,
         invoke: 8,
         ret: Some(9),
-        result: lst(&[b"a"], 6),
+        result: Some(lst(&[b"a"], 6)),
         indeterminate: false
     }));
     let mut t = ListState::default();
@@ -287,7 +292,7 @@ fn test_list_every_apply_arm() {
         },
         invoke: 0,
         ret: Some(1),
-        result: lst(&[&vec![9u8; 100]], 2),
+        result: Some(lst(&[&[9u8; 100]], 2)),
         indeterminate: false,
     });
     let _ = big.state_hash();

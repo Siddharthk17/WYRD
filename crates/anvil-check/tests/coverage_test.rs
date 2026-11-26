@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(clippy::assert_is_empty, clippy::cast_possible_truncation)]
 
 use anvil_check::list::ListState;
 use anvil_check::porcupine::export_porcupine;
@@ -138,7 +139,7 @@ fn test_register_cas_unknown_version_paths() {
         indeterminate: false,
     };
     assert!(state.apply(&cas_op));
-    assert!(indet.is_completed() == false);
+    assert!(!indet.is_completed());
     indet.result = Some(OpResult::Value {
         value: None,
         version: 0,

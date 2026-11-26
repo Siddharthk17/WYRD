@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(clippy::assert_is_empty)]
 
 use anvil_kv::{KvCommand, KvConfig, KvResponse, KvStore};
 use anvil_types::{LogIndex, SeqNo, SessionId};

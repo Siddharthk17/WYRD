@@ -185,14 +185,11 @@ fn range_state_hash(state: &BTreeMap<Vec<u8>, Vec<u8>>) -> u64 {
 
 fn apply_range_effect(state: &mut BTreeMap<Vec<u8>, Vec<u8>>, op: &HistoryOp) {
     match &op.op {
-        ClientOp::Put { value } | ClientOp::Append { value } => {
+        ClientOp::Put { value } | ClientOp::Append { value } | ClientOp::Cas { value, .. } => {
             state.insert(op.key.to_vec(), value.to_vec());
         }
         ClientOp::Delete => {
             state.remove(&op.key.to_vec());
-        }
-        ClientOp::Cas { value, .. } => {
-            state.insert(op.key.to_vec(), value.to_vec());
         }
         ClientOp::Get | ClientOp::Range { .. } => {}
     }
@@ -221,7 +218,6 @@ fn apply_range_op(state: &mut BTreeMap<Vec<u8>, Vec<u8>>, op: &HistoryOp) -> boo
             state.insert(op.key.to_vec(), value.to_vec());
             true
         }
-        (ClientOp::Cas { .. }, Some(OpResult::CasConflict { .. })) => true,
         (ClientOp::Get, Some(OpResult::Value { value, .. })) => {
             state.get(op.key.as_ref()).cloned() == value.as_ref().map(|b| b.to_vec())
         }
