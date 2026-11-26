@@ -16,7 +16,7 @@ use anvil_sim::run_kv_seed_with_stats;
 
 #[test]
 fn test_snapshot_over_divergent_prefix_recovers_cleanly() {
-    for seed in [89738u64, 132635, 136637, 144041, 163047, 178942] {
+    for seed in [89_738u64, 132_635, 136_637, 144_041, 163_047, 178_942] {
         let (_, audit, _) = run_kv_seed_with_stats(seed, false);
         assert!(audit, "seed {seed} must converge with a clean audit");
     }
