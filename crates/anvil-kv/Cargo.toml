@@ -11,6 +11,7 @@ bytes = { workspace = true }
 thiserror = { workspace = true }
 imbl = { workspace = true }
 blake3 = { workspace = true }
+crc32c = { workspace = true }
 
 [lints]
 workspace = true
