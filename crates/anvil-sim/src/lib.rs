@@ -22,7 +22,7 @@ pub use buggify::{
     BuggifyPoint, BuggifyRegistry, list_registered_points, reset_buggify_registry,
     set_buggify_enabled, set_buggify_seed,
 };
-pub use cluster::{InFlightPacket, PlanNet, SimCluster, SimNodeStorage};
+pub use cluster::{CommittedArchive, InFlightPacket, PlanNet, SimCluster, SimNodeStorage};
 pub use device::{FileState, SimDevice, SimDeviceConfig, SimDeviceStats, StorageFaultAtlas};
 pub use farm::{
     FarmOptions, FarmProfile, FarmRange, FarmResult, FarmSummary, SOMETIMES_INVENTORY, SeedOutcome,

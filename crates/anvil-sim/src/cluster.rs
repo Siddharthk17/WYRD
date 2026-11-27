@@ -42,6 +42,12 @@ pub use crate::network::InFlightPacket;
 /// functions with no generator draws mid-run.
 pub use crate::network::PlanNet;
 
+/// Committed-prefix archive: every committed index maps to its term, entry
+/// kind, and payload (`None` for no-ops and other payload-free entries).
+/// Repair treats the archive as branch truth; peer bytes must agree with it
+/// wherever both cover an index.
+pub type CommittedArchive = BTreeMap<LogIndex, (Term, anvil_types::EntryKind, Option<Bytes>)>;
+
 /// Simulated storage layer for a single Raft node, holding its real `StorageEngine` and `SimDevice`.
 pub struct SimNodeStorage {
     /// Simulated disk device with fault injection and volatile page cache.
@@ -456,13 +462,67 @@ impl SimCluster {
     fn step_node_internal(&mut self, node_id: NodeId, input: Input) {
         if self.is_node_crashed(node_id)
             || self.is_node_refused_start(node_id)
-            || self.is_node_needs_repair(node_id)
             || self.paused.contains(&node_id)
         {
             return;
         }
+        // A repair flag set while this node was paused or crashed must
+        // reach the core before it steps anything else: an unflagged core
+        // with a corrupt prefix could win an election it must lose. The
+        // one-shot sync below never re-enters itself.
+        let repair_from = self
+            .storage
+            .get(&node_id)
+            .and_then(|storage| storage.repair_from);
+        let core_flagged = self
+            .nodes
+            .get(&node_id)
+            .and_then(anvil_raft::RaftCore::repair_from);
+        if repair_from != core_flagged {
+            if let Some(from) = repair_from {
+                self.step_node_unsynced(node_id, Input::SetNeedsRepair { from_index: from });
+            } else if self.nodes.contains_key(&node_id) {
+                self.step_node_unsynced(node_id, Input::ClearNeedsRepair);
+            }
+            // Re-check after the one-shot sync; if the node paused or
+            // crashed meanwhile, leave it alone until it resumes.
+            let core_flagged = self
+                .nodes
+                .get(&node_id)
+                .and_then(anvil_raft::RaftCore::repair_from);
+            if repair_from != core_flagged {
+                return;
+            }
+        }
+        self.step_node_unsynced(node_id, input);
+    }
+
+    /// Steps one node without repair-flag syncing. Used for the sync itself
+    /// (which must not re-enter the check) and for the steady-state path
+    /// once flags agree.
+    fn step_node_unsynced(&mut self, node_id: NodeId, input: Input) {
+        if self.is_node_crashed(node_id)
+            || self.is_node_refused_start(node_id)
+            || self.paused.contains(&node_id)
+        {
+            return;
+        }
+        // Nodes under repair keep stepping: they answer appends with the
+        // last good match, track the leader, and re-replicate the missing
+        // range. The core suppresses their votes and campaigns while the
+        // repair flag is set.
 
         self.sync_node_storage_with_core(node_id);
+        // A latched engine error must crash the node here, or persist-gated
+        // messages stall forever behind completions that never arrive.
+        if self
+            .storage
+            .get(&node_id)
+            .is_some_and(|storage| storage.engine.fatal_error().is_some())
+        {
+            self.crash_node(node_id);
+            return;
+        }
         self.output_scratch.clear();
         let mut fresh_reads = Vec::new();
 
@@ -775,7 +835,7 @@ impl SimCluster {
     pub fn reconcile_snapshot_prefix(
         &mut self,
         node_id: NodeId,
-        archive: &BTreeMap<LogIndex, (Term, Option<Bytes>)>,
+        archive: &CommittedArchive,
         base: LogIndex,
     ) {
         if self.is_node_crashed(node_id)
@@ -795,7 +855,7 @@ impl SimCluster {
                 .storage
                 .get(&node_id)
                 .and_then(|storage| storage.engine.term_at(at));
-            let archive_term = archive.get(&at).map(|(term, _)| *term);
+            let archive_term = archive.get(&at).map(|(term, _, _)| *term);
             match (disk_term, archive_term) {
                 (Some(disk), Some(archived)) if disk == archived => {}
                 _ => {
@@ -811,15 +871,15 @@ impl SimCluster {
         let mut idx = first.as_u64();
         while idx <= tip.as_u64() {
             let at = LogIndex::from_raw(idx);
-            if let Some((term, payload)) = archive.get(&at) {
-                let (kind, bytes) = match payload {
-                    Some(bytes) => (anvil_types::EntryKind::Normal, bytes.clone()),
-                    None => (anvil_types::EntryKind::NoOp, Bytes::new()),
+            if let Some((term, kind, payload)) = archive.get(&at) {
+                let bytes = match payload {
+                    Some(bytes) => bytes.clone(),
+                    None => Bytes::new(),
                 };
                 entries.push(Entry {
                     index: at,
                     term: *term,
-                    kind,
+                    kind: *kind,
                     payload: bytes,
                 });
             } else if let Some(core) = self.nodes.get(&node_id)
@@ -968,6 +1028,86 @@ impl SimCluster {
     ///
     /// # Errors
     /// Returns `StorageError` if hard-state recovery fails (both slots corrupted).
+    /// Rebuilds a node's core after restart with a restart-aware seed, then
+    /// aligns the checker with the recovered durable term and vote. Shared
+    /// by the clean, torn-tail, and sidelined paths: a sidelined node keeps
+    /// a live core so it keeps following through appends while its repair
+    /// flag suppresses votes and clamps acks. A vote mismatch refuses start.
+    fn rebuild_core_after_restart(
+        &mut self,
+        node_id: NodeId,
+        recovered: &RecoveredStorageState,
+    ) -> Result<(), StorageError> {
+        let restarts = self.restart_counts.get(&node_id).copied().unwrap_or(0);
+        self.restart_counts.insert(node_id, restarts + 1);
+        let path = format!("cluster/node/{}/restart-{restarts}", node_id.get());
+        let seed = derive_component_seed(self.master_seed, &path);
+        let rng = ChaCha8Rng::from_seed(seed);
+
+        let config = self
+            .configs
+            .get(&node_id)
+            .cloned()
+            .unwrap_or_else(|| RaftConfig {
+                cluster_id: ClusterId::from_raw(1),
+                learners: BTreeSet::new(),
+                node_id,
+                peers: self
+                    .configs
+                    .keys()
+                    .copied()
+                    .filter(|&p| p != node_id)
+                    .collect(),
+                election_timeout_ticks: 10,
+                heartbeat_interval_ticks: 3,
+                max_inflight_messages: 256,
+                max_bytes_per_message: 64 * 1024,
+                pre_vote_enabled: true,
+                check_quorum: true,
+            });
+
+        let recovered_state = RecoveredState {
+            current_term: recovered.current_term,
+            voted_for: recovered.voted_for,
+            commit_index: LogIndex::from_raw(0),
+            entries: recovered.log.entries.clone(),
+        };
+        let core = RaftCore::new(config, recovered_state, rng);
+        self.nodes.insert(node_id, core);
+
+        // Crash discarded volatile terms/votes that never reached disk.
+        // Reset checker history to the recovered durable state before
+        // validating, or pre-crash in-memory values would read as
+        // regressions no other node could have observed. A mismatch
+        // against an acknowledged vote means durable state lost a real
+        // vote, so the node must not resume.
+        let persisted_votes = self
+            .storage
+            .get(&node_id)
+            .map(|storage| storage.persisted_votes.clone());
+        if let Err((tracked, durable)) = self.checker.reset_for_restart(
+            node_id,
+            recovered.current_term,
+            recovered.voted_for,
+            &persisted_votes.unwrap_or_default(),
+        ) {
+            if let Some(storage) = self.storage.get_mut(&node_id) {
+                storage.refused_start = true;
+                storage.crashed = true;
+            }
+            if let Some(atlas) = &self.fault_atlas {
+                atlas.record_hard_state_dead(node_id);
+            }
+            return Err(StorageError::StaleHardState {
+                recovered_term: recovered.current_term,
+                recovered_vote: recovered.voted_for,
+                acked_term: recovered.current_term,
+                acked_vote: tracked.or(durable),
+            });
+        }
+        Ok(())
+    }
+
     pub fn restart_node(&mut self, node_id: NodeId) -> Result<RecoveredStorageState, StorageError> {
         let storage = self.storage.get_mut(&node_id).ok_or_else(|| {
             StorageError::DeviceError(format!("node {node_id} not found in cluster storage"))
@@ -1110,17 +1250,14 @@ impl SimCluster {
 
         match &recovered.log.classification {
             LogRecoveryClassification::MidLogCorruption { corrupt_index, .. } => {
-                // Mid-log corruption: marked NeedsRepair, does not vote or lead
+                // Mid-log corruption: rebuild a live core (not frozen) so
+                // the node keeps following through appends while the repair
+                // flag suppresses its votes and clamps its acks. The clean
+                // ack checks below do not apply to known-bad bytes.
                 sometimes!(self.sometimes_hits, "storage.midlog.needsrepair");
                 let failed_index = *corrupt_index;
-                if let Some(storage) = self.storage.get_mut(&node_id) {
-                    storage.needs_repair = true;
-                    storage.repair_from = Some(failed_index);
-                    storage.crashed = false;
-                }
-                self.trace_line(format!(
-                    "{node_id:?} sidelined for repair at {failed_index:?}"
-                ));
+                self.rebuild_core_after_restart(node_id, &recovered)?;
+                self.mark_needs_repair(node_id, failed_index);
                 Ok(recovered)
             }
             LogRecoveryClassification::Clean | LogRecoveryClassification::TornTail { .. } => {
@@ -1167,14 +1304,9 @@ impl SimCluster {
                 }) = commit_res
                 {
                     sometimes!(self.sometimes_hits, "storage.midlog.needsrepair");
-                    if let Some(storage) = self.storage.get_mut(&node_id) {
-                        storage.needs_repair = true;
-                        storage.repair_from = Some(failed_index);
-                        storage.crashed = false;
-                    }
-                    self.trace_line(format!(
-                        "{node_id:?} sidelined for repair at {failed_index:?} (torn committed write)"
-                    ));
+                    self.rebuild_core_after_restart(node_id, &recovered)?;
+                    self.mark_needs_repair(node_id, failed_index);
+                    self.trace_line(format!("{node_id:?} torn committed write under repair"));
                     return Ok(recovered);
                 }
 
@@ -1328,7 +1460,7 @@ impl SimCluster {
     /// re-scanned, so a failed repair leaves the node sidelined instead of
     /// installing unverified bytes. Repair is a heal-phase activity;
     /// mid-chaos faults keep faulting.
-    pub fn repair_step(&mut self, archive: Option<&BTreeMap<LogIndex, (Term, Option<Bytes>)>>) {
+    pub fn repair_step(&mut self, archive: Option<&CommittedArchive>) {
         // Crashed sidelined nodes are included: repair fixes their disk
         // first, and the heal pass restarts them right after (crashed nodes
         // restart unconditionally now that recovery re-derives the flag).
@@ -1343,27 +1475,51 @@ impl SimCluster {
         }
     }
 
-    /// Repairs one sidelined node from peer data. Returns true when the
-    /// node rejoined.
-    fn repair_node(
-        &mut self,
-        node_id: NodeId,
-        archive: Option<&BTreeMap<LogIndex, (Term, Option<Bytes>)>>,
-    ) -> bool {
-        if !self.rewrite_repair_frames(node_id, archive) {
-            return false;
+    /// Marks a node as needing protocol-aware repair from an index: the
+    /// storage flag sidelines disk reads while the core flag suppresses
+    /// votes and campaigns and clamps append acks to the last good index.
+    pub fn mark_needs_repair(&mut self, node_id: NodeId, from_index: LogIndex) {
+        if from_index.is_zero() {
+            return;
         }
+        if let Some(storage) = self.storage.get_mut(&node_id) {
+            storage.needs_repair = true;
+            storage.repair_from = Some(from_index);
+            storage.crashed = false;
+        }
+        self.trace_line(format!(
+            "{node_id:?} sidelined for repair at {from_index:?}"
+        ));
+        if self.nodes.contains_key(&node_id) {
+            self.step_node_internal(node_id, Input::SetNeedsRepair { from_index });
+        }
+    }
+
+    /// Clears repair once the missing range is verified whole, on disk and
+    /// in the core, so the node rejoins with full votes and matches.
+    pub fn clear_repair(&mut self, node_id: NodeId) {
         if let Some(storage) = self.storage.get_mut(&node_id) {
             storage.needs_repair = false;
             storage.repair_from = None;
-            if !self.nodes.contains_key(&node_id) {
-                // No core exists: the crash that sidelined this node removed
-                // it and recovery never rebuilt it. Mark crashed so the heal
-                // pass restarts it from the repaired disk.
-                storage.crashed = true;
-            }
+        }
+        if self.nodes.contains_key(&node_id) {
+            self.step_node_internal(node_id, Input::ClearNeedsRepair);
         }
         sometimes!(self.sometimes_hits, "sim.repair.cleared");
+    }
+
+    /// Repairs one sidelined node from peer data. Returns true when the
+    /// node rejoined.
+    fn repair_node(&mut self, node_id: NodeId, archive: Option<&CommittedArchive>) -> bool {
+        if !self.rewrite_repair_frames(node_id, archive) {
+            return false;
+        }
+        self.clear_repair(node_id);
+        // Rejoin from the repaired disk, never from the stale in-memory
+        // log: the core rebuilt at sideline time still carries the corrupt
+        // prefix, which could win elections it must lose. Crash and let the
+        // heal pass restart clean from verified bytes.
+        self.crash_node(node_id);
         true
     }
 
@@ -1375,19 +1531,17 @@ impl SimCluster {
         &self,
         node_id: NodeId,
         repair_from: LogIndex,
-        archive: Option<&BTreeMap<LogIndex, (Term, Option<Bytes>)>>,
+        archive: Option<&CommittedArchive>,
     ) -> Option<Entry> {
-        if let Some((term, payload)) = archive.and_then(|archive| archive.get(&repair_from)) {
-            return Some(Entry {
+        if let Some((term, kind, payload)) = archive.and_then(|archive| archive.get(&repair_from)) {
+            let entry = Entry {
                 index: repair_from,
                 term: *term,
-                kind: if payload.is_some() {
-                    anvil_types::EntryKind::Normal
-                } else {
-                    anvil_types::EntryKind::NoOp
-                },
+                kind: *kind,
                 payload: payload.clone().unwrap_or_default(),
-            });
+            };
+            return Self::validate_repair_entry(node_id, repair_from, &entry, archive, None)
+                .then_some(entry);
         }
         let mut best: Option<(LogIndex, Entry)> = None;
         for (peer_id, core) in &self.nodes {
@@ -1412,7 +1566,31 @@ impl SimCluster {
             }
             best = Some((core.commit_index(), entry.clone()));
         }
-        best.map(|(_, entry)| entry)
+        best.and_then(|(commit, entry)| {
+            Self::validate_repair_entry(node_id, repair_from, &entry, archive, Some(commit))
+                .then_some(entry)
+        })
+    }
+
+    /// Validates a fetched repair entry before it touches disk. The index
+    /// must match the request; archive truth wins over peer bytes when both
+    /// cover the index; otherwise the peer must have committed the entry,
+    /// which makes it branch truth by leader completeness. Peer bytes are
+    /// untrusted input: a mismatch rejects the entry instead of crashing.
+    fn validate_repair_entry(
+        _node_id: NodeId,
+        expected: LogIndex,
+        entry: &Entry,
+        archive: Option<&CommittedArchive>,
+        peer_commit: Option<LogIndex>,
+    ) -> bool {
+        if entry.index != expected || entry.index.is_zero() {
+            return false;
+        }
+        if let Some((term, kind, _)) = archive.and_then(|archive| archive.get(&expected)) {
+            return entry.term == *term && entry.kind == *kind;
+        }
+        peer_commit.is_some_and(|commit| commit >= expected)
     }
 
     /// Rewrites corrupt frames in the node's WAL files from validated peer
@@ -1424,7 +1602,7 @@ impl SimCluster {
     fn rewrite_repair_frames(
         &mut self,
         node_id: NodeId,
-        archive: Option<&BTreeMap<LogIndex, (Term, Option<Bytes>)>>,
+        archive: Option<&CommittedArchive>,
     ) -> bool {
         let Some(sector_size) = self
             .storage
@@ -1533,7 +1711,7 @@ impl SimCluster {
         &self,
         node_id: NodeId,
         expected: LogIndex,
-        archive: Option<&BTreeMap<LogIndex, (Term, Option<Bytes>)>>,
+        archive: Option<&CommittedArchive>,
         last_crc: u32,
         segment_id: u64,
         offset: u64,
@@ -1566,7 +1744,7 @@ impl SimCluster {
         node_id: NodeId,
         file_id: FileId,
         sector_size: SectorSize,
-        archive: Option<&BTreeMap<LogIndex, (Term, Option<Bytes>)>>,
+        archive: Option<&CommittedArchive>,
     ) -> bool {
         let sector_len = sector_size.as_usize();
         let Some(data) = self
@@ -1621,7 +1799,7 @@ impl SimCluster {
                     let stale = archive
                         .as_ref()
                         .and_then(|archive| archive.get(&expected))
-                        .is_some_and(|(term, _)| *term != frame.term);
+                        .is_some_and(|(term, _, _)| *term != frame.term);
                     if !stale {
                         rebuilt.extend_from_slice(&data[offset..offset + bytes_consumed]);
                         last_crc = next_crc;

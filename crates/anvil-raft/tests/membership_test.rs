@@ -658,3 +658,170 @@ fn test_stale_snapshot_restore_ignored() {
     assert_eq!(leader.membership_voters(), before);
     assert!(!output.sometimes_hits.contains(&"raft.config.restore"));
 }
+
+#[test]
+fn test_repair_node_does_not_vote_or_campaign() {
+    let (mut leader, mut output) = elect_and_settle();
+    assert_eq!(leader.role(), Role::Leader);
+    output.clear();
+    leader.step(
+        Input::SetNeedsRepair {
+            from_index: LogIndex::from_raw(1),
+        },
+        &mut output,
+    );
+    // A flagged leader steps down immediately and hands off.
+    assert_eq!(leader.role(), Role::Follower);
+    assert_eq!(leader.repair_from(), Some(LogIndex::from_raw(1)));
+    assert!(output.sometimes_hits.contains(&"raft.repair.enter"));
+
+    // No campaigning while flagged, even after many timeouts.
+    output.clear();
+    for _ in 0..30 {
+        leader.step(Input::Tick, &mut output);
+    }
+    assert_eq!(leader.role(), Role::Follower);
+    assert!(output.messages.is_empty());
+
+    // No vote grants while flagged.
+    output.clear();
+    leader.step(
+        Input::Recv {
+            from: node_id(2),
+            message: Message::RequestVoteRequest {
+                term: Term::from_raw(2),
+                candidate_id: node_id(2),
+                last_log_index: LogIndex::from_raw(1),
+                last_log_term: Term::from_raw(1),
+            },
+        },
+        &mut output,
+    );
+    let granted = output.messages.iter().any(|msg| {
+        matches!(
+            &msg.message,
+            Message::RequestVoteResponse {
+                vote_granted: true,
+                ..
+            }
+        )
+    });
+    assert!(!granted, "repair node must never grant a vote");
+}
+
+#[test]
+fn test_repair_node_answers_append_as_last_good() {
+    let (mut leader, mut output) = elect_and_settle();
+    // Commit one client entry so the log extends past the repair base.
+    ack_persists(&mut leader, &mut output);
+    output.clear();
+
+    // Flag from index 1: every ack reports match 0 (nothing durable).
+    leader.step(
+        Input::SetNeedsRepair {
+            from_index: LogIndex::from_raw(1),
+        },
+        &mut output,
+    );
+    // Follower behavior: step down first (tested above), then handle an
+    // append as a flagged follower and check the clamped ack.
+    let mut follower = make_core(2, &[1, 3], &[], 77);
+    let mut follower_out = Output::new();
+    follower.step(
+        Input::Recv {
+            from: node_id(1),
+            message: Message::AppendEntriesRequest {
+                term: leader.term(),
+                leader_id: node_id(1),
+                prev_log_index: LogIndex::from_raw(0),
+                prev_log_term: Term::from_raw(0),
+                entries: vec![anvil_types::Entry::noop(
+                    LogIndex::from_raw(1),
+                    leader.term(),
+                )],
+                leader_commit: LogIndex::from_raw(0),
+            },
+        },
+        &mut follower_out,
+    );
+    ack_persists(&mut follower, &mut follower_out);
+    follower_out.clear();
+    follower.step(
+        Input::SetNeedsRepair {
+            from_index: LogIndex::from_raw(2),
+        },
+        &mut follower_out,
+    );
+    follower_out.clear();
+    follower.step(
+        Input::Recv {
+            from: node_id(1),
+            message: Message::AppendEntriesRequest {
+                term: leader.term(),
+                leader_id: node_id(1),
+                prev_log_index: LogIndex::from_raw(1),
+                prev_log_term: leader.term(),
+                entries: vec![],
+                leader_commit: LogIndex::from_raw(0),
+            },
+        },
+        &mut follower_out,
+    );
+    let acked = follower_out
+        .messages
+        .iter()
+        .find_map(|msg| match &msg.message {
+            Message::AppendEntriesResponse { match_index, .. } => Some(*match_index),
+            _ => None,
+        })
+        .expect("append answered");
+    assert_eq!(
+        acked,
+        LogIndex::from_raw(1),
+        "repair node acks only the last good index"
+    );
+
+    // Clearing resumes full matching.
+    follower_out.clear();
+    follower.step(Input::ClearNeedsRepair, &mut follower_out);
+    assert!(follower.repair_from().is_none());
+    assert!(follower_out.sometimes_hits.contains(&"raft.repair.cleared"));
+    follower_out.clear();
+    follower.step(
+        Input::Recv {
+            from: node_id(1),
+            message: Message::AppendEntriesRequest {
+                term: leader.term(),
+                leader_id: node_id(1),
+                prev_log_index: LogIndex::from_raw(1),
+                prev_log_term: leader.term(),
+                entries: vec![],
+                leader_commit: LogIndex::from_raw(0),
+            },
+        },
+        &mut follower_out,
+    );
+    let acked = follower_out
+        .messages
+        .iter()
+        .find_map(|msg| match &msg.message {
+            Message::AppendEntriesResponse { match_index, .. } => Some(*match_index),
+            _ => None,
+        })
+        .expect("append answered");
+    assert_eq!(acked, LogIndex::from_raw(1));
+}
+
+#[test]
+fn test_repair_zero_index_ignored() {
+    let (mut leader, mut output) = elect_and_settle();
+    output.clear();
+    leader.step(
+        Input::SetNeedsRepair {
+            from_index: LogIndex::from_raw(0),
+        },
+        &mut output,
+    );
+    assert!(leader.repair_from().is_none());
+    assert_eq!(leader.role(), Role::Leader);
+}

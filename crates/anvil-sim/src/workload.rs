@@ -24,7 +24,7 @@
 //! generator state: network faults come from the plan salt hash, and client
 //! timing comes from the pre-generated schedule.
 
-use crate::cluster::{PlanNet, SimCluster};
+use crate::cluster::{CommittedArchive, PlanNet, SimCluster};
 use crate::device::SimDeviceConfig;
 use crate::plan::{FaultKind, Plan, WorkloadSpec};
 use crate::rng::DetRng;
@@ -104,7 +104,7 @@ pub fn swarm_profile(seed: u64) -> SwarmProfile {
 struct SnapshotHarness {
     policy: SnapshotPolicy,
     chunk_bytes: usize,
-    archive: BTreeMap<LogIndex, (anvil_types::Term, Option<Bytes>)>,
+    archive: CommittedArchive,
     since_entries: BTreeMap<NodeId, u64>,
     since_bytes: BTreeMap<NodeId, u64>,
     last_snapshot: BTreeMap<NodeId, LogIndex>,
@@ -136,15 +136,12 @@ impl SnapshotHarness {
 
 /// Replays the archived committed prefix into a fresh store and asserts the
 /// state hash equals the snapshot's: `SnapshotEqualsReplay`.
-fn assert_snapshot_equals_replay(
-    snapshot: &KvStore,
-    archive: &BTreeMap<LogIndex, (anvil_types::Term, Option<Bytes>)>,
-) {
+fn assert_snapshot_equals_replay(snapshot: &KvStore, archive: &CommittedArchive) {
     let mut replay = KvStore::new(snapshot.config());
     let mut idx = 1u64;
     let applied = snapshot.applied_index().as_u64();
     while idx <= applied {
-        if let Some((_, payload)) = archive.get(&LogIndex::from_raw(idx)) {
+        if let Some((_, _, payload)) = archive.get(&LogIndex::from_raw(idx)) {
             if let Some(bytes) = payload {
                 // Committed commands can legitimately fail application: a
                 // client may pipeline writes against a session whose
@@ -604,7 +601,7 @@ fn heal_step(
     cluster: &mut SimCluster,
     node_ids: &[NodeId],
     base_skew: &BTreeMap<NodeId, u64>,
-    archive: &BTreeMap<LogIndex, (anvil_types::Term, Option<Bytes>)>,
+    archive: &CommittedArchive,
 ) {
     cluster.heal_all();
     cluster.repair_step(Some(archive));
@@ -1368,14 +1365,16 @@ fn apply_all(
                 // applied like no-ops and never reach the state machine. The
                 // archive records no payload for them; Week 6 extends the
                 // archive with entry kinds for protocol-aware repair.
-                harness.archive.insert(index, (term, None));
+                harness.archive.insert(index, (term, kind, None));
                 applied.insert(id, index);
                 applied_terms.insert(id, (index, term));
             } else {
                 if let Some(store) = stores.get_mut(&id) {
                     let _ = store.apply(index, &payload);
                 }
-                harness.archive.insert(index, (term, Some(payload.clone())));
+                harness
+                    .archive
+                    .insert(index, (term, kind, Some(payload.clone())));
                 harness
                     .since_entries
                     .entry(id)
@@ -1523,12 +1522,12 @@ fn backfill_engine_from_archive(
     let mut idx = tip.as_u64() + 1;
     while idx <= up_to.as_u64() {
         let at = LogIndex::from_raw(idx);
-        let Some((term, payload)) = harness.archive.get(&at) else {
+        let Some((term, kind, payload)) = harness.archive.get(&at) else {
             return;
         };
         let (kind, bytes) = match payload {
-            Some(bytes) => (anvil_types::EntryKind::Normal, bytes.clone()),
-            None => (anvil_types::EntryKind::NoOp, Bytes::new()),
+            Some(bytes) => (*kind, bytes.clone()),
+            None => (*kind, Bytes::new()),
         };
         entries.push(anvil_types::Entry {
             index: at,
@@ -1590,15 +1589,29 @@ fn install_snapshot_state(
         return;
     }
 
+    // A snapshot that fails verification sidelines the node on the same
+    // repair path as mid-log corruption: it re-fetches the missing range
+    // from peers and clears the flag once a good snapshot installs.
     if anvil_kv::snapshot_digest(&snap.data) != snap.snapshot_digest {
+        cluster.mark_needs_repair(id, snap.last_included_index);
         return;
     }
     let config = KvConfig::default();
     let Ok(restored) = KvStore::decode_snapshot(config, &snap.data) else {
+        cluster.mark_needs_repair(id, snap.last_included_index);
         return;
     };
     if restored.applied_index() != snap.last_included_index {
+        cluster.mark_needs_repair(id, snap.last_included_index);
         return;
+    }
+    if cluster
+        .storage
+        .get(&id)
+        .and_then(|storage| storage.repair_from)
+        .is_some_and(|from| from <= snap.last_included_index)
+    {
+        cluster.clear_repair(id);
     }
     // The snapshot carries the live membership: adopt it so an installer
     // that missed config entries (or a fresh joiner) converges.

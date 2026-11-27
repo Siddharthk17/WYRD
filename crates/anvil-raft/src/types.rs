@@ -363,6 +363,15 @@ pub enum Input {
         base: LogIndex,
         membership: MembershipSnapshot,
     },
+    /// Marks the node as needing protocol-aware repair from an index.
+    /// A flagged node never campaigns, never grants votes, and answers
+    /// appends as if its match index were the last good index, so the
+    /// leader re-replicates the missing range through the validated log
+    /// path. A flagged leader steps down immediately. Ignored for a zero
+    /// index, which repairs nothing.
+    SetNeedsRepair { from_index: LogIndex },
+    /// Clears the repair flag once the missing range is verified whole.
+    ClearNeedsRepair,
     /// Administrative request to transfer leadership to target node.
     TransferLeader { to: NodeId },
     /// Node notifies the core that the log prefix is durable in a snapshot and

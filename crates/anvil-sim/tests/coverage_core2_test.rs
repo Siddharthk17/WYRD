@@ -1375,10 +1375,14 @@ fn test_core2_cluster_rebuild_header_without_junction_stays_sidelined() {
         LogRecoveryClassification::MidLogCorruption { .. }
     ));
     // No live peer and no archive: the header cannot be rebuilt, the file is
-    // left untouched, and the node stays sidelined.
+    // left untouched, and the node stays sidelined with a live but flagged
+    // core that keeps following without voting.
     cluster.repair_step(None);
     assert!(cluster.is_node_needs_repair(follower));
-    assert!(!cluster.nodes.contains_key(&follower));
+    assert_eq!(
+        cluster.nodes[&follower].repair_from(),
+        cluster.storage[&follower].repair_from
+    );
     cluster.repair_step(Some(&BTreeMap::new()));
     assert!(cluster.is_node_needs_repair(follower));
 }
@@ -1515,7 +1519,7 @@ fn test_core2_cluster_repair_via_archive_mixed_kinds() {
 
     // The archive carries branch truth with real terms: a `None` payload for
     // the first corrupt index (NoOp arm) and real payloads after it.
-    let mut archive: BTreeMap<LogIndex, (Term, Option<Bytes>)> = BTreeMap::new();
+    let mut archive: anvil_sim::CommittedArchive = BTreeMap::new();
     let mut cursor = repair_from.as_u64();
     let mut first = true;
     while cursor <= commit.as_u64() {
@@ -1530,7 +1534,7 @@ fn test_core2_cluster_repair_via_archive_mixed_kinds() {
         } else {
             Some(entry.payload.clone())
         };
-        archive.insert(at, (entry.term, payload));
+        archive.insert(at, (entry.term, entry.kind, payload));
         first = false;
         cursor += 1;
     }
@@ -1564,6 +1568,7 @@ fn test_core2_cluster_repair_without_source_stays_sidelined() {
     }
     cluster.repair_step(None);
     assert!(cluster.is_node_needs_repair(follower));
+    // Every core was crashed after sidelining, so none exists to flag.
     assert!(!cluster.nodes.contains_key(&follower));
     cluster.repair_step(Some(&BTreeMap::new()));
     assert!(cluster.is_node_needs_repair(follower));
@@ -1605,14 +1610,14 @@ fn test_core2_cluster_backfill_and_reconcile() {
     cluster.tick_n(15);
 
     // A matching archive finds no divergence and returns early.
-    let mut matching: BTreeMap<LogIndex, (Term, Option<Bytes>)> = BTreeMap::new();
+    let mut matching: anvil_sim::CommittedArchive = BTreeMap::new();
     for raw in 1..=3u64 {
         let at = LogIndex::from_raw(raw);
         let term = cluster.storage[&leader]
             .engine
             .term_at(at)
             .expect("disk term");
-        matching.insert(at, (term, None));
+        matching.insert(at, (term, anvil_types::EntryKind::NoOp, None));
     }
     cluster.reconcile_snapshot_prefix(leader, &matching, LogIndex::from_raw(3));
 
@@ -1637,12 +1642,19 @@ fn test_core2_cluster_backfill_and_reconcile() {
 
     // A conflicting archive restages the prefix from archive truth plus the
     // entries the core still holds, dropping frames neither side supplies.
-    let mut conflicting: BTreeMap<LogIndex, (Term, Option<Bytes>)> = BTreeMap::new();
+    let mut conflicting: anvil_sim::CommittedArchive = BTreeMap::new();
     conflicting.insert(
         LogIndex::from_raw(1),
-        (Term::from_raw(99), Some(Bytes::from_static(b"arch-1"))),
+        (
+            Term::from_raw(99),
+            anvil_types::EntryKind::Normal,
+            Some(Bytes::from_static(b"arch-1")),
+        ),
     );
-    conflicting.insert(LogIndex::from_raw(2), (Term::from_raw(99), None));
+    conflicting.insert(
+        LogIndex::from_raw(2),
+        (Term::from_raw(99), anvil_types::EntryKind::NoOp, None),
+    );
     cluster.reconcile_snapshot_prefix(follower, &conflicting, LogIndex::from_raw(3));
     assert!(!cluster.is_node_crashed(follower));
     assert!(cluster.engine_last_index(follower).is_some());

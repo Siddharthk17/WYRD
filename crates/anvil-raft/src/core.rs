@@ -125,6 +125,7 @@ pub struct RaftCore {
     leave_index: Option<LogIndex>,
     committed_current_term: bool,
     installed_base: Option<LogIndex>,
+    repair_from: Option<LogIndex>,
 }
 
 impl RaftCore {
@@ -212,6 +213,7 @@ impl RaftCore {
             leave_index: None,
             committed_current_term: false,
             installed_base: None,
+            repair_from: None,
         };
         core.rebuild_membership_from_log(&recovered.entries, recovered.commit_index);
         core
@@ -233,6 +235,12 @@ impl RaftCore {
             Input::TransferLeader { to } => self.handle_transfer_leader(to, output),
             Input::RestoreMembership { base, membership } => {
                 self.handle_restore_membership(base, membership, output);
+            }
+            Input::SetNeedsRepair { from_index } => {
+                self.handle_set_needs_repair(from_index, output);
+            }
+            Input::ClearNeedsRepair => {
+                self.handle_clear_needs_repair(output);
             }
             Input::SnapshotReady {
                 last_included_index,
@@ -423,6 +431,64 @@ impl RaftCore {
         sometimes!(output.sometimes_hits, "raft.config.restore");
     }
 
+    /// Returns the repair base when flagged, `None` once verified whole.
+    #[must_use]
+    pub const fn repair_from(&self) -> Option<LogIndex> {
+        self.repair_from
+    }
+
+    /// Marks the node as needing repair from `from_index`. A flagged leader
+    /// hands off and steps down: it must not lead while its storage is
+    /// unverified.
+    fn handle_set_needs_repair(&mut self, from_index: LogIndex, output: &mut Output) {
+        if from_index.is_zero() {
+            return;
+        }
+        if self.repair_from == Some(from_index) {
+            return;
+        }
+        self.repair_from = Some(from_index);
+        sometimes!(output.sometimes_hits, "raft.repair.enter");
+        if self.role == Role::Leader {
+            if let Some(&heir) = self
+                .membership_voters()
+                .iter()
+                .find(|voter| **voter != self.config.node_id)
+            {
+                output.messages.push(OutboundMessage {
+                    to: heir,
+                    message: Message::TimeoutNow {
+                        term: self.term,
+                        leader_id: self.config.node_id,
+                    },
+                });
+            }
+            self.transition_to_follower(self.term, output);
+        }
+    }
+
+    /// Clears the repair flag once the missing range is verified whole.
+    fn handle_clear_needs_repair(&mut self, output: &mut Output) {
+        if self.repair_from.is_none() {
+            return;
+        }
+        self.repair_from = None;
+        sometimes!(output.sometimes_hits, "raft.repair.cleared");
+    }
+
+    /// Match index this node reports: the last good index while flagged, so
+    /// the leader re-replicates the unverified suffix through the validated
+    /// path instead of counting it as durable.
+    fn report_match(&self, matched: LogIndex) -> LogIndex {
+        match self.repair_from {
+            Some(from) => {
+                let last_good = from.prev().unwrap_or(LogIndex::from_raw(0));
+                std::cmp::min(matched, last_good)
+            }
+            None => matched,
+        }
+    }
+
     /// Rebuilds membership by replaying config entries in log order, then
     /// clearing state the commit index proves durable.
     fn rebuild_membership_from_log(&mut self, entries: &[Entry], commit: LogIndex) {
@@ -549,10 +615,11 @@ impl RaftCore {
         self.is_effective_voter(node) || self.learners.contains(&node)
     }
 
-    /// Returns true when this node may campaign: voters only, never learners
-    /// and never nodes removed from the effective config.
+    /// Returns true when this node may campaign: voters only, never learners,
+    /// never nodes removed from the effective config, and never nodes under
+    /// repair.
     fn can_campaign(&self) -> bool {
-        self.is_effective_voter(self.config.node_id)
+        self.repair_from.is_none() && self.is_effective_voter(self.config.node_id)
     }
 
     /// Majority quorum size for `count` voters.
@@ -770,9 +837,10 @@ impl RaftCore {
         output: &mut Output,
     ) {
         let is_log_ok = self.is_log_up_to_date(last_log_index, last_log_term);
-        // Only voters grant pre-votes. Learners and removed nodes answer
-        // false so they can never feed a quorum.
-        let grant = self.is_effective_voter(self.config.node_id)
+        // Only voters grant pre-votes. Learners, removed nodes, and nodes
+        // under repair answer false so they can never feed a quorum.
+        let grant = self.repair_from.is_none()
+            && self.is_effective_voter(self.config.node_id)
             && term >= self.term
             && is_log_ok
             && (!self.leader_sticky || self.role == Role::Leader);
@@ -869,10 +937,12 @@ impl RaftCore {
 
         let can_vote = self.voted_for.is_none() || self.voted_for == Some(candidate_id);
         let is_log_ok = self.is_log_up_to_date(last_log_index, last_log_term);
-        // Only voters grant votes. Learners and removed nodes never vote.
+        // Only voters grant votes. Learners, removed nodes, and nodes under
+        // repair never vote.
         let grant = term == self.term
             && can_vote
             && is_log_ok
+            && self.repair_from.is_none()
             && self.is_effective_voter(self.config.node_id);
 
         if grant {
@@ -1409,7 +1479,7 @@ impl RaftCore {
                 message: Message::AppendEntriesResponse {
                     term: self.term,
                     success: false,
-                    match_index: self.log.last_index(),
+                    match_index: self.report_match(self.log.last_index()),
                     conflict_term: None,
                     conflict_index: None,
                     from: self.config.node_id,
@@ -1459,7 +1529,7 @@ impl RaftCore {
                 message: Message::AppendEntriesResponse {
                     term: self.term,
                     success: false,
-                    match_index: self.log.last_index(),
+                    match_index: self.report_match(self.log.last_index()),
                     conflict_term,
                     conflict_index,
                     from: self.config.node_id,
@@ -1485,7 +1555,7 @@ impl RaftCore {
                     message: Message::AppendEntriesResponse {
                         term: self.term,
                         success: false,
-                        match_index: self.log.last_index(),
+                        match_index: self.report_match(self.log.last_index()),
                         conflict_term: None,
                         conflict_index: Some(hint),
                         from: self.config.node_id,
@@ -1547,7 +1617,7 @@ impl RaftCore {
                 message: Message::AppendEntriesResponse {
                     term: self.term,
                     success: true,
-                    match_index: new_match,
+                    match_index: self.report_match(new_match),
                     conflict_term: None,
                     conflict_index: None,
                     from: self.config.node_id,
@@ -1577,7 +1647,7 @@ impl RaftCore {
                 message: Message::AppendEntriesResponse {
                     term: self.term,
                     success: true,
-                    match_index: new_match,
+                    match_index: self.report_match(new_match),
                     conflict_term: None,
                     conflict_index: None,
                     from: self.config.node_id,
@@ -1590,7 +1660,7 @@ impl RaftCore {
                 message: Message::AppendEntriesResponse {
                     term: self.term,
                     success: true,
-                    match_index: new_match,
+                    match_index: self.report_match(new_match),
                     conflict_term: None,
                     conflict_index: None,
                     from: self.config.node_id,
@@ -1603,7 +1673,7 @@ impl RaftCore {
                 message: Message::AppendEntriesResponse {
                     term: self.term,
                     success: true,
-                    match_index: new_match,
+                    match_index: self.report_match(new_match),
                     conflict_term: None,
                     conflict_index: None,
                     from: self.config.node_id,

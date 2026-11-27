@@ -363,6 +363,8 @@ pub const SOMETIMES_INVENTORY: &[&str] = &[
     "raft.config.rejected",
     "raft.config.restore",
     "raft.config.stepdown.removed",
+    "raft.repair.cleared",
+    "raft.repair.enter",
     "raft.snapshot.install.complete",
     "raft.snapshot.resend",
     "raft.snapshot.send.start",

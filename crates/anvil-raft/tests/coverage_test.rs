@@ -731,7 +731,11 @@ fn test_peer_progress_fallback_paths() {
     let mut clamped = PeerProgress::new(LogIndex::from_raw(2), 4);
     clamped.on_success(LogIndex::from_raw(5));
     clamped.on_rejection(None, Some(LogIndex::from_raw(1)), |_| None);
-    assert_eq!(clamped.next_index, LogIndex::from_raw(6));
+    // The rejection proves the follower lost its suffix (torn write after
+    // acking): the stale recorded match comes down so backtracking can
+    // reach the compacted prefix the follower actually needs.
+    assert_eq!(clamped.match_index, LogIndex::from_raw(0));
+    assert_eq!(clamped.next_index, LogIndex::from_raw(1));
 
     let mut conflicted = PeerProgress::new(LogIndex::from_raw(8), 4);
     conflicted.on_rejection(Some(Term::from_raw(7)), None, |_| None);
