@@ -95,3 +95,91 @@ seeds with 0 invariant violations. The negative configs are kept for
 `cargo xtask tlc-full` on larger hosts; the per-change gate does not run
 them, for the reasons documented above, and the Figure 8 rule is covered by
 the deterministic Rust scenario and property tests instead.
+
+---
+
+# ANVIL Joint-Consensus Reconfiguration Spec (`anvil_reconfig.tla`)
+
+This specification models safe membership changes on top of the base Raft
+core: learners, joint consensus, serialized config changes, and automatic
+leave. The implementation lives in `crates/anvil-raft` (joint quorums,
+auto-leave, refusals, stepdown) and `crates/anvil-node` (bootstrap, joining,
+snapshot-carried config).
+
+## Bounds
+
+The smoke config
+([anvil_reconfig_smoke.cfg](../../specs/anvil_reconfig_smoke.cfg)) defines:
+- **Servers**: 4 nodes (3 voters plus `Joiner`, which starts as a learner)
+- **Max Term**: 2
+- **Max Log Length**: 3
+- **Fault Budget**: 3 fault events (loss, crash, spurious stepdown) per trace
+- **AllowConcurrentChanges**: `FALSE`
+
+The negative config
+([anvil_reconfig_negative.cfg](../../specs/anvil_reconfig_negative.cfg)) is
+identical except `AllowConcurrentChanges = TRUE`: a second joint may be
+appended while one is uncommitted.
+
+## Invariants
+
+The base seven (ElectionSafety, LeaderAppendOnly, LogMatching,
+LeaderCompleteness, StateMachineSafety, CommittedEntriesNeverLost,
+TermMonotonic) plus three reconfiguration invariants:
+
+8. **`CommittedConfigNeverLost`**: a committed config entry keeps its value
+   in every log that still covers its index.
+9. **`SerializedConfig`**: at most one open joint index cluster-wide. A
+   joint at index `i` is open while `i` is uncommitted and no `LeaveJoint`
+   follows it. The oracle (`committedCfg`) makes the property stable across
+   restarts and truncation.
+10. **`JointQuorumOverlap`**: every active joint overlaps both the old and
+    the new config by quorum, in both directions.
+
+## Results
+
+`cargo xtask tlc` simulates the positive config (3 seeds, 200 traces of
+depth 150 each). Measured 2026-11-27 on the dev machine (i5-12450H):
+seeds 1, 7 and 42 explore about 61k states each in about 2 s with zero
+invariant violations. `Reconfig` fires dozens of times per run and
+`FinishJoint` completes joint cycles, so the joint mechanics are genuinely
+exercised (action coverage verified with `-coverage`).
+
+The negative config violates `SerializedConfig` within 3 traces and 811
+states in under a second: the second `EnterJoint` opens a second joint
+index while the first is still uncommitted. The gate asserts the violation
+appears; a clean negative run fails the gate (the spec or the model
+changed, triage before proceeding).
+
+Exhaustive checking of the 4-server bound does not finish within practical
+limits (90M+ states generated in 4 minutes with the queue still growing on
+the dev machine), so per the charter the gate uses simulation mode for the
+reconfig spec while the negative config still yields its counterexample by
+simulation. The base spec keeps its own (vacuous-for-commits) simulation
+gate plus large-host exhaustive runs.
+
+## Modeling notes (read before extending the spec)
+
+- Client writes are not modeled: the log holds the election no-op and
+  config entries only. Filler entries crowd out every `Reconfig` under
+  uniform random simulation, and normal replication is covered by the base
+  spec. Measured: with filler entries `Reconfig` fired 0 times in 50
+  traces; without them it fires dozens of times per run.
+- Faults draw from a per-trace budget (3 by default), mirroring the
+  Plan-based nemesis (warmup/chaos/heal): unbounded loss, crash, and
+  spurious stepdown starve all progress under simulation (nothing ever
+  commits), the same reason the base simulation gate is vacuous for
+  commits.
+- `Stutter` models idle ticks so a quiescent state (spent budget, maxed
+  terms, stale messages no handler accepts) never deadlocks the run. It
+  preserves every safety invariant.
+- A commit marker that outlives its log prefix after truncation is clamped
+  to the log length, matching the implementation (commit advances at most
+  to the matched prefix). Without the clamp, `LeaderCompleteness` faults
+  on an out-of-bounds access instead of checking a real property; the clamp
+  was added after simulation caught exactly that modeling gap.
+- Restart preserves `commitIndex` (recovered from durable storage in the
+  implementation) and rebuilds the pending config marker from the log.
+- Joint state carries the pre-joint voters and learners so a truncated
+  joint rolls back exactly like the implementation's
+  `rollback_config_for_truncate`.
