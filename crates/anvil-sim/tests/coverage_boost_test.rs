@@ -12,15 +12,14 @@
 
 use anvil_raft::SnapshotChunkData;
 use anvil_sim::{
-    DetRng, FarmOptions, FarmProfile, FarmRange, FarmSummary, Plan, PlanNet, SimCluster,
-    SimDevice, SimDeviceConfig, SimNetwork, SplitMix64, StorageFaultAtlas, TraceEvent,
-    TraceRecorder, TransportMode, Watchdog, SwarmProfile, WorkloadSpec, consensus_failure_class,
-    count_sometimes, derive_component_seed, kv_plan_failure_class, normalize_failure_class,
-    panic_failure_class, run_farm_range, run_farm_seed, run_farm_seed_with_storage_faults,
-    run_kv_farm, run_kv_farm_seed, run_kv_farm_seed_with_storage, run_kv_plan,
-    run_kv_plan_traced, run_kv_seed, run_kv_seed_with_stats, run_kv_seed_with_storage, run_plan,
-    run_plan_traced, run_seed_farm, run_seed_farm_with_storage_faults, shrink_plan,
-    shrink_plan_same_class, swarm_profile,
+    DetRng, FarmOptions, FarmProfile, FarmRange, FarmSummary, Plan, PlanNet, SimCluster, SimDevice,
+    SimDeviceConfig, SimNetwork, SplitMix64, StorageFaultAtlas, SwarmProfile, TraceEvent,
+    TraceRecorder, TransportMode, Watchdog, WorkloadSpec, consensus_failure_class, count_sometimes,
+    derive_component_seed, kv_plan_failure_class, normalize_failure_class, panic_failure_class,
+    run_farm_range, run_farm_seed, run_farm_seed_with_storage_faults, run_kv_farm,
+    run_kv_farm_seed, run_kv_farm_seed_with_storage, run_kv_plan, run_kv_plan_traced, run_kv_seed,
+    run_kv_seed_with_stats, run_kv_seed_with_storage, run_plan, run_plan_traced, run_seed_farm,
+    run_seed_farm_with_storage_faults, shrink_plan, shrink_plan_same_class, swarm_profile,
 };
 use anvil_storage::{Device, DeviceOp, FileId, SectorSize};
 use anvil_types::{Entry, EntryKind, LogIndex, NodeId, Term};
@@ -96,7 +95,10 @@ fn test_boost_farm_profile_accessors() {
     assert_eq!(FarmProfile::Smoke.name(), "smoke");
     assert_eq!(FarmProfile::Kv.name(), "kv");
     assert_eq!(FarmProfile::KvStorage.name(), "kv-storage");
-    assert_eq!(FarmProfile::parse("smoke").expect("smoke"), FarmProfile::Smoke);
+    assert_eq!(
+        FarmProfile::parse("smoke").expect("smoke"),
+        FarmProfile::Smoke
+    );
     assert!(FarmProfile::parse("bogus").is_err());
 }
 
@@ -259,11 +261,8 @@ fn test_boost_farm_range_resume_without_out_path() {
         time_budget_secs: None,
         failures_dir: None,
     };
-    let (outcomes, summary) = run_farm_range(
-        FarmRange { start: 5, end: 5 },
-        FarmProfile::Smoke,
-        &options,
-    );
+    let (outcomes, summary) =
+        run_farm_range(FarmRange { start: 5, end: 5 }, FarmProfile::Smoke, &options);
     assert!(outcomes.is_empty());
     assert_eq!(summary.total_seeds, 0);
 }
@@ -283,11 +282,8 @@ fn test_boost_farm_range_out_path_and_bad_writer() {
         time_budget_secs: None,
         failures_dir: Some(failures),
     };
-    let (outcomes, _) = run_farm_range(
-        FarmRange { start: 0, end: 2 },
-        FarmProfile::Smoke,
-        &options,
-    );
+    let (outcomes, _) =
+        run_farm_range(FarmRange { start: 0, end: 2 }, FarmProfile::Smoke, &options);
     assert_eq!(outcomes.len(), 2);
     let text = std::fs::read_to_string(&out).expect("jsonl written");
     assert!(text.contains("\"type\":\"seed\""));
@@ -300,11 +296,8 @@ fn test_boost_farm_range_out_path_and_bad_writer() {
         time_budget_secs: None,
         failures_dir: None,
     };
-    let (second, second_summary) = run_farm_range(
-        FarmRange { start: 0, end: 2 },
-        FarmProfile::Smoke,
-        &resumed,
-    );
+    let (second, second_summary) =
+        run_farm_range(FarmRange { start: 0, end: 2 }, FarmProfile::Smoke, &resumed);
     assert!(second.is_empty());
     assert_eq!(second_summary.total_seeds, 0);
 
@@ -326,7 +319,9 @@ fn test_boost_farm_range_out_path_and_bad_writer() {
 
     let bad_options = FarmOptions {
         jobs: 1,
-        out_path: Some(std::path::PathBuf::from("/nonexistent-boost-dir-xyz/results.jsonl")),
+        out_path: Some(std::path::PathBuf::from(
+            "/nonexistent-boost-dir-xyz/results.jsonl",
+        )),
         resume: false,
         time_budget_secs: None,
         failures_dir: None,
@@ -349,11 +344,7 @@ fn test_boost_farm_range_time_budget_kv() {
         time_budget_secs: Some(0),
         failures_dir: None,
     };
-    let (outcomes, _) = run_farm_range(
-        FarmRange { start: 0, end: 10 },
-        FarmProfile::Kv,
-        &options,
-    );
+    let (outcomes, _) = run_farm_range(FarmRange { start: 0, end: 10 }, FarmProfile::Kv, &options);
     assert!((outcomes.len() as u64) < 10);
 }
 
@@ -500,7 +491,10 @@ fn test_boost_device_config_variants() {
     let latency = SimDeviceConfig::with_latency(SectorSize::Sector512, 2, 5);
     assert_eq!(latency.min_latency_ticks, 2);
     assert_eq!(latency.max_latency_ticks, 5);
-    let mut device = SimDevice::new(SimDeviceConfig::for_test(SectorSize::Sector512), DetRng::new(1, "cfg"));
+    let mut device = SimDevice::new(
+        SimDeviceConfig::for_test(SectorSize::Sector512),
+        DetRng::new(1, "cfg"),
+    );
     assert_eq!(device.current_tick(), 0);
     device.step_time(7);
     assert_eq!(device.current_tick(), 7);
@@ -567,7 +561,10 @@ fn test_boost_device_read_durable_eio() {
         payload: Bytes::from(vec![0xABu8; 64]),
     });
     assert!(device.poll_completion().expect("write").result.is_ok());
-    device.submit(DeviceOp::Fdatasync { op_id: 3, file_id: file });
+    device.submit(DeviceOp::Fdatasync {
+        op_id: 3,
+        file_id: file,
+    });
     assert!(device.poll_completion().expect("sync").result.is_ok());
     assert!(device.read_durable(file).is_err());
     assert!(device.stats().read_eios_injected >= 1);
@@ -580,7 +577,11 @@ fn test_boost_device_overwrite_extend_and_lists() {
         DetRng::new(919, "overwrite"),
     );
     device.overwrite_durable(FileId::wal_segment(50), 0, &[1u8; 8]);
-    assert!(device.get_file_durable_bytes(FileId::wal_segment(50)).is_none());
+    assert!(
+        device
+            .get_file_durable_bytes(FileId::wal_segment(50))
+            .is_none()
+    );
     let file = FileId::wal_segment(3);
     device.submit(DeviceOp::Create {
         op_id: 1,
@@ -663,7 +664,13 @@ fn test_boost_trace_recorder_wrap() {
     assert_eq!(recent.len(), 2);
     assert_eq!(recent[0].actor_id, 3);
     assert_eq!(recent[1].actor_id, 4);
-    assert!(!recorder.finalize_hash().as_bytes().iter().all(|byte| *byte == 0));
+    assert!(
+        !recorder
+            .finalize_hash()
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte == 0)
+    );
     let fallback = TraceRecorder::default();
     assert_eq!(fallback.total_events(), 0);
 }
@@ -714,7 +721,10 @@ fn test_boost_normalize_truncation_and_panic_nonstring() {
     assert!(class.len() <= 240);
     assert_eq!(class, "#");
     let boxed: Box<dyn std::any::Any + Send> = Box::new(42u32);
-    assert_eq!(panic_failure_class(&boxed), "panic:non-string panic payload");
+    assert_eq!(
+        panic_failure_class(&boxed),
+        "panic:non-string panic payload"
+    );
     let text: Box<dyn std::any::Any + Send> = Box::new(String::from("boom at 12"));
     assert_eq!(panic_failure_class(&text), "panic:boom at #");
 }
@@ -851,10 +861,7 @@ fn test_boost_watchdog_helpers() {
             .is_ok()
     );
     let fallback = Watchdog::default();
-    assert_eq!(
-        fallback.events_without_progress(),
-        0
-    );
+    assert_eq!(fallback.events_without_progress(), 0);
 }
 
 #[test]

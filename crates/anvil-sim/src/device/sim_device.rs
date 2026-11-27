@@ -745,7 +745,8 @@ impl SimDevice {
     }
 
     /// Internal helper to check if a corruption of a WAL frame is permitted by the atlas.
-    fn can_corrupt_wal_frame(&self, file_id: FileId, offset: u64, buf: &[u8]) -> bool {        if let (Some(atlas), Some(node_id)) = (&self.atlas, self.node_id)
+    fn can_corrupt_wal_frame(&self, file_id: FileId, offset: u64, buf: &[u8]) -> bool {
+        if let (Some(atlas), Some(node_id)) = (&self.atlas, self.node_id)
             && file_id.is_wal_segment()
             && offset >= self.config.sector_size.as_u64()
             && let Some(index) = Self::frame_index_at(buf)

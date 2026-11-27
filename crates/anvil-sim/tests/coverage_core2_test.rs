@@ -75,13 +75,7 @@ fn drain_device(device: &mut SimDevice) {
 
 /// Creates a WAL segment with `count` single-sector frames starting at
 /// `first`, then syncs it so the bytes are durable.
-fn seed_wal_frames(
-    device: &mut SimDevice,
-    ops: &mut OpCounter,
-    seg: u64,
-    first: u64,
-    count: u64,
-) {
+fn seed_wal_frames(device: &mut SimDevice, ops: &mut OpCounter, seg: u64, first: u64, count: u64) {
     let sector = SectorSize::Sector512;
     let file = FileId::wal_segment(seg);
     device.submit(DeviceOp::Create {
@@ -89,9 +83,11 @@ fn seed_wal_frames(
         file_id: file,
         preallocate_bytes: 512 * (count + 1),
     });
-    assert_eq!(drain_one(device).expect("create"), CompletionPayload::Created);
-    let header =
-        WalSegmentHeader::new(sector, seg, LogIndex::from_raw(first), Term::from_raw(1));
+    assert_eq!(
+        drain_one(device).expect("create"),
+        CompletionPayload::Created
+    );
+    let header = WalSegmentHeader::new(sector, seg, LogIndex::from_raw(first), Term::from_raw(1));
     let mut header_buf = vec![0u8; sector.as_usize()];
     header.encode(&mut header_buf).expect("header encodes");
     device.submit(DeviceOp::Write {
@@ -249,7 +245,11 @@ fn test_core2_device_namespace_ops() {
     );
     assert!(!device.file_exists(target));
     assert!(device.get_file_volatile_bytes(target).is_none());
-    assert!(device.get_file_volatile_bytes(FileId::wal_segment(77)).is_none());
+    assert!(
+        device
+            .get_file_volatile_bytes(FileId::wal_segment(77))
+            .is_none()
+    );
     assert!(device.read_durable(target).is_err());
 
     // Fdatasync on a missing file errors.
@@ -378,9 +378,7 @@ fn test_core2_device_read_write_edges() {
     assert!(device.read_durable(FileId::wal_segment(9)).is_err());
 
     // SyncDir marks namespace entries durable.
-    device.submit(DeviceOp::SyncDir {
-        op_id: ops.next(),
-    });
+    device.submit(DeviceOp::SyncDir { op_id: ops.next() });
     assert_eq!(
         drain_one(&mut device).expect("syncdir"),
         CompletionPayload::DirSynced
@@ -439,7 +437,10 @@ fn test_core2_device_injected_faults() {
         preallocate_bytes: 512,
     });
     assert!(drain_one(&mut fsync).is_ok());
-    fsync.submit(DeviceOp::Fdatasync { op_id: 2, file_id: file });
+    fsync.submit(DeviceOp::Fdatasync {
+        op_id: 2,
+        file_id: file,
+    });
     assert!(matches!(
         drain_one(&mut fsync),
         Err(StorageError::FsyncFailed { .. })
@@ -541,11 +542,8 @@ fn test_core2_device_read_corruption_atlas_veto_and_allow() {
     atlas.advance_commit_index(committed);
     let mut veto_config = SimDeviceConfig::for_test(SectorSize::Sector512);
     veto_config.read_corruption_rate_ppm = 1_000_000;
-    let mut vetoed = SimDevice::new(
-        veto_config,
-        DetRng::new(19, "core2-veto"),
-    )
-    .with_atlas(atlas, me);
+    let mut vetoed =
+        SimDevice::new(veto_config, DetRng::new(19, "core2-veto")).with_atlas(atlas, me);
     let mut ops = OpCounter(0);
     seed_wal_frames(&mut vetoed, &mut ops, 1, 1, 1);
     assert!(vetoed.read_durable(FileId::wal_segment(1)).is_ok());
@@ -558,20 +556,20 @@ fn test_core2_device_read_corruption_atlas_veto_and_allow() {
         .get_file_durable_bytes(FileId::wal_segment(1))
         .expect("bytes")
         .to_vec();
-    assert!(anvil_storage::WalSegmentHeader::decode(
-        &raw[..SectorSize::Sector512.as_usize()],
-        SectorSize::Sector512
-    )
-    .is_err(), "header sector took the rot");
+    assert!(
+        anvil_storage::WalSegmentHeader::decode(
+            &raw[..SectorSize::Sector512.as_usize()],
+            SectorSize::Sector512
+        )
+        .is_err(),
+        "header sector took the rot"
+    );
 
     // A permissive atlas allows hard-state damage.
     let mut allow_config = SimDeviceConfig::for_test(SectorSize::Sector512);
     allow_config.read_corruption_rate_ppm = 1_000_000;
-    let mut allowed = SimDevice::new(
-        allow_config,
-        DetRng::new(20, "core2-allow"),
-    )
-    .with_atlas(StorageFaultAtlas::permissive(), me);
+    let mut allowed = SimDevice::new(allow_config, DetRng::new(20, "core2-allow"))
+        .with_atlas(StorageFaultAtlas::permissive(), me);
     allowed.submit(DeviceOp::Create {
         op_id: 1,
         file_id: FileId::HARD_STATE,
@@ -621,7 +619,10 @@ fn test_core2_device_latency_and_drains() {
     assert_eq!(ready[0].op_id, 1);
 
     // A sync op exercises the fsync-stall latency branch.
-    device.submit(DeviceOp::Fdatasync { op_id: 2, file_id: file });
+    device.submit(DeviceOp::Fdatasync {
+        op_id: 2,
+        file_id: file,
+    });
     device.step_time(30);
     let forced = device.drain_all_completions_forcing();
     assert_eq!(forced.len(), 1);
@@ -659,9 +660,7 @@ fn test_core2_device_crash_fates() {
     // An unsynced sector past the durable prefix forces the durable
     // resize path on crash. SyncDir first so directory loss cannot drop
     // the file before fate resolution runs.
-    torn.submit(DeviceOp::SyncDir {
-        op_id: ops.next(),
-    });
+    torn.submit(DeviceOp::SyncDir { op_id: ops.next() });
     assert!(drain_one(&mut torn).is_ok());
     torn.submit(DeviceOp::Write {
         op_id: ops.next(),
@@ -672,13 +671,7 @@ fn test_core2_device_crash_fates() {
     assert!(drain_one(&mut torn).is_ok());
     torn.crash();
     assert!(torn.stats().torn_sectors_persisted >= 1);
-    assert!(
-        torn
-            .get_file_durable_bytes(file)
-            .expect("durable")
-            .len()
-            >= 2048
-    );
+    assert!(torn.get_file_durable_bytes(file).expect("durable").len() >= 2048);
 
     // Lost sectors revert to the old durable image.
     let mut loss_config = SimDeviceConfig::for_test(SectorSize::Sector512);
@@ -802,9 +795,7 @@ fn test_core2_device_crash_unlinked_reinsert() {
         preallocate_bytes: 512,
     });
     assert!(drain_one(&mut device).is_ok());
-    device.submit(DeviceOp::SyncDir {
-        op_id: ops.next(),
-    });
+    device.submit(DeviceOp::SyncDir { op_id: ops.next() });
     assert!(drain_one(&mut device).is_ok());
     device.submit(DeviceOp::Unlink {
         op_id: ops.next(),
@@ -826,8 +817,8 @@ fn test_core2_device_crash_atlas_file_loss_veto() {
     atlas.advance_commit_index(committed);
     let mut config = SimDeviceConfig::for_test(SectorSize::Sector512);
     config.unsynced_dir_loss_rate_ppm = 1_000_000;
-    let mut device = SimDevice::new(config, DetRng::new(29, "core2-veto-loss"))
-        .with_atlas(atlas, me);
+    let mut device =
+        SimDevice::new(config, DetRng::new(29, "core2-veto-loss")).with_atlas(atlas, me);
     let mut ops = OpCounter(0);
     seed_wal_frames(&mut device, &mut ops, 1, 5, 3);
     assert!(!device.is_file_durable(FileId::wal_segment(1)));
@@ -838,8 +829,8 @@ fn test_core2_device_crash_atlas_file_loss_veto() {
     let atlas_two = StorageFaultAtlas::new(3);
     let mut config_two = SimDeviceConfig::for_test(SectorSize::Sector512);
     config_two.unsynced_dir_loss_rate_ppm = 1_000_000;
-    let mut device_two = SimDevice::new(config_two, DetRng::new(30, "core2-drop"))
-        .with_atlas(atlas_two, me);
+    let mut device_two =
+        SimDevice::new(config_two, DetRng::new(30, "core2-drop")).with_atlas(atlas_two, me);
     let mut ops_two = OpCounter(0);
     seed_wal_frames(&mut device_two, &mut ops_two, 1, 50, 2);
     device_two.crash();
@@ -873,8 +864,8 @@ fn test_core2_device_crash_atlas_protected_and_immune() {
     let mut torn_config = SimDeviceConfig::for_test(SectorSize::Sector512);
     torn_config.torn_write_rate_ppm = 1_000_000;
     torn_config.unsynced_sector_loss_rate_ppm = 0;
-    let mut device = SimDevice::new(torn_config, DetRng::new(32, "core2-protect"))
-        .with_atlas(atlas, me);
+    let mut device =
+        SimDevice::new(torn_config, DetRng::new(32, "core2-protect")).with_atlas(atlas, me);
     let mut ops = OpCounter(0);
     let file = FileId::wal_segment(1);
     device.submit(DeviceOp::Create {
@@ -894,9 +885,7 @@ fn test_core2_device_crash_atlas_protected_and_immune() {
         payload: Bytes::from(header_buf),
     });
     assert!(drain_one(&mut device).is_ok());
-    device.submit(DeviceOp::SyncDir {
-        op_id: ops.next(),
-    });
+    device.submit(DeviceOp::SyncDir { op_id: ops.next() });
     assert!(drain_one(&mut device).is_ok());
     // The committed frame stays dirty: the crash must persist it whole
     // instead of tearing or losing it.
@@ -906,8 +895,7 @@ fn test_core2_device_crash_atlas_protected_and_immune() {
         kind: EntryKind::Normal,
         payload: Bytes::from(vec![0x5Au8; 16]),
     };
-    let protected_frame =
-        WalRecordFrame::from_entry(&protected_entry, header.header_crc, 1, 512);
+    let protected_frame = WalRecordFrame::from_entry(&protected_entry, header.header_crc, 1, 512);
     let mut protected_buf = Vec::new();
     protected_frame.encode_frame(sector, &mut protected_buf);
     device.submit(DeviceOp::Write {
@@ -920,13 +908,7 @@ fn test_core2_device_crash_atlas_protected_and_immune() {
     device.crash();
     // Sector 0 tears (the only torn sector); the protected frame persists.
     assert_eq!(device.stats().torn_sectors_persisted, 1);
-    assert!(
-        device
-            .get_file_durable_bytes(file)
-            .expect("durable")
-            .len()
-            >= 1024
-    );
+    assert!(device.get_file_durable_bytes(file).expect("durable").len() >= 1024);
 
     // A truncated volatile image exercises the short-sector continue arms.
     let mut trunc_config = SimDeviceConfig::for_test(SectorSize::Sector512);
@@ -935,8 +917,8 @@ fn test_core2_device_crash_atlas_protected_and_immune() {
     let atlas_trunc = StorageFaultAtlas::new(3);
     atlas_trunc.record_persisted(me, committed);
     atlas_trunc.advance_commit_index(committed);
-    let mut truncated = SimDevice::new(trunc_config, DetRng::new(33, "core2-ptrunc"))
-        .with_atlas(atlas_trunc, me);
+    let mut truncated =
+        SimDevice::new(trunc_config, DetRng::new(33, "core2-ptrunc")).with_atlas(atlas_trunc, me);
     let mut trunc_ops = OpCounter(0);
     seed_wal_frames(&mut truncated, &mut trunc_ops, 1, 5, 2);
     // A fresh dirty frame past the truncation point exercises the
@@ -971,8 +953,8 @@ fn test_core2_device_crash_atlas_protected_and_immune() {
     assert!(!immune_atlas.can_lose_hard_state(me));
     let mut immune_config = SimDeviceConfig::for_test(SectorSize::Sector512);
     immune_config.torn_write_rate_ppm = 1_000_000;
-    let mut immune = SimDevice::new(immune_config, DetRng::new(34, "core2-immune"))
-        .with_atlas(immune_atlas, me);
+    let mut immune =
+        SimDevice::new(immune_config, DetRng::new(34, "core2-immune")).with_atlas(immune_atlas, me);
     immune.submit(DeviceOp::Create {
         op_id: 1,
         file_id: FileId::HARD_STATE,
@@ -1230,10 +1212,7 @@ fn test_core2_cluster_both_slots_refused_with_atlas() {
     let error = cluster
         .restart_node(follower)
         .expect_err("both slots corrupt must refuse");
-    assert!(matches!(
-        error,
-        StorageError::CorruptHardStateBothSlots
-    ));
+    assert!(matches!(error, StorageError::CorruptHardStateBothSlots));
     assert!(cluster.is_node_refused_start(follower));
 }
 
@@ -1342,9 +1321,7 @@ fn test_core2_cluster_torn_tail_without_acked_beyond_tip() {
         });
         drain_device(&mut storage.device);
     }
-    let recovered = cluster
-        .restart_node(follower)
-        .expect("torn tail restarts");
+    let recovered = cluster.restart_node(follower).expect("torn tail restarts");
     assert!(matches!(
         recovered.log.classification,
         LogRecoveryClassification::TornTail { .. }
@@ -1392,9 +1369,7 @@ fn test_core2_cluster_rebuild_header_without_junction_stays_sidelined() {
             cluster.crash_node(id);
         }
     }
-    let recovered = cluster
-        .restart_node(follower)
-        .expect("scan completes");
+    let recovered = cluster.restart_node(follower).expect("scan completes");
     assert!(matches!(
         recovered.log.classification,
         LogRecoveryClassification::MidLogCorruption { .. }
@@ -1644,11 +1619,7 @@ fn test_core2_cluster_backfill_and_reconcile() {
     // Reconcile on a crashed node returns before touching the disk.
     let follower = follower_of(&cluster, leader);
     cluster.crash_node(follower);
-    cluster.reconcile_snapshot_prefix(
-        follower,
-        &BTreeMap::new(),
-        LogIndex::from_raw(3),
-    );
+    cluster.reconcile_snapshot_prefix(follower, &BTreeMap::new(), LogIndex::from_raw(3));
     cluster.restart_node(follower).expect("restart");
 
     // Backfilling entries past the core tip succeeds without crashing.
@@ -1952,10 +1923,7 @@ fn empty_stores_and_applied(
         .iter()
         .map(|id| (*id, KvStore::new(KvConfig::default())))
         .collect();
-    let applied = ids
-        .iter()
-        .map(|id| (*id, LogIndex::from_raw(0)))
-        .collect();
+    let applied = ids.iter().map(|id| (*id, LogIndex::from_raw(0))).collect();
     (stores, applied)
 }
 
@@ -1969,7 +1937,11 @@ fn test_core2_workload_convergence_audit_branches() {
     // Divergent applied indexes fail the audit.
     let (stores_same, mut applied_mismatch) = empty_stores_and_applied(&ids);
     applied_mismatch.insert(ids[1], LogIndex::from_raw(3));
-    assert!(!convergence_audit(&cluster, &stores_same, &applied_mismatch));
+    assert!(!convergence_audit(
+        &cluster,
+        &stores_same,
+        &applied_mismatch
+    ));
 
     // Equal applied indexes with divergent state hashes fail the audit.
     let (mut stores_diverged, applied_same) = empty_stores_and_applied(&ids);
@@ -1991,7 +1963,11 @@ fn test_core2_workload_convergence_audit_branches() {
         .encode(&mut put);
         store.apply(LogIndex::from_raw(2), &put).expect("put");
     }
-    assert!(!convergence_audit(&cluster, &stores_diverged, &applied_same));
+    assert!(!convergence_audit(
+        &cluster,
+        &stores_diverged,
+        &applied_same
+    ));
 
     // No live nodes converge vacuously.
     let mut dead = SimCluster::new(3, 10021);

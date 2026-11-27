@@ -443,21 +443,26 @@ fn test_v03_rejects_tomb_key_len_over_limit() {
 #[test]
 fn test_v02_decodes_entry_with_tombstone() {
     let config = KvConfig::default();
-    let store =
-        KvStore::decode_snapshot(config, &base_v02_entry_tomb()).expect("v02 with entries");
+    let store = KvStore::decode_snapshot(config, &base_v02_entry_tomb()).expect("v02 with entries");
     assert_eq!(store.applied_index(), idx(3));
     assert_eq!(store.virtual_tick(), 7);
     assert_eq!(store.session_count(), 0);
     assert_eq!(store.len(), 1);
     match store.read_register(b"k") {
-        KvResponse::Value { value: Some(value), version } => {
+        KvResponse::Value {
+            value: Some(value),
+            version,
+        } => {
             assert_eq!(value, Bytes::from_static(b"v"));
             assert_eq!(version, idx(2));
         }
         other => panic!("unexpected read: {other:?}"),
     }
     match store.read_register(b"gone") {
-        KvResponse::Value { value: None, version } => assert_eq!(version, idx(3)),
+        KvResponse::Value {
+            value: None,
+            version,
+        } => assert_eq!(version, idx(3)),
         other => panic!("unexpected tombstone read: {other:?}"),
     }
     match store.read_list(b"gone") {
@@ -533,11 +538,17 @@ fn test_v03_roundtrips_every_response_variant() {
     );
     assert_eq!(
         replay(&mut store, 14, session, 3),
-        KvResponse::Value { value: Some(Bytes::from_static(b"sv")), version: idx(7) }
+        KvResponse::Value {
+            value: Some(Bytes::from_static(b"sv")),
+            version: idx(7)
+        }
     );
     assert_eq!(
         replay(&mut store, 15, session, 4),
-        KvResponse::Value { value: None, version: idx(8) }
+        KvResponse::Value {
+            value: None,
+            version: idx(8)
+        }
     );
     assert_eq!(
         replay(&mut store, 16, session, 5),
@@ -548,11 +559,22 @@ fn test_v03_roundtrips_every_response_variant() {
     );
     assert_eq!(
         replay(&mut store, 17, session, 6),
-        KvResponse::Range { pairs: vec![(Bytes::from_static(b"rk"), Bytes::from_static(b"rv"))] }
+        KvResponse::Range {
+            pairs: vec![(Bytes::from_static(b"rk"), Bytes::from_static(b"rv"))]
+        }
     );
-    assert_eq!(replay(&mut store, 18, session, 7), KvResponse::CasConflict { version: idx(10) });
-    assert_eq!(replay(&mut store, 19, session, 8), KvResponse::SessionExpired);
-    assert_eq!(replay(&mut store, 20, session, 9), KvResponse::UnknownSession);
+    assert_eq!(
+        replay(&mut store, 18, session, 7),
+        KvResponse::CasConflict { version: idx(10) }
+    );
+    assert_eq!(
+        replay(&mut store, 19, session, 8),
+        KvResponse::SessionExpired
+    );
+    assert_eq!(
+        replay(&mut store, 20, session, 9),
+        KvResponse::UnknownSession
+    );
     assert_eq!(replay(&mut store, 21, session, 10), KvResponse::Duplicate);
     // The empty-elements record surfaces as an empty value in range scans.
     match store.read_range(b"", b"", 10) {
@@ -560,7 +582,10 @@ fn test_v03_roundtrips_every_response_variant() {
             assert_eq!(pairs.len(), 2);
             assert_eq!(pairs[0].0, Bytes::from_static(b"empty"));
             assert!(pairs[0].1.is_empty());
-            assert_eq!(pairs[1], (Bytes::from_static(b"k"), Bytes::from_static(b"v")));
+            assert_eq!(
+                pairs[1],
+                (Bytes::from_static(b"k"), Bytes::from_static(b"v"))
+            );
         }
         other => panic!("range failed: {other:?}"),
     }
@@ -612,7 +637,10 @@ fn test_decode_value_response_rejects_malformed() {
     let mut store = KvStore::decode_snapshot(config, &good).expect("none value decodes");
     assert_eq!(
         replay(&mut store, 12, sess(1), 1),
-        KvResponse::Value { value: None, version: idx(8) }
+        KvResponse::Value {
+            value: None,
+            version: idx(8)
+        }
     );
 }
 
@@ -636,7 +664,10 @@ fn test_decode_list_response_rejects_malformed() {
     let mut store = KvStore::decode_snapshot(config, &good).expect("list decodes");
     assert_eq!(
         replay(&mut store, 12, sess(1), 1),
-        KvResponse::List { values: vec![Bytes::from_static(b"a")], version: idx(9) }
+        KvResponse::List {
+            values: vec![Bytes::from_static(b"a")],
+            version: idx(9)
+        }
     );
 }
 
@@ -668,7 +699,9 @@ fn test_decode_range_response_rejects_malformed() {
     let mut store = KvStore::decode_snapshot(config, &good).expect("range decodes");
     assert_eq!(
         replay(&mut store, 12, sess(1), 1),
-        KvResponse::Range { pairs: vec![(Bytes::from_static(b"x"), Bytes::from_static(b"y"))] }
+        KvResponse::Range {
+            pairs: vec![(Bytes::from_static(b"x"), Bytes::from_static(b"y"))]
+        }
     );
 }
 
@@ -718,7 +751,10 @@ fn test_snapshot_roundtrips_list_and_cas_conflict() {
         .expect("replay append")
     {
         KvResponse::List { values, version } => {
-            assert_eq!(values, vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]);
+            assert_eq!(
+                values,
+                vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]
+            );
             assert_eq!(version, idx(4));
         }
         other => panic!("cached list lost: {other:?}"),

@@ -164,7 +164,15 @@ fn cli_farm_empty_range_exit_2() {
 #[test]
 fn cli_farm_bad_profile_exit_2() {
     let output = std::process::Command::new(bin_exe())
-        .args(["farm", "--seeds", "0..1", "--jobs", "1", "--profile", "bogus"])
+        .args([
+            "farm",
+            "--seeds",
+            "0..1",
+            "--jobs",
+            "1",
+            "--profile",
+            "bogus",
+        ])
         .output()
         .expect("run anvil-sim farm");
     assert_eq!(output.status.code(), Some(2));
@@ -248,7 +256,10 @@ fn cli_trace_smoke_to_file() {
         String::from_utf8_lossy(&output.stderr)
     );
     let text = std::fs::read_to_string(&out).expect("trace written");
-    assert!(text.contains("anvil trace seed=1 profile=smoke"), "trace: {text}");
+    assert!(
+        text.contains("anvil trace seed=1 profile=smoke"),
+        "trace: {text}"
+    );
     assert!(text.contains("outcome:"), "trace: {text}");
     assert!(text.contains("plan: anvil-plan/"), "trace: {text}");
     let _ = std::fs::remove_dir_all(&dir);
@@ -278,7 +289,10 @@ fn cli_trace_kv_to_file() {
         String::from_utf8_lossy(&output.stderr)
     );
     let text = std::fs::read_to_string(&out).expect("kv trace written");
-    assert!(text.contains("anvil trace seed=1 profile=kv"), "trace: {text}");
+    assert!(
+        text.contains("anvil trace seed=1 profile=kv"),
+        "trace: {text}"
+    );
     assert!(text.contains("outcome:"), "trace: {text}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -421,11 +435,8 @@ fn farm_range_resume_filters_mixed_lines() {
         time_budget_secs: None,
         failures_dir: None,
     };
-    let (outcomes, _) = anvil_sim::run_farm_range(
-        FarmRange { start: 0, end: 2 },
-        FarmProfile::Smoke,
-        &options,
-    );
+    let (outcomes, _) =
+        anvil_sim::run_farm_range(FarmRange { start: 0, end: 2 }, FarmProfile::Smoke, &options);
     // Seed 0 was recorded as passed and is skipped; seed 1 re-runs.
     assert_eq!(outcomes.len(), 1);
     assert_eq!(outcomes[0].seed, 1);
@@ -499,8 +510,8 @@ fn plan_decode_error_branches() {
         client_crashes: false,
         unordered: false,
     };
-    let with_workload = Plan::decode(&format!("{MINIMAL};workload=2,4,4,0,5,50,0,0"))
-        .expect("workload decodes");
+    let with_workload =
+        Plan::decode(&format!("{MINIMAL};workload=2,4,4,0,5,50,0,0")).expect("workload decodes");
     assert_eq!(with_workload.workload, Some(workload));
 }
 
@@ -652,10 +663,7 @@ fn plan_shrink_helpers_with_synthetic_oracles() {
 #[test]
 fn plan_failure_class_str_payload_and_normalize() {
     let payload: Box<dyn std::any::Any + Send> = Box::new("boom 12");
-    assert_eq!(
-        anvil_sim::panic_failure_class(&payload),
-        "panic:boom #"
-    );
+    assert_eq!(anvil_sim::panic_failure_class(&payload), "panic:boom #");
     assert_eq!(anvil_sim::normalize_failure_class(""), "");
     assert_eq!(anvil_sim::normalize_failure_class("abc"), "abc");
     assert_eq!(anvil_sim::normalize_failure_class("a1b22c"), "a#b#c");
@@ -728,7 +736,11 @@ fn invariants_leader_completeness_wrong_term() {
     let mut checker = anvil_sim::RaftInvariantChecker::new();
     assert!(checker.try_check_invariants(&nodes).is_ok());
     assert!(checker.committed_entries_count() >= 1);
-    assert!(checker.committed_oracle().contains_key(&LogIndex::from_raw(1)));
+    assert!(
+        checker
+            .committed_oracle()
+            .contains_key(&LogIndex::from_raw(1))
+    );
 
     let mut divergent = core_with_vote(config1, 2, 0, vec![normal_entry(1, 2)], None, 133);
     divergent.testing_set_role(Role::Leader);
@@ -828,7 +840,12 @@ fn invariants_vote_never_forgotten_and_reset_for_restart() {
     assert!(fresh.try_check_invariants(&fresh_nodes).is_ok());
     assert!(
         fresh
-            .reset_for_restart(fresh_node, Term::from_raw(1), Some(fresh_node), &empty_acked)
+            .reset_for_restart(
+                fresh_node,
+                Term::from_raw(1),
+                Some(fresh_node),
+                &empty_acked
+            )
             .is_ok()
     );
 }
@@ -950,7 +967,10 @@ fn network_latency_models_sample_deterministically() {
     );
     let uniform = LatencyModel::Uniform { min: 1, max: 9 }.sample_hash(11, 1, 2, 3);
     assert!((1..=9).contains(&uniform));
-    assert_eq!(LatencyModel::Exponential { mean: 0 }.sample_hash(1, 2, 3, 4), 0);
+    assert_eq!(
+        LatencyModel::Exponential { mean: 0 }.sample_hash(1, 2, 3, 4),
+        0
+    );
     let exp = LatencyModel::Exponential { mean: 10 }.sample_hash(13, 1, 2, 3);
     assert!(exp <= 80);
     let bimodal = LatencyModel::Bimodal {

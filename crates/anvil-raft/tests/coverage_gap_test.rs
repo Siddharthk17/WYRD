@@ -42,7 +42,12 @@ fn make_core(n: u64, peers: &[u64]) -> RaftCore {
     )
 }
 
-fn make_core_with_log(node_id_raw: u64, peers: &[u64], term: Term, entries: Vec<Entry>) -> RaftCore {
+fn make_core_with_log(
+    node_id_raw: u64,
+    peers: &[u64],
+    term: Term,
+    entries: Vec<Entry>,
+) -> RaftCore {
     let mut set = BTreeSet::new();
     for &p in peers {
         set.insert(node_id(p));
@@ -323,9 +328,7 @@ fn test_become_leader_aborts_pending_transfer() {
     output.clear();
     leader.testing_become_leader(&mut output);
     assert!(
-        output
-            .sometimes_hits
-            .contains(&"raft.transfer.aborted"),
+        output.sometimes_hits.contains(&"raft.transfer.aborted"),
         "re-election with a pending transfer must mark the abort"
     );
     ack_all(&mut leader, &mut output);
@@ -521,9 +524,11 @@ fn test_append_overwrites_conflicting_suffix_and_skips_snapshotted() {
         .persist_ops
         .iter()
         .filter_map(|op| match op {
-            PersistOp::TruncateAndAppend { from_index, entries, .. } => {
-                Some((*from_index, entries.len()))
-            }
+            PersistOp::TruncateAndAppend {
+                from_index,
+                entries,
+                ..
+            } => Some((*from_index, entries.len())),
             _ => None,
         })
         .collect();
@@ -630,7 +635,12 @@ fn test_overlapping_reads_complete_and_retain_independently() {
     let first = Bytes::from_static(b"first");
     let second = Bytes::from_static(b"second");
     output.clear();
-    leader.step(Input::ReadIndex { context: first.clone() }, &mut output);
+    leader.step(
+        Input::ReadIndex {
+            context: first.clone(),
+        },
+        &mut output,
+    );
     leader.step(
         Input::ReadIndex {
             context: second.clone(),
@@ -728,12 +738,7 @@ fn test_snapshot_ready_rejects_malformed_inputs() {
     let (_, chunks, digest) = fake_snapshot(64, 2);
     let bad_cases: Vec<(&str, u64, u64, Vec<SnapshotChunkData>)> = vec![
         ("zero index", 0, 64, chunks.clone()),
-        (
-            "empty chunks",
-            2,
-            64,
-            Vec::new(),
-        ),
+        ("empty chunks", 2, 64, Vec::new()),
         ("zero bytes", 2, 0, chunks.clone()),
         (
             "empty chunk",
@@ -845,7 +850,13 @@ fn test_install_snapshot_invalid_chunk_index_rejected() {
     );
     let mut follower = make_core(2, &[1]);
     let mut output = Output::new();
-    follower.step(Input::Recv { from: leader, message: bad }, &mut output);
+    follower.step(
+        Input::Recv {
+            from: leader,
+            message: bad,
+        },
+        &mut output,
+    );
     let rejected = output.messages.iter().any(|m| {
         matches!(
             &m.message,
@@ -1472,9 +1483,10 @@ fn test_transfer_immediate_timeout_when_peer_caught_up() {
     );
     output.clear();
     leader.step(Input::TransferLeader { to: peer }, &mut output);
-    let timeout = output.messages.iter().any(|m| {
-        matches!(&m.message, Message::TimeoutNow { .. }) && m.to == peer
-    });
+    let timeout = output
+        .messages
+        .iter()
+        .any(|m| matches!(&m.message, Message::TimeoutNow { .. }) && m.to == peer);
     assert!(timeout, "caught-up transferee must get TimeoutNow at once");
     output.clear();
     leader.step(
@@ -1722,10 +1734,7 @@ fn test_log_compacted_term_and_truncate_edges() {
     assert_eq!(log.base_index(), LogIndex::from_raw(3));
     assert_eq!(log.base_term(), Term::from_raw(1));
     assert_eq!(log.term_at(LogIndex::from_raw(2)), None);
-    assert_eq!(
-        log.term_at(LogIndex::from_raw(3)),
-        Some(Term::from_raw(1))
-    );
+    assert_eq!(log.term_at(LogIndex::from_raw(3)), Some(Term::from_raw(1)));
     assert_eq!(log.find_last_index_of_term(Term::from_raw(7)), None);
 
     let before = log.last_index();
@@ -1759,10 +1768,7 @@ fn test_log_compacted_term_and_truncate_edges() {
             ),
         ],
     );
-    assert_eq!(
-        log.term_at(LogIndex::from_raw(4)),
-        Some(Term::from_raw(9))
-    );
+    assert_eq!(log.term_at(LogIndex::from_raw(4)), Some(Term::from_raw(9)));
     assert_eq!(log.last_index(), LogIndex::from_raw(4));
 }
 
@@ -1802,4 +1808,3 @@ fn test_election_sampler_rejection_loop_redraws() {
     );
     assert_eq!(core.role(), Role::Follower);
 }
-

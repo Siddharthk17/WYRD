@@ -31,21 +31,8 @@ fn test_snapshot_over_divergent_prefix_recovers_cleanly() {
 #[test]
 fn test_storage_fault_pins_recover_cleanly() {
     for seed in [
-        31_604u64,
-        88_700,
-        118_313,
-        100_260,
-        123_509,
-        20_400,
-        48_019,
-        101_519,
-        140_919,
-        59_349,
-        74_788,
-        79_738,
-        105_094,
-        159_614,
-        176_149,
+        31_604u64, 88_700, 118_313, 100_260, 123_509, 20_400, 48_019, 101_519, 140_919, 59_349,
+        74_788, 79_738, 105_094, 159_614, 176_149,
     ] {
         let (_, audit, _) = run_kv_seed_with_stats(seed, true);
         assert!(audit, "seed {seed} must converge with a clean audit");

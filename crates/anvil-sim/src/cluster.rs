@@ -399,8 +399,7 @@ impl SimCluster {
                 if !entries_to_sync.is_empty() {
                     let sync_prev = LogIndex::from_raw(sync_from.saturating_sub(1));
                     let token = storage.next_internal_token;
-                    storage.next_internal_token =
-                        storage.next_internal_token.saturating_sub(1);
+                    storage.next_internal_token = storage.next_internal_token.saturating_sub(1);
                     storage.pending_ack_entries.insert(
                         token,
                         entries_to_sync.iter().map(|e| (e.index, e.term)).collect(),
@@ -677,8 +676,7 @@ impl SimCluster {
         let Some(token) = token else {
             return false;
         };
-        let pending: Vec<(LogIndex, Term)> =
-            entries.iter().map(|e| (e.index, e.term)).collect();
+        let pending: Vec<(LogIndex, Term)> = entries.iter().map(|e| (e.index, e.term)).collect();
         let Some(storage) = self.storage.get_mut(&node_id) else {
             return false;
         };
@@ -712,8 +710,7 @@ impl SimCluster {
             return false;
         }
         if let Some(storage) = self.storage.get_mut(&node_id) {
-            let completed: Vec<u64> =
-                std::mem::take(&mut storage.engine_output.persisted_tokens);
+            let completed: Vec<u64> = std::mem::take(&mut storage.engine_output.persisted_tokens);
             storage.engine_output.clear();
             for token_val in completed {
                 self.acknowledge_token(node_id, token_val);
@@ -841,8 +838,7 @@ impl SimCluster {
         let Some(token) = token else {
             return;
         };
-        let pending: Vec<(LogIndex, Term)> =
-            entries.iter().map(|e| (e.index, e.term)).collect();
+        let pending: Vec<(LogIndex, Term)> = entries.iter().map(|e| (e.index, e.term)).collect();
         let Some(storage) = self.storage.get_mut(&node_id) else {
             return;
         };
@@ -875,8 +871,7 @@ impl SimCluster {
             return;
         }
         if let Some(storage) = self.storage.get_mut(&node_id) {
-            let completed: Vec<u64> =
-                std::mem::take(&mut storage.engine_output.persisted_tokens);
+            let completed: Vec<u64> = std::mem::take(&mut storage.engine_output.persisted_tokens);
             storage.engine_output.clear();
             storage
                 .acknowledged_entries
