@@ -21,3 +21,33 @@ fn test_snapshot_over_divergent_prefix_recovers_cleanly() {
         assert!(audit, "seed {seed} must converge with a clean audit");
     }
 }
+
+/// Storage-fault profile pins: repair cascade (88700, 118313), torn
+/// committed write sideline (31604), durable acknowledgments plus
+/// directory sync (100260, 123509), and the hard-state survivor budget
+/// (20400, 48019, 101519, 140919). Each failed a 200k-seed farm leg
+/// before its fix and passes after; the liveness-class pins exercise
+/// the full heal-phase convergence the farm asserts.
+#[test]
+fn test_storage_fault_pins_recover_cleanly() {
+    for seed in [
+        31_604u64,
+        88_700,
+        118_313,
+        100_260,
+        123_509,
+        20_400,
+        48_019,
+        101_519,
+        140_919,
+        59_349,
+        74_788,
+        79_738,
+        105_094,
+        159_614,
+        176_149,
+    ] {
+        let (_, audit, _) = run_kv_seed_with_stats(seed, true);
+        assert!(audit, "seed {seed} must converge with a clean audit");
+    }
+}

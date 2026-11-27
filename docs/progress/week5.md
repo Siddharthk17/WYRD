@@ -78,7 +78,7 @@
   past it.
 - Snapshot install reconciles the engine prefix against the committed
   archive through the existing truncate path, so the disk agrees with
-  the committed oracle on the covered prefix. Pinned seeds 89738,
+  the committed oracle on the covered prefix. Pinned kv seeds 89738,
   132635, 136637, 144041, 163047 and 178942 failed before and pass
   after; the pinned-seed regression test fails with the call removed.
 
@@ -86,19 +86,24 @@
 
 - Repair replaces valid frames that contradict the committed archive
   and re-chains (re-sources) every frame after the replacement; the
-  first unsourcable index aborts the file untouched.
+  first unsourcable index aborts the file untouched. Log-matching
+  violations assembled by partial implants (88700, 118313) heal
+  through the cascade.
 - Restart sidelines a torn committed write for peer-validated repair
-  instead of asserting, rejoining through the normal restart path.
-  Ten of the eleven remaining kv-storage seeds heal through the
-  cascade, one through the sideline.
+  instead of asserting, rejoining through the normal restart path
+  (31604).
 
 ### K. Durable Acknowledgments and Directory Sync (ADR 0031)
 
 - Staged entries and votes are acknowledged on their own persist
-  completion only; uncompleted work clears on crash.
+  completion only; uncompleted work clears on crash. The missing-ack
+  restarts (100260, 123509) pass: nothing is demanded that the disk
+  never saw.
 - The engine syncs the directory after the data batch covering new
-  files, and read-path rot lands on durable media so repair observes
-  exactly what recovery observed.
+  files, so init-created files stop relying on the one-shot init
+  sync. Read-path rot lands on durable media, turning phantom
+  sidelines the repair walk could never see into real damage it
+  heals the same way.
 
 ### L. Hard-State Survivor Budget (ADR 0032)
 
