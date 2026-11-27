@@ -6,7 +6,9 @@ use anvil_storage::{
     SnapshotHeader, StorageError, WalRecordFrame, WalScanResult, WalSegmentHeader,
     decode_wal_frame, recover_hard_state,
 };
-use anvil_types::{ClusterId, Entry, EntryKind, GroupId, LogIndex, NodeId, Term};
+use anvil_types::{
+    ClusterConfig, ClusterId, Entry, EntryKind, GroupId, LogIndex, NodeId, Term, config_entry,
+};
 use bytes::Bytes;
 
 #[test]
@@ -87,6 +89,28 @@ fn test_wal_record_frame_roundtrip_and_chained_crc() {
                 assert_eq!(next_crc, frame.crc32c);
             }
             other => panic!("expected valid frame scan, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn test_wal_record_config_entries_roundtrip() {
+    let joint = ClusterConfig::new(vec![NodeId::new(1).unwrap()], vec![NodeId::new(2).unwrap()])
+        .expect("valid config");
+    let single = ClusterConfig::single(NodeId::new(1).unwrap()).expect("valid config");
+    for (kind, config) in [
+        (EntryKind::EnterJoint, &joint),
+        (EntryKind::LeaveJoint, &single),
+    ] {
+        let entry = config_entry(kind, LogIndex::from_raw(3), Term::from_raw(2), config);
+        let frame = WalRecordFrame::from_entry(&entry, 0x9e37, 11, 512);
+        let mut encoded = Vec::new();
+        frame.encode_frame(SectorSize::Sector512, &mut encoded);
+        match decode_wal_frame(&encoded, SectorSize::Sector512, 0x9e37, 11, 512) {
+            WalScanResult::Valid { frame: decoded, .. } => {
+                assert_eq!(decoded.to_entry(), entry);
+            }
+            other => panic!("expected valid config frame scan, got {other:?}"),
         }
     }
 }
