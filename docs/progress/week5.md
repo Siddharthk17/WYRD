@@ -139,10 +139,11 @@ section 3; JSONL artifacts in `/tmp/opencode/week5-gate5/`).
   design; the sometimes gate is evaluated on kv-storage.
 - Shrinker: `cargo xtask repro <plan-file|plan.json>` reproduces the
   failing seed, shrinks same-class, and writes `<input>.minimal.plan`;
-  re-running the minimal file still fails. Verified end to end on a
-  kv-storage failure (2-event minimal plan, re-run fails identically).
-  The Week 4 canary shrinks to <= 30 events (rerun of the recorded
-  canary artifacts).
+  re-running the minimal file still fails. Demonstrated on Week-5
+  kv-storage failures (seed 31604 shrinks to 4 events, seed 118313 to
+  0 events since storage faults alone trigger it; both minimal reruns
+  fail identically). The Week 4 canary plan itself now passes outright
+  because its bug class is fixed.
 - `SnapshotEqualsReplay` runs after every snapshot take
   (`take_snapshot_for` asserts replay equality against the committed
   archive; a mismatch panics the seed, and the 500k-seed farm is
