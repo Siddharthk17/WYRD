@@ -4,7 +4,8 @@
     clippy::expect_used,
     clippy::panic,
     clippy::similar_names,
-    clippy::assert_is_empty
+    clippy::assert_is_empty,
+    clippy::too_many_lines
 )]
 
 use anvil_storage::{
