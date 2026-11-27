@@ -184,6 +184,17 @@ rustc 1.99.0. All numbers from the gate binary above unless noted.
 
 ## 6. Anything Unsure About
 
-- Coverage floors and the full `cargo xtask ci` verdict are recorded
-  below once the runs complete; nothing in this report is claimed
-  without a pasted command output.
+- `cargo xtask ci` passes all gates end to end on the final tree
+  (fmt, clippy `-D warnings`, workspace nextest, doc tests, doc
+  build, zero-unsafe audit over 14 crates, determinism goldens,
+  `anvil-bench --verify-budgets`, TLC spec check, 2000-seed smoke
+  farm, 60s-per-target fuzz smoke, `cargo deny`, `cargo audit`,
+  per-crate `cargo geiger`, feature powerset, per-crate coverage
+  floors: types 97.97%, raft 98.93%, storage 96.64%, kv 99.19%,
+  check 95.85%, sim 92.65%). Full log: `cargo xtask ci`,
+  `ALL CI QUALITY GATES PASSED`.
+- A scoped `cargo mutants -p anvil-types` run was started and
+  interrupted by a host restart before producing a result; no mutants
+  verdict is claimed. A wider mutation gate stays future work
+  alongside the nightly 200,000-seed farm. Nothing else in this
+  report is claimed without a pasted command output.
