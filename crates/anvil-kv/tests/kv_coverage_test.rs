@@ -3,7 +3,7 @@
 #![allow(clippy::assert_is_empty)]
 
 use anvil_kv::{KvCommand, KvConfig, KvResponse, KvStore};
-use anvil_types::{LogIndex, SeqNo, SessionId};
+use anvil_types::{LogIndex, MembershipSnapshot, SeqNo, SessionId};
 use bytes::Bytes;
 
 fn idx(n: u64) -> LogIndex {
@@ -164,7 +164,7 @@ fn test_kv_snapshot_decode_rejects_garbage() {
     store
         .apply(idx(2), &put_cmd(s, 1, b"k", b"v"))
         .expect("put");
-    let snap = store.encode_snapshot();
+    let snap = store.encode_snapshot(&MembershipSnapshot::empty());
     let mut truncated = snap.to_vec();
     truncated.truncate(10);
     assert!(KvStore::decode_snapshot(config, &truncated).is_err());
@@ -319,7 +319,7 @@ fn test_kv_read_list_missing_and_snapshot_with_tombstones() {
     }
     .encode(&mut del);
     store.apply(idx(3), &del).expect("delete");
-    let snap = store.encode_snapshot();
+    let snap = store.encode_snapshot(&MembershipSnapshot::empty());
     let restored =
         KvStore::decode_snapshot(KvConfig::default(), &snap).expect("snapshot with tombstone");
     match restored.read_register(b"gone") {
@@ -342,7 +342,7 @@ fn test_kv_snapshot_decode_truncations() {
     store
         .apply(idx(3), &put_cmd(s, 2, b"j", b"w"))
         .expect("put");
-    let snap = store.encode_snapshot();
+    let snap = store.encode_snapshot(&MembershipSnapshot::empty());
     let bytes = snap.to_vec();
     for cut in [8usize, 20, 56, 57, 60, 72, 100] {
         if cut >= bytes.len() {

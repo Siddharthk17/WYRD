@@ -2,7 +2,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use anvil_kv::{KvCommand, KvConfig, KvResponse, KvStore, SnapshotPolicy};
-use anvil_types::{LogIndex, SeqNo, SessionId};
+use anvil_types::{LogIndex, MembershipSnapshot, SeqNo, SessionId};
 use bytes::Bytes;
 
 fn idx(n: u64) -> LogIndex {
@@ -40,8 +40,8 @@ fn test_snapshot_v03_roundtrips_session_table() {
     put(&mut store, 3, session, 2, b"k", b"v2");
     assert_eq!(store.session_count(), 1);
 
-    let snap = store.encode_snapshot();
-    assert!(snap.starts_with(b"ANVKVS03"));
+    let snap = store.encode_snapshot(&MembershipSnapshot::empty());
+    assert!(snap.starts_with(b"ANVKVS04"));
     let restored = KvStore::decode_snapshot(config, &snap).expect("v03 roundtrip");
     assert_eq!(restored.session_count(), 1);
     assert_eq!(restored.applied_index(), store.applied_index());
@@ -78,7 +78,7 @@ fn test_snapshot_v03_rejects_config_mismatch() {
     let mut store = KvStore::new(KvConfig::default());
     let session = register(&mut store, 1);
     put(&mut store, 2, session, 1, b"k", b"v");
-    let snap = store.encode_snapshot();
+    let snap = store.encode_snapshot(&MembershipSnapshot::empty());
     let other = KvConfig {
         max_key_bytes: 512,
         ..KvConfig::default()
@@ -125,7 +125,7 @@ fn test_snapshot_chunks_roundtrip_and_reject_damage() {
     let mut store = KvStore::new(config);
     let session = register(&mut store, 1);
     put(&mut store, 2, session, 1, b"k", b"v");
-    let (chunks, digest) = store.encode_snapshot_chunked(64);
+    let (chunks, digest) = store.encode_snapshot_chunked(64, &MembershipSnapshot::empty());
     assert!(chunks.len() > 1);
     let restored =
         KvStore::decode_snapshot_chunked(config, &chunks, &digest).expect("chunk roundtrip");
@@ -154,4 +154,48 @@ fn test_snapshot_handle_shares_map_clone() {
     let handle = store.snapshot_handle();
     assert_eq!(handle.state_hash(), store.state_hash());
     assert_eq!(handle.len(), store.len());
+}
+
+#[test]
+fn test_snapshot_v04_carries_membership() {
+    use anvil_types::{JointSnapshot, NodeId};
+
+    let config = KvConfig::default();
+    let mut store = KvStore::new(config);
+    let session = register(&mut store, 1);
+    put(&mut store, 2, session, 1, b"k", b"v");
+    let membership = MembershipSnapshot {
+        voters: vec![
+            NodeId::new(1).expect("id"),
+            NodeId::new(2).expect("id"),
+            NodeId::new(3).expect("id"),
+        ],
+        learners: vec![NodeId::new(4).expect("id")],
+        joint: Some(JointSnapshot {
+            old_voters: vec![NodeId::new(1).expect("id"), NodeId::new(2).expect("id")],
+            new_voters: vec![
+                NodeId::new(1).expect("id"),
+                NodeId::new(2).expect("id"),
+                NodeId::new(3).expect("id"),
+            ],
+            old_learners: vec![],
+            new_learners: vec![NodeId::new(4).expect("id")],
+            enter_index: LogIndex::from_raw(9),
+        }),
+    };
+    let snap = store.encode_snapshot(&membership);
+    let restored = KvStore::decode_snapshot(config, &snap).expect("v04 decodes");
+    assert_eq!(restored.state_hash(), store.state_hash());
+    let back = KvStore::decode_membership(config, &snap).expect("section decodes");
+    assert_eq!(back, membership);
+
+    let empty_back =
+        KvStore::decode_membership(config, &store.encode_snapshot(&MembershipSnapshot::empty()))
+            .expect("empty section decodes");
+    assert_eq!(empty_back, MembershipSnapshot::empty());
+
+    let mut truncated = snap.to_vec();
+    truncated.pop();
+    assert!(KvStore::decode_snapshot(config, &truncated).is_err());
+    assert!(KvStore::decode_membership(config, &truncated).is_err());
 }

@@ -31,7 +31,7 @@ use crate::rng::DetRng;
 use anvil_check::{ClientOp, History, HistoryOp, OpResult};
 use anvil_kv::{KvCommand, KvConfig, KvResponse, KvStore, SnapshotPolicy};
 use anvil_raft::{Input, ReceivedSnapshot, SnapshotChunkData};
-use anvil_types::{LogIndex, NodeId, SeqNo, SessionId, sometimes};
+use anvil_types::{LogIndex, MembershipSnapshot, NodeId, SeqNo, SessionId, sometimes};
 use bytes::Bytes;
 use std::collections::BTreeMap;
 
@@ -1363,7 +1363,11 @@ fn apply_all(
             };
             let (index, kind, term, payload) =
                 (entry.index, entry.kind, entry.term, entry.payload.clone());
-            if kind == anvil_types::EntryKind::NoOp {
+            if kind == anvil_types::EntryKind::NoOp || kind.is_config_change() {
+                // Config entries carry membership, not state: they advance
+                // applied like no-ops and never reach the state machine. The
+                // archive records no payload for them; Week 6 extends the
+                // archive with entry kinds for protocol-aware repair.
                 harness.archive.insert(index, (term, None));
                 applied.insert(id, index);
                 applied_terms.insert(id, (index, term));
@@ -1468,7 +1472,13 @@ fn take_snapshot_for(
     }
     let handle = store.snapshot_handle();
     assert_snapshot_equals_replay(&handle, &harness.archive);
-    let full = handle.encode_snapshot();
+    let membership = cluster
+        .nodes
+        .get(&id)
+        .map_or(MembershipSnapshot::empty(), |core| {
+            core.membership_snapshot()
+        });
+    let full = handle.encode_snapshot(&membership);
     let digest = anvil_kv::snapshot_digest(&full);
     let chunks = anvil_kv::split_into_chunks(&full, harness.chunk_bytes);
     let mut total: u64 = 0;
@@ -1589,6 +1599,17 @@ fn install_snapshot_state(
     };
     if restored.applied_index() != snap.last_included_index {
         return;
+    }
+    // The snapshot carries the live membership: adopt it so an installer
+    // that missed config entries (or a fresh joiner) converges.
+    if let Ok(membership) = KvStore::decode_membership(config, &snap.data) {
+        cluster.step_node(
+            id,
+            Input::RestoreMembership {
+                base: snap.last_included_index,
+                membership,
+            },
+        );
     }
     if let Some(storage) = cluster.storage.get_mut(&id) {
         storage.engine.discard_gap_buffer();

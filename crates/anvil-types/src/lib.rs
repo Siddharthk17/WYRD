@@ -15,8 +15,8 @@ pub use codec::{
     encode_varint_u64,
 };
 pub use config::{
-    ClusterConfig, MAX_LEARNERS, MAX_VOTERS, MembershipError, config_entry, decode_config_entry,
-    ensure_cluster,
+    ClusterConfig, JointSnapshot, MAX_LEARNERS, MAX_VOTERS, MembershipError, MembershipSnapshot,
+    bootstrap_config_entry, config_entry, decode_config_entry, ensure_cluster,
 };
 pub use entry::{Entry, EntryKind};
 pub use ids::{ClusterId, GroupId, LogIndex, NodeId, SeqNo, SessionId, Term, ZeroNodeIdError};

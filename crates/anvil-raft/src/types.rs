@@ -2,7 +2,7 @@
 
 //! Core types, state machines, and public contracts for `anvil-raft`.
 
-use anvil_types::{ClusterId, Entry, LogIndex, MembershipError, NodeId, Term};
+use anvil_types::{ClusterId, Entry, LogIndex, MembershipError, MembershipSnapshot, NodeId, Term};
 use bytes::Bytes;
 use std::collections::BTreeSet;
 
@@ -95,9 +95,6 @@ impl RaftConfig {
         }
         if self.peers.iter().any(|peer| self.learners.contains(peer)) {
             return Err("learners must not overlap peers");
-        }
-        if self.peers.is_empty() && self.learners.contains(&self.node_id) {
-            return Err("voter set must not be empty");
         }
         Ok(())
     }
@@ -358,6 +355,14 @@ pub enum Input {
     Persisted { token: PersistToken },
     /// Notification from state machine that a log entry has been applied.
     Applied { index: LogIndex },
+    /// Node notifies the core of the membership carried by an installed
+    /// snapshot. Accepted only when `base` matches the last installed
+    /// snapshot: the bytes on disk decide, and a stale restore is ignored.
+    /// Lets a fresh joiner with an empty log adopt the cluster config.
+    RestoreMembership {
+        base: LogIndex,
+        membership: MembershipSnapshot,
+    },
     /// Administrative request to transfer leadership to target node.
     TransferLeader { to: NodeId },
     /// Node notifies the core that the log prefix is durable in a snapshot and

@@ -184,6 +184,155 @@ impl ClusterConfig {
     }
 }
 
+/// Joint state carried by a snapshot taken while `EnterJoint` is active.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JointSnapshot {
+    /// Voters before the joint entry.
+    pub old_voters: Vec<NodeId>,
+    /// Voters after the joint entry.
+    pub new_voters: Vec<NodeId>,
+    /// Learners before the joint entry.
+    pub old_learners: Vec<NodeId>,
+    /// Learners after the joint entry.
+    pub new_learners: Vec<NodeId>,
+    /// Log index of the `EnterJoint` entry.
+    pub enter_index: LogIndex,
+}
+
+/// Membership carried by a snapshot, so a node that installs it (including
+/// a fresh joiner with an empty log) ends up in the same config the snapshot
+/// was taken under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MembershipSnapshot {
+    /// Effective voters.
+    pub voters: Vec<NodeId>,
+    /// Effective learners.
+    pub learners: Vec<NodeId>,
+    /// Joint state when the snapshot was taken inside joint consensus.
+    pub joint: Option<JointSnapshot>,
+}
+
+impl MembershipSnapshot {
+    /// Empty membership: no voters, no learners, no joint state.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            voters: Vec::new(),
+            learners: Vec::new(),
+            joint: None,
+        }
+    }
+
+    /// Wire encoding: voter and learner sets, then an optional joint section.
+    /// Counts are bounded by [`MAX_VOTERS`] and [`MAX_LEARNERS`] before any
+    /// reservation.
+    pub fn encode(&self, buf: &mut Vec<u8>) {
+        encode_ids(&self.voters, buf);
+        encode_ids(&self.learners, buf);
+        match &self.joint {
+            None => buf.push(0),
+            Some(joint) => {
+                buf.push(1);
+                encode_ids(&joint.old_voters, buf);
+                encode_ids(&joint.new_voters, buf);
+                encode_ids(&joint.old_learners, buf);
+                encode_ids(&joint.new_learners, buf);
+                encode_varint_u64(joint.enter_index.as_u64(), buf);
+            }
+        }
+    }
+
+    /// Decodes a membership section, checking bounds before reserving.
+    ///
+    /// # Errors
+    /// Returns [`MembershipError::TooManyMembers`] on over-cap counts,
+    /// [`MembershipError::Decode`] on framing errors or trailing bytes.
+    pub fn decode(buf: &mut &[u8]) -> Result<Self, MembershipError> {
+        let voters = decode_ids(buf, MAX_VOTERS)?;
+        let learners = decode_ids(buf, MAX_LEARNERS)?;
+        if buf.is_empty() {
+            return Err(MembershipError::Decode(CodecError::UnexpectedEof {
+                needed: 1,
+                available: 0,
+            }));
+        }
+        let flag = buf[0];
+        *buf = &buf[1..];
+        let joint = match flag {
+            0 => None,
+            1 => {
+                let old_voters = decode_ids(buf, MAX_VOTERS)?;
+                let new_voters = decode_ids(buf, MAX_VOTERS)?;
+                let old_learners = decode_ids(buf, MAX_LEARNERS)?;
+                let new_learners = decode_ids(buf, MAX_LEARNERS)?;
+                let enter_raw = decode_varint_u64(buf).map_err(MembershipError::Decode)?;
+                Some(JointSnapshot {
+                    old_voters,
+                    new_voters,
+                    old_learners,
+                    new_learners,
+                    enter_index: LogIndex::from_raw(enter_raw),
+                })
+            }
+            _ => {
+                return Err(MembershipError::Decode(CodecError::TrailingData(
+                    buf.len() + 1,
+                )));
+            }
+        };
+        if !buf.is_empty() {
+            return Err(MembershipError::Decode(CodecError::TrailingData(buf.len())));
+        }
+        Ok(Self {
+            voters,
+            learners,
+            joint,
+        })
+    }
+}
+
+fn encode_ids(ids: &[NodeId], buf: &mut Vec<u8>) {
+    encode_varint_u64(ids.len() as u64, buf);
+    for id in ids {
+        id.encode(buf);
+    }
+}
+
+fn decode_ids(buf: &mut &[u8], cap: usize) -> Result<Vec<NodeId>, MembershipError> {
+    let raw = decode_varint_u64(buf).map_err(MembershipError::Decode)?;
+    let len = usize::try_from(raw).map_err(|_| MembershipError::TooManyMembers)?;
+    if len > cap {
+        return Err(MembershipError::TooManyMembers);
+    }
+    let mut ids = Vec::with_capacity(len);
+    for _ in 0..len {
+        ids.push(NodeId::decode(buf).map_err(MembershipError::Decode)?);
+    }
+    Ok(ids)
+}
+
+/// Builds the bootstrap entry: a `LeaveJoint` at index 1 in term 0 carrying
+/// the founding voter and learner sets. Every founding node writes the same
+/// bytes, so recovery replays the same membership everywhere.
+#[must_use]
+pub fn bootstrap_config_entry(voters: &[NodeId], learners: &[NodeId]) -> Entry {
+    let mut sorted_voters = voters.to_vec();
+    sorted_voters.sort();
+    sorted_voters.dedup();
+    let mut sorted_learners = learners.to_vec();
+    sorted_learners.sort();
+    sorted_learners.dedup();
+    let mut buf = Vec::new();
+    encode_ids(&sorted_voters, &mut buf);
+    encode_ids(&sorted_learners, &mut buf);
+    Entry::new(
+        LogIndex::from_raw(1),
+        Term::from_raw(0),
+        EntryKind::LeaveJoint,
+        Bytes::from(buf),
+    )
+}
+
 /// Builds a config-change log entry carrying `config` as its payload.
 #[must_use]
 pub fn config_entry(kind: EntryKind, index: LogIndex, term: Term, config: &ClusterConfig) -> Entry {

@@ -105,3 +105,59 @@ fn test_ensure_cluster() {
         }
     );
 }
+
+#[test]
+fn test_membership_snapshot_roundtrip() {
+    use anvil_types::{JointSnapshot, MembershipSnapshot};
+
+    let stable = MembershipSnapshot {
+        voters: vec![node(1), node(2), node(3)],
+        learners: vec![node(4)],
+        joint: None,
+    };
+    let mut buf = Vec::new();
+    stable.encode(&mut buf);
+    let back = MembershipSnapshot::decode(&mut &buf[..]).expect("decode");
+    assert_eq!(stable, back);
+
+    let jointed = MembershipSnapshot {
+        voters: vec![node(1), node(2), node(3)],
+        learners: vec![node(4)],
+        joint: Some(JointSnapshot {
+            old_voters: vec![node(1), node(2)],
+            new_voters: vec![node(1), node(2), node(3)],
+            old_learners: vec![],
+            new_learners: vec![node(4)],
+            enter_index: LogIndex::from_raw(9),
+        }),
+    };
+    buf.clear();
+    jointed.encode(&mut buf);
+    let back = MembershipSnapshot::decode(&mut &buf[..]).expect("decode");
+    assert_eq!(jointed, back);
+
+    let empty = MembershipSnapshot::empty();
+    buf.clear();
+    empty.encode(&mut buf);
+    let back = MembershipSnapshot::decode(&mut &buf[..]).expect("decode");
+    assert_eq!(empty, back);
+
+    // Truncation and trailing bytes are rejected.
+    assert!(MembershipSnapshot::decode(&mut &buf[..buf.len() - 1]).is_err());
+    buf.push(0xFF);
+    assert!(MembershipSnapshot::decode(&mut &buf[..]).is_err());
+}
+
+#[test]
+fn test_bootstrap_entry_is_identical() {
+    use anvil_types::{EntryKind, bootstrap_config_entry, decode_config_entry};
+
+    let a = bootstrap_config_entry(&[node(3), node(1), node(2)], &[]);
+    let b = bootstrap_config_entry(&[node(1), node(2), node(3)], &[]);
+    assert_eq!(a, b);
+    assert_eq!(a.index, LogIndex::from_raw(1));
+    assert_eq!(a.kind, EntryKind::LeaveJoint);
+    let config = decode_config_entry(&a).expect("bootstrap decodes");
+    assert_eq!(config.voters(), &[node(1), node(2), node(3)]);
+    assert_eq!(config.learners(), &[]);
+}

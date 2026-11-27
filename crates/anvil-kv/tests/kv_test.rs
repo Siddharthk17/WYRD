@@ -2,7 +2,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use anvil_kv::{KvCommand, KvConfig, KvResponse, KvStore};
-use anvil_types::{LogIndex, SeqNo, SessionId};
+use anvil_types::{LogIndex, MembershipSnapshot, SeqNo, SessionId};
 use bytes::Bytes;
 
 fn idx(n: u64) -> LogIndex {
@@ -173,7 +173,7 @@ fn test_kv_session_expiry_and_snapshot_roundtrip() {
     store.apply(idx(4), &exp).expect("expire");
     let dup = put_payload(session, 1, b"k", b"v2");
     let _ = store.apply(idx(5), &dup);
-    let snap = store.encode_snapshot();
+    let snap = store.encode_snapshot(&MembershipSnapshot::empty());
     let restored = KvStore::decode_snapshot(config, &snap).expect("snapshot");
     assert_eq!(restored.applied_index(), store.applied_index());
     assert_eq!(restored.state_hash(), store.state_hash());

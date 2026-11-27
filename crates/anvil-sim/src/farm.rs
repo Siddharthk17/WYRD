@@ -361,6 +361,7 @@ pub const SOMETIMES_INVENTORY: &[&str] = &[
     "raft.config.enter",
     "raft.config.leave.auto",
     "raft.config.rejected",
+    "raft.config.restore",
     "raft.config.stepdown.removed",
     "raft.snapshot.install.complete",
     "raft.snapshot.resend",

@@ -11,7 +11,7 @@
 use anvil_kv::{
     ChunkError, KvCommand, KvConfig, KvResponse, KvStore, reassemble_chunks, split_into_chunks,
 };
-use anvil_types::{LogIndex, SeqNo, SessionId};
+use anvil_types::{LogIndex, MembershipSnapshot, SeqNo, SessionId};
 use bytes::Bytes;
 
 fn idx(n: u64) -> LogIndex {
@@ -114,8 +114,8 @@ fn base_v03_single() -> Vec<u8> {
     store
         .apply(idx(2), &put_cmd(session, 1, 0, b"k", b"v"))
         .expect("put");
-    let snap = store.encode_snapshot().to_vec();
-    assert_eq!(snap.len(), 230);
+    let snap = store.encode_snapshot(&MembershipSnapshot::empty()).to_vec();
+    assert_eq!(snap.len(), 233);
     snap
 }
 
@@ -123,7 +123,7 @@ fn base_v03_single() -> Vec<u8> {
 // map count 96..104 (=0), tomb count 104..112 (=1), tomb key_len
 // 112..120, key 120, tomb version 121..129, session count 129..137,
 // entry 137..195 (id, activity, highest=2, one response seq 2 with a
-// 10-byte None-value blob), order tick 195..203. Total 203.
+// 10-byte None-value blob), order tick 195..203, empty membership 203..206. Total 206.
 fn base_v03_tomb() -> Vec<u8> {
     let mut store = KvStore::new(KvConfig::default());
     let session = reg(&mut store, 1);
@@ -133,8 +133,8 @@ fn base_v03_tomb() -> Vec<u8> {
     store
         .apply(idx(3), &del_cmd(session, 2, 1, b"k"))
         .expect("delete");
-    let snap = store.encode_snapshot().to_vec();
-    assert_eq!(snap.len(), 203);
+    let snap = store.encode_snapshot(&MembershipSnapshot::empty()).to_vec();
+    assert_eq!(snap.len(), 206);
     snap
 }
 
@@ -424,6 +424,8 @@ fn test_v03_rejects_duplicate_session_id() {
     let mut two = base[..155].to_vec();
     two.extend_from_slice(&base[155..230]);
     two.extend_from_slice(&base[155..230]);
+    // v04 membership section: empty voter, learner, and joint counts.
+    two.extend_from_slice(&[0, 0, 0]);
     two[147..155].copy_from_slice(&2u64.to_le_bytes());
     two[230..238].copy_from_slice(&2u64.to_le_bytes());
     let decoded = KvStore::decode_snapshot(config, &two).expect("two sessions decode");
@@ -590,7 +592,7 @@ fn test_v03_roundtrips_every_response_variant() {
         other => panic!("range failed: {other:?}"),
     }
     // Re-encoding serializes every response variant; decoding proves it valid.
-    let reencoded = store.encode_snapshot();
+    let reencoded = store.encode_snapshot(&MembershipSnapshot::empty());
     let again = KvStore::decode_snapshot(config, &reencoded).expect("re-encode roundtrip");
     assert_eq!(again.session_count(), 1);
     assert_eq!(again.len(), 2);
@@ -742,7 +744,7 @@ fn test_snapshot_roundtrips_list_and_cas_conflict() {
     store
         .apply(idx(5), &cas_cmd(session, 4, 0, b"k", 99, b"nope"))
         .expect("cas");
-    let snap = store.encode_snapshot();
+    let snap = store.encode_snapshot(&MembershipSnapshot::empty());
     let mut restored =
         KvStore::decode_snapshot(KvConfig::default(), &snap).expect("snapshot decodes");
     assert_eq!(restored.session_count(), 1);
@@ -766,6 +768,6 @@ fn test_snapshot_roundtrips_list_and_cas_conflict() {
         KvResponse::CasConflict { version } => assert_eq!(version, idx(2)),
         other => panic!("cached conflict lost: {other:?}"),
     }
-    let again = restored.encode_snapshot();
+    let again = restored.encode_snapshot(&MembershipSnapshot::empty());
     KvStore::decode_snapshot(KvConfig::default(), &again).expect("re-encode decodes");
 }

@@ -135,7 +135,8 @@ fn pump_round(
             }
             let node = nodes.get_mut(&outbound.to).expect("peer");
             let out = outs.get_mut(&outbound.to).expect("peer out");
-            node.receive(*from, outbound.message, out);
+            let cluster = node.cluster_id();
+            node.receive(*from, cluster, outbound.message, out);
             ack_persisted(node, out);
         }
     }

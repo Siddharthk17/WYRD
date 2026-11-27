@@ -117,6 +117,9 @@ pub enum KvResponse {
     SessionExpired,
     UnknownSession,
     Duplicate,
+    SessionsExpired {
+        removed: u64,
+    },
 }
 
 impl KvCommand {

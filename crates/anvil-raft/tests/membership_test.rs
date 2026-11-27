@@ -2,6 +2,7 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
+    clippy::assert_is_empty,
     clippy::too_many_lines
 )]
 
@@ -636,4 +637,24 @@ fn test_joint_election_needs_both_majorities() {
         &mut output,
     );
     assert_eq!(candidate.role(), Role::Leader);
+}
+
+#[test]
+fn test_stale_snapshot_restore_ignored() {
+    let (mut leader, mut output) = elect_and_settle();
+    let before = leader.membership_voters();
+    // No snapshot was installed, so any restore is stale and ignored.
+    leader.step(
+        Input::RestoreMembership {
+            base: LogIndex::from_raw(41),
+            membership: anvil_types::MembershipSnapshot {
+                voters: vec![node_id(1)],
+                learners: vec![],
+                joint: None,
+            },
+        },
+        &mut output,
+    );
+    assert_eq!(leader.membership_voters(), before);
+    assert!(!output.sometimes_hits.contains(&"raft.config.restore"));
 }

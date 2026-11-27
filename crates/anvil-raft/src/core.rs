@@ -12,8 +12,8 @@ use crate::types::{
     SnapshotChunkData, SnapshotRequest, SpecProjection,
 };
 use anvil_types::{
-    ClusterConfig, Entry, EntryKind, LogIndex, NodeId, Term, config_entry, decode_config_entry,
-    sometimes,
+    ClusterConfig, Entry, EntryKind, JointSnapshot, LogIndex, MembershipSnapshot, NodeId, Term,
+    config_entry, decode_config_entry, sometimes,
 };
 use bytes::Bytes;
 use rand_chacha::ChaCha8Rng;
@@ -124,6 +124,7 @@ pub struct RaftCore {
     pending_config: Option<LogIndex>,
     leave_index: Option<LogIndex>,
     committed_current_term: bool,
+    installed_base: Option<LogIndex>,
 }
 
 impl RaftCore {
@@ -174,10 +175,6 @@ impl RaftCore {
         }
 
         let mut voters: Vec<NodeId> = config.initial_voters();
-        assert!(
-            !voters.is_empty(),
-            "RaftCore requires a non-empty voter set"
-        );
         voters.sort();
         voters.dedup();
         let learners = config.learners.clone();
@@ -214,6 +211,7 @@ impl RaftCore {
             pending_config: None,
             leave_index: None,
             committed_current_term: false,
+            installed_base: None,
         };
         core.rebuild_membership_from_log(&recovered.entries, recovered.commit_index);
         core
@@ -233,6 +231,9 @@ impl RaftCore {
             Input::Applied { index } => self.handle_applied(index),
             Input::CompactLog { up_to } => self.handle_compact_log(up_to),
             Input::TransferLeader { to } => self.handle_transfer_leader(to, output),
+            Input::RestoreMembership { base, membership } => {
+                self.handle_restore_membership(base, membership, output);
+            }
             Input::SnapshotReady {
                 last_included_index,
                 last_included_term,
@@ -334,6 +335,92 @@ impl RaftCore {
     #[must_use]
     pub const fn in_joint(&self) -> bool {
         self.joint.is_some()
+    }
+
+    /// Returns the current membership as a snapshot carrier: effective
+    /// voters and learners plus joint state. The node embeds this in
+    /// snapshots so installers adopt the same config.
+    #[must_use]
+    pub fn membership_snapshot(&self) -> MembershipSnapshot {
+        let joint = self.joint.as_ref().map(|joint| JointSnapshot {
+            old_voters: joint.old_voters.clone(),
+            new_voters: joint.new_voters.clone(),
+            old_learners: joint.old_learners.iter().copied().collect(),
+            new_learners: joint.new_learners.iter().copied().collect(),
+            enter_index: joint.enter_index,
+        });
+        MembershipSnapshot {
+            voters: self.membership_voters(),
+            learners: self.learners.iter().copied().collect(),
+            joint,
+        }
+    }
+
+    /// Restores membership from an installed snapshot. Only the snapshot
+    /// just installed counts; anything older is ignored.
+    fn handle_restore_membership(
+        &mut self,
+        base: LogIndex,
+        membership: MembershipSnapshot,
+        output: &mut Output,
+    ) {
+        if self.installed_base != Some(base) {
+            return;
+        }
+        self.installed_base = None;
+        if membership.voters.is_empty() {
+            return;
+        }
+        let mut voters = membership.voters.clone();
+        voters.sort();
+        voters.dedup();
+        let mut learners: BTreeSet<NodeId> = membership.learners.iter().copied().collect();
+        learners.retain(|learner| !voters.contains(learner));
+        let joint = membership.joint.and_then(|joint| {
+            if joint.enter_index > base || joint.new_voters.is_empty() {
+                return None;
+            }
+            let mut old_voters = joint.old_voters.clone();
+            old_voters.sort();
+            old_voters.dedup();
+            let mut new_voters = joint.new_voters.clone();
+            new_voters.sort();
+            new_voters.dedup();
+            let old_learners: BTreeSet<NodeId> = joint.old_learners.iter().copied().collect();
+            let new_learners: BTreeSet<NodeId> = joint.new_learners.iter().copied().collect();
+            Some(JointState {
+                old_voters,
+                new_voters,
+                old_learners,
+                new_learners,
+                enter_index: joint.enter_index,
+            })
+        });
+        self.voters = voters;
+        self.learners = learners;
+        self.joint = joint;
+        self.pending_config = self.joint.as_ref().map(|state| state.enter_index);
+        self.leave_index = None;
+        self.resolve_committed_configs(self.commit_index);
+        let next = base.next().unwrap_or(base);
+        let mut fresh = BTreeMap::new();
+        let mut targets = self.membership_voters();
+        for learner in &self.learners {
+            if !targets.contains(learner) {
+                targets.push(*learner);
+            }
+        }
+        for target in targets {
+            if target == self.config.node_id {
+                continue;
+            }
+            fresh.insert(
+                target,
+                PeerProgress::new(next, self.config.max_inflight_messages),
+            );
+        }
+        self.progress = fresh;
+        sometimes!(output.sometimes_hits, "raft.config.restore");
     }
 
     /// Rebuilds membership by replaying config entries in log order, then
@@ -451,8 +538,14 @@ impl RaftCore {
         }
     }
 
-    /// Returns true when `node` may send protocol messages: a voter or a learner.
+    /// Returns true when `node` may send protocol messages: a voter or a
+    /// learner in the effective config. A node with an empty voter set and
+    /// no joint state is still joining: it accepts appends and snapshots
+    /// from anyone so the cluster can configure it.
     fn is_member_sender(&self, node: NodeId) -> bool {
+        if self.voters.is_empty() && self.joint.is_none() {
+            return true;
+        }
         self.is_effective_voter(node) || self.learners.contains(&node)
     }
 
@@ -2008,6 +2101,7 @@ impl RaftCore {
                 }
                 self.log
                     .install_snapshot(last_included_index, last_included_term);
+                self.installed_base = Some(last_included_index);
                 sometimes!(output.sometimes_hits, "raft.snapshot.install.complete");
                 if last_included_index > self.commit_index {
                     self.commit_index = last_included_index;
