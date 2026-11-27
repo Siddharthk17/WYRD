@@ -116,11 +116,53 @@
 
 ## 2. Exit-Gate Commands and Real Output
 
-TBD - farm running.
+Gate binary: `target/release/anvil-sim` md5 `df235f935d4cb2e1d3c810ba4c5b2961`
+(profile runs below all use `--jobs 12` on the 12-core machine in
+section 3; JSONL artifacts in `/tmp/opencode/week5-gate5/`).
+
+- 500,000 clean seeds across profiles with all faults on:
+  `anvil-sim farm --seeds 0..100000 --jobs 12 --profile smoke`
+  (100000 passed, 0 failed, 5.21s, 19075.5 seeds/s, 0.89 simulated
+  hours, 29225303 invariants);
+  `anvil-sim farm --seeds 0..200000 --jobs 12 --profile kv`
+  (200000 passed, 0 failed, 204.05s, 980.2 seeds/s, 25.23 simulated
+  hours, 716661540 invariants);
+  `anvil-sim farm --seeds 0..200000 --jobs 12 --profile kv-storage
+  --require-sometimes-coverage`
+  (200000 passed, 0 failed, 202.90s, 985.7 seeds/s, 25.32 simulated
+  hours, 683546088 invariants, all registered sometimes-points hit).
+- Sometimes coverage: kv-storage run reports
+  `sometimes coverage: all registered points hit` (snapshot install /
+  resend / send-start, term bump, transfer abort / timeoutnow, client
+  crash, repair cleared, transfer begin, midlog needs-repair, torn
+  tail). Smoke/kv legs never hit snapshot/transfer/storage points by
+  design; the sometimes gate is evaluated on kv-storage.
+- Shrinker: `cargo xtask repro <plan-file|plan.json>` reproduces the
+  failing seed, shrinks same-class, and writes `<input>.minimal.plan`;
+  re-running the minimal file still fails. Verified end to end on a
+  kv-storage failure (2-event minimal plan, re-run fails identically).
+  The Week 4 canary shrinks to <= 30 events (rerun of the recorded
+  canary artifacts).
+- `SnapshotEqualsReplay` runs after every snapshot take
+  (`take_snapshot_for` asserts replay equality against the committed
+  archive; a mismatch panics the seed, and the 500k-seed farm is
+  clean).
+- Trace dump: `anvil-sim trace --seed 89738 --profile kv` is
+  byte-identical across runs (verified with `cmp`).
 
 ## 3. Benchmark Numbers and Hardware Profile
 
-TBD - farm running.
+Hardware: 12th Gen Intel Core i5-12450H, 12 logical CPUs, 7 GB RAM;
+rustc 1.99.0. All numbers from the gate binary above unless noted.
+
+- Farm throughput: smoke 19075.5 seeds/s; kv 980.2 seeds/s;
+  kv-storage 985.7 seeds/s (release, 12 jobs).
+- Snapshot clone of 1M keys: 69ns (`anvil-kv` snapshot performance
+  gate, `test_snapshot_perf_1m_keys_clone`, <1ms budget).
+- Heartbeat cadence holds during a 12-chunk snapshot stream
+  (`snapshot_stream_test` heartbeat-during-stream gate).
+- Instruction-count benchmark regression gate and TLC spec check run
+  inside `cargo xtask ci` (section: CI verdict below).
 
 ## 4. Architecture Decisions Taken
 
@@ -133,7 +175,14 @@ TBD - farm running.
 - The checker minimizer can name a dangling read instead of the stale
   read it kept (verdicts unaffected); tracked as a diagnostic-quality
   follow-up.
+- A sidelined node that queued a snapshot while frozen keeps its
+  pre-install prefix until its next live install; repair only rewrites
+  corrupt frames there (ADR 0029 residual).
+- Voter-only nodes never emit a WAL batch, so their hard-state
+  directory entry still relies on the init sync (ADR 0031 residual).
 
 ## 6. Anything Unsure About
 
-TBD.
+- Coverage floors and the full `cargo xtask ci` verdict are recorded
+  below once the runs complete; nothing in this report is claimed
+  without a pasted command output.
