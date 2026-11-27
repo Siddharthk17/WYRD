@@ -761,7 +761,13 @@ fn begin_workload_event(
                 cluster.step_node(leader, anvil_raft::Input::TransferLeader { to: target });
             }
         }
-        FaultKind::DelaySpike { .. } => {}
+        // Membership changes are implemented by the reconfiguration
+        // nemesis; until it lands, the events trace and no-op here.
+        FaultKind::DelaySpike { .. }
+        | FaultKind::AddMember { .. }
+        | FaultKind::RemoveMember { .. }
+        | FaultKind::ReplaceMember { .. }
+        | FaultKind::PromoteMember { .. } => {}
     }
     cluster.trace_line(format!("fault begin id={} {:?}", event.id, event.fault));
 }
@@ -813,8 +819,14 @@ fn end_workload_event(
                 cluster.set_tick_skew(*id, base_skew.get(id).copied().unwrap_or(1000));
             }
         }
-        FaultKind::DelaySpike { .. } => {}
-        FaultKind::Transfer { .. } => {}
+        // Membership changes are implemented by the reconfiguration
+        // nemesis; until it lands, the events trace and no-op here.
+        FaultKind::DelaySpike { .. }
+        | FaultKind::Transfer { .. }
+        | FaultKind::AddMember { .. }
+        | FaultKind::RemoveMember { .. }
+        | FaultKind::ReplaceMember { .. }
+        | FaultKind::PromoteMember { .. } => {}
     }
     cluster.trace_line(format!("fault end id={} {:?}", event.id, event.fault));
 }

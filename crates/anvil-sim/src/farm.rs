@@ -517,6 +517,10 @@ fn fault_kind_name(kind: &crate::plan::FaultKind) -> &'static str {
         crate::plan::FaultKind::SlowClock { .. } => "clock",
         crate::plan::FaultKind::Transfer { .. } => "transfer",
         crate::plan::FaultKind::DelaySpike { .. } => "delay",
+        crate::plan::FaultKind::AddMember { .. } => "add-member",
+        crate::plan::FaultKind::RemoveMember { .. } => "remove-member",
+        crate::plan::FaultKind::ReplaceMember { .. } => "replace-member",
+        crate::plan::FaultKind::PromoteMember { .. } => "promote-member",
     }
 }
 
