@@ -2,7 +2,7 @@
 
 //! Core types, state machines, and public contracts for `anvil-raft`.
 
-use anvil_types::{Entry, LogIndex, NodeId, Term};
+use anvil_types::{ClusterId, Entry, LogIndex, MembershipError, NodeId, Term};
 use bytes::Bytes;
 use std::collections::BTreeSet;
 
@@ -39,6 +39,10 @@ pub struct RaftConfig {
     pub node_id: NodeId,
     /// Cluster peer identifiers (excluding local node).
     pub peers: BTreeSet<NodeId>,
+    /// Non-voting learners: they receive log entries but never vote.
+    pub learners: BTreeSet<NodeId>,
+    /// Cluster this node belongs to. Senders from another cluster are dropped.
+    pub cluster_id: ClusterId,
     /// Minimum randomized election timeout in logical ticks.
     pub election_timeout_ticks: u64,
     /// Leader heartbeat broadcast interval in logical ticks.
@@ -73,6 +77,9 @@ impl RaftConfig {
     /// breaks quorum math. Timeouts may be zero: a zero election timeout starts
     /// an election on every tick, which focused unit tests use and which
     /// `SimCluster` and production startup never select.
+    /// Learners must be disjoint from the voter set: a node is either a voter
+    /// or a learner, never both. The local node is a learner exactly when it
+    /// appears in `learners`, and then it is excluded from the voters.
     ///
     /// # Errors
     /// Returns a description when a bound would deadlock or corrupt the core.
@@ -86,7 +93,26 @@ impl RaftConfig {
         if self.peers.contains(&self.node_id) {
             return Err("peers must not contain local node_id");
         }
+        if self.peers.iter().any(|peer| self.learners.contains(peer)) {
+            return Err("learners must not overlap peers");
+        }
+        if self.peers.is_empty() && self.learners.contains(&self.node_id) {
+            return Err("voter set must not be empty");
+        }
         Ok(())
+    }
+
+    /// Returns the initial voter set: peers plus the local node, unless the
+    /// local node is a learner.
+    #[must_use]
+    pub fn initial_voters(&self) -> Vec<NodeId> {
+        let mut voters: Vec<NodeId> = self.peers.iter().copied().collect();
+        if !self.learners.contains(&self.node_id) {
+            voters.push(self.node_id);
+        }
+        voters.sort();
+        voters.dedup();
+        voters
     }
 }
 
@@ -223,6 +249,41 @@ pub struct OutboundMessage {
     pub message: crate::messages::Message,
 }
 
+/// Reason a membership change proposal was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigReject {
+    /// Proposer is not the leader.
+    NotLeader,
+    /// A config entry is already appended but not yet committed.
+    ConfigInProgress,
+    /// The leader has not yet committed an entry in its own term.
+    NoCurrentTermCommit,
+    /// The proposed voter and learner sets fail validation.
+    InvalidConfig(MembershipError),
+}
+
+/// Membership lifecycle notification emitted by `RaftCore`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MembershipEvent {
+    /// An `EnterJoint` entry was appended and took effect.
+    Proposed {
+        /// Log index of the joint entry.
+        index: LogIndex,
+    },
+    /// The leader auto-appended `LeaveJoint` after the joint entry committed.
+    AutoLeave {
+        /// Log index of the leave entry.
+        index: LogIndex,
+    },
+    /// A membership proposal was refused.
+    Rejected {
+        /// Why the proposal was refused.
+        reason: ConfigReject,
+    },
+    /// A removed leader stepped down after `LeaveJoint` committed.
+    RemovedSteppedDown,
+}
+
 /// Caller-provided reusable buffer holding all side-effects emitted by `RaftCore::step`.
 #[derive(Debug, Default)]
 pub struct Output {
@@ -246,6 +307,8 @@ pub struct Output {
     /// Entries are `&'static str` markers pushed by `sometimes!`; the
     /// simulator drains them after every step.
     pub sometimes_hits: Vec<&'static str>,
+    /// Membership lifecycle notifications since the last drain.
+    pub membership_events: Vec<MembershipEvent>,
 }
 
 impl Output {
@@ -266,6 +329,7 @@ impl Output {
         self.role_changes.clear();
         self.spec_projections.clear();
         self.sometimes_hits.clear();
+        self.membership_events.clear();
     }
 }
 
@@ -281,6 +345,13 @@ pub enum Input {
     },
     /// Client proposal command submitted to cluster leader.
     Propose { payload: Bytes },
+    /// Membership change proposal submitted to cluster leader. The leader
+    /// appends an `EnterJoint` entry carrying the new config, then appends
+    /// `LeaveJoint` automatically once the joint entry commits.
+    ProposeConfig {
+        voters: Vec<NodeId>,
+        learners: Vec<NodeId>,
+    },
     /// Linearizable read index request with client correlation context.
     ReadIndex { context: Bytes },
     /// Notification from storage engine that a previous `PersistOp` has synced to disk.

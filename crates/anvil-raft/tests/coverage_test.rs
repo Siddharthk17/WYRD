@@ -8,7 +8,7 @@
 
 use anvil_raft::{Input, Message, Output, PersistOp, RaftConfig, RaftCore, RecoveredState, Role};
 use anvil_raft::{PeerProgress, ProgressState, RaftLog};
-use anvil_types::{Entry, EntryKind, LogIndex, NodeId, Term};
+use anvil_types::{ClusterId, Entry, EntryKind, LogIndex, NodeId, Term};
 use bytes::Bytes;
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
@@ -20,6 +20,8 @@ fn make_core(node_id: u64, peers: &[u64]) -> RaftCore {
         peer_set.insert(NodeId::new(peer).expect("peer"));
     }
     let config = RaftConfig {
+        cluster_id: ClusterId::from_raw(1),
+        learners: BTreeSet::new(),
         node_id: NodeId::new(node_id).expect("node"),
         peers: peer_set,
         election_timeout_ticks: 5,
@@ -254,6 +256,8 @@ fn test_large_cluster_uses_heap_fallback_paths() {
 fn test_vote_denied_when_already_voted_or_log_stale() {
     let voted_for = NodeId::new(9).expect("voter");
     let config = RaftConfig {
+        cluster_id: ClusterId::from_raw(1),
+        learners: BTreeSet::new(),
         node_id: NodeId::new(1).expect("node"),
         peers: BTreeSet::from([NodeId::new(2).expect("peer")]),
         election_timeout_ticks: 5,
@@ -321,6 +325,8 @@ fn test_vote_denied_when_already_voted_or_log_stale() {
     assert!(prevote_denied);
 
     let log_config = RaftConfig {
+        cluster_id: ClusterId::from_raw(1),
+        learners: BTreeSet::new(),
         node_id: NodeId::new(5).expect("node"),
         peers: BTreeSet::from([NodeId::new(6).expect("peer")]),
         election_timeout_ticks: 5,
@@ -766,6 +772,8 @@ fn base_config(node_id: u64, peers: &[u64]) -> RaftConfig {
         peer_set.insert(NodeId::new(peer).expect("peer"));
     }
     RaftConfig {
+        cluster_id: ClusterId::from_raw(1),
+        learners: BTreeSet::new(),
         node_id: NodeId::new(node_id).expect("node"),
         peers: peer_set,
         election_timeout_ticks: 5,
@@ -2016,6 +2024,8 @@ fn make_core_with_log(node_id: u64, peers: &[u64], term: Term, entries: Vec<Entr
         peer_set.insert(NodeId::new(peer).expect("peer"));
     }
     let config = RaftConfig {
+        cluster_id: ClusterId::from_raw(1),
+        learners: BTreeSet::new(),
         node_id: NodeId::new(node_id).expect("node"),
         peers: peer_set,
         election_timeout_ticks: 5,

@@ -6,7 +6,7 @@
 )]
 
 use anvil_raft::{Input, Message, Output, PersistOp, RaftConfig, RaftCore, RecoveredState, Role};
-use anvil_types::{NodeId, Term};
+use anvil_types::{ClusterId, NodeId, Term};
 use bytes::Bytes;
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
@@ -18,6 +18,8 @@ fn node_id(n: u64) -> NodeId {
 
 fn make_config(n: u64, peers: &[u64]) -> RaftConfig {
     RaftConfig {
+        cluster_id: ClusterId::from_raw(1),
+        learners: BTreeSet::new(),
         node_id: node_id(n),
         peers: peers.iter().map(|p| node_id(*p)).collect::<BTreeSet<_>>(),
         election_timeout_ticks: 5,

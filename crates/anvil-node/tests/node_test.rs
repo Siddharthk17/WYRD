@@ -3,7 +3,7 @@
 
 use anvil_node::{Node, NodeConfig, NodeRead, NodeWrite, ReadConsistency};
 use anvil_raft::{RaftConfig, RecoveredState};
-use anvil_types::NodeId;
+use anvil_types::{ClusterId, NodeId};
 use bytes::Bytes;
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
@@ -15,6 +15,8 @@ fn node() -> Node {
     peers.insert(NodeId::new(2).expect("id"));
     peers.insert(NodeId::new(3).expect("id"));
     let config = RaftConfig {
+        cluster_id: ClusterId::from_raw(1),
+        learners: BTreeSet::new(),
         node_id: id,
         peers,
         election_timeout_ticks: 10,
@@ -85,6 +87,8 @@ fn test_node_canary_serves_stale_as_linearizable() {
     let id = NodeId::new(1).expect("id");
     let peers = BTreeSet::new();
     let config_raft = RaftConfig {
+        cluster_id: ClusterId::from_raw(1),
+        learners: BTreeSet::new(),
         node_id: id,
         peers,
         election_timeout_ticks: 10,

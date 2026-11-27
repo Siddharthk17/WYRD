@@ -25,6 +25,7 @@ pub use crate::messages::Message;
 pub use crate::progress::{PeerProgress, ProgressState, SnapshotProgress};
 pub use crate::types::OutboundMessage;
 pub use crate::types::{
-    Input, Output, PersistOp, PersistToken, RaftConfig, ReadIndexResult, ReceivedSnapshot,
-    RecoveredState, Role, RoleChangeEvent, SnapshotChunkData, SnapshotRequest, SpecProjection,
+    ConfigReject, Input, MembershipEvent, Output, PersistOp, PersistToken, RaftConfig,
+    ReadIndexResult, ReceivedSnapshot, RecoveredState, Role, RoleChangeEvent, SnapshotChunkData,
+    SnapshotRequest, SpecProjection,
 };

@@ -354,15 +354,21 @@ pub struct SeedOutcome {
 
 /// Registered `sometimes!` coverage points. Every name marked anywhere in
 /// the deterministic crates or the sim must appear here exactly once; a
-/// source-scan test enforces it. Session expiry, joint config, and repair
-/// completion join in Week 6 with the code that triggers them.
+/// source-scan test enforces it. The reconfig nemesis (Week 6) drives the
+/// joint-config points; session expiry and repair completion join with the
+/// code that triggers them.
 pub const SOMETIMES_INVENTORY: &[&str] = &[
+    "raft.config.enter",
+    "raft.config.leave.auto",
+    "raft.config.rejected",
+    "raft.config.stepdown.removed",
     "raft.snapshot.install.complete",
     "raft.snapshot.resend",
     "raft.snapshot.send.start",
     "raft.term.bump.append",
     "raft.transfer.aborted",
     "raft.transfer.timeoutnow.sent",
+    "raft.unknown.sender",
     "sim.client.crash",
     "sim.repair.cleared",
     "sim.transfer.begin",

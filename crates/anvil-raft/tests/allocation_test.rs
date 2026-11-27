@@ -13,7 +13,7 @@
 //! - Replication: at most 1 allocation per entry amortized
 
 use anvil_raft::{Input, Output, PersistOp, RaftConfig, RaftCore, RecoveredState};
-use anvil_types::NodeId;
+use anvil_types::{ClusterId, NodeId};
 use bytes::Bytes;
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
@@ -76,6 +76,8 @@ fn create_test_node(
         peer_set.insert(NodeId::new(p).expect("valid peer id"));
     }
     let config = RaftConfig {
+        cluster_id: ClusterId::from_raw(1),
+        learners: BTreeSet::new(),
         node_id: NodeId::new(id).expect("valid node id"),
         peers: peer_set,
         election_timeout_ticks: election_timeout,

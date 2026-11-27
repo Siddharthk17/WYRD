@@ -23,7 +23,7 @@ use anvil_storage::{
     WalSegmentHeader,
     format::wal::{WAL_RECORD_HEADER_FIXED_LEN, WalScanResult, decode_wal_frame},
 };
-use anvil_types::{Entry, LogIndex, NodeId, Term, sometimes};
+use anvil_types::{ClusterId, Entry, LogIndex, NodeId, Term, sometimes};
 use bytes::Bytes;
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
@@ -219,6 +219,8 @@ impl SimCluster {
             }
 
             let config = RaftConfig {
+                cluster_id: ClusterId::from_raw(1),
+                learners: BTreeSet::new(),
                 node_id,
                 peers,
                 election_timeout_ticks: 10,
@@ -1189,6 +1191,8 @@ impl SimCluster {
                     .get(&node_id)
                     .cloned()
                     .unwrap_or_else(|| RaftConfig {
+                        cluster_id: ClusterId::from_raw(1),
+                        learners: BTreeSet::new(),
                         node_id,
                         peers: self
                             .configs

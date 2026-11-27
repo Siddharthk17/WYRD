@@ -11,7 +11,7 @@ use anvil_raft::{
     Input, Message, Output, PersistOp, ProgressState, RaftConfig, RaftCore, RecoveredState, Role,
     SnapshotChunkData,
 };
-use anvil_types::{Entry, LogIndex, NodeId, Term};
+use anvil_types::{ClusterId, Entry, LogIndex, NodeId, Term};
 use bytes::Bytes;
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::{Rng, SeedableRng};
@@ -28,6 +28,8 @@ fn make_core(n: u64, peers: &[u64]) -> RaftCore {
     }
     RaftCore::new(
         RaftConfig {
+            cluster_id: ClusterId::from_raw(1),
+            learners: BTreeSet::new(),
             node_id: node_id(n),
             peers: set,
             election_timeout_ticks: 5,
@@ -54,6 +56,8 @@ fn make_core_with_log(
     }
     RaftCore::new(
         RaftConfig {
+            cluster_id: ClusterId::from_raw(1),
+            learners: BTreeSet::new(),
             node_id: node_id(node_id_raw),
             peers: set,
             election_timeout_ticks: 5,
@@ -1240,6 +1244,8 @@ fn snapshot_leader_with_behind_peer() -> (RaftCore, NodeId, Output) {
     let mut set = BTreeSet::new();
     set.insert(node_id(2));
     let config = RaftConfig {
+        cluster_id: ClusterId::from_raw(1),
+        learners: BTreeSet::new(),
         node_id: node_id(1),
         peers: set,
         election_timeout_ticks: 5,
@@ -1676,6 +1682,8 @@ fn test_config_validation_rejects_bad_configs() {
     let mut peers = BTreeSet::new();
     peers.insert(node_id(2));
     let valid = RaftConfig {
+        cluster_id: ClusterId::from_raw(1),
+        learners: BTreeSet::new(),
         node_id: node_id(1),
         peers: peers.clone(),
         election_timeout_ticks: 5,
@@ -1688,6 +1696,8 @@ fn test_config_validation_rejects_bad_configs() {
     assert!(valid.validate().is_ok());
 
     let no_window = RaftConfig {
+        cluster_id: ClusterId::from_raw(1),
+        learners: BTreeSet::new(),
         max_inflight_messages: 0,
         ..valid.clone()
     };
@@ -1697,6 +1707,8 @@ fn test_config_validation_rejects_bad_configs() {
     );
 
     let no_bytes = RaftConfig {
+        cluster_id: ClusterId::from_raw(1),
+        learners: BTreeSet::new(),
         max_bytes_per_message: 0,
         ..valid.clone()
     };
@@ -1708,6 +1720,8 @@ fn test_config_validation_rejects_bad_configs() {
     let mut selfish = BTreeSet::new();
     selfish.insert(node_id(1));
     let loops_back = RaftConfig {
+        cluster_id: ClusterId::from_raw(1),
+        learners: BTreeSet::new(),
         peers: selfish,
         ..valid.clone()
     };
@@ -1792,6 +1806,8 @@ fn test_election_sampler_rejection_loop_redraws() {
     }
     let seed = chosen.expect("a seed must trigger the sampler rejection loop");
     let config = RaftConfig {
+        cluster_id: ClusterId::from_raw(1),
+        learners: BTreeSet::new(),
         node_id: node_id(1),
         peers: BTreeSet::new(),
         election_timeout_ticks: base,

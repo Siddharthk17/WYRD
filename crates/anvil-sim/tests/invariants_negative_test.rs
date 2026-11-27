@@ -8,7 +8,7 @@
 
 use anvil_raft::{Input, Output, RaftConfig, RaftCore, RecoveredState, Role};
 use anvil_sim::RaftInvariantChecker;
-use anvil_types::{Entry, LogIndex, NodeId, Term};
+use anvil_types::{ClusterId, Entry, LogIndex, NodeId, Term};
 use bytes::Bytes;
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
@@ -22,6 +22,8 @@ fn two_node_configs() -> (RaftConfig, RaftConfig, NodeId, NodeId) {
     let mut peers2 = BTreeSet::new();
     peers2.insert(node1);
     let base = |node_id: NodeId, peers: BTreeSet<NodeId>| RaftConfig {
+        cluster_id: ClusterId::from_raw(1),
+        learners: BTreeSet::new(),
         node_id,
         peers,
         election_timeout_ticks: 10,

@@ -18,10 +18,11 @@ use anvil_sim::queue::{BinaryHeapEventQueue, EventQueue};
 use anvil_sim::rng::DetRng;
 use anvil_sim::scenario::run_golden_scenario;
 use anvil_sim::time::SimTime;
-use anvil_types::{Entry, EntryKind, LogIndex, NodeId, Term};
+use anvil_types::{ClusterId, Entry, EntryKind, LogIndex, NodeId, Term};
 use bytes::Bytes;
 use clap::Parser;
 use rand_chacha::rand_core::SeedableRng;
+use std::collections::BTreeSet;
 use std::time::Instant;
 
 #[derive(Parser, Debug)]
@@ -162,6 +163,8 @@ fn measure_raft_replication() -> (f64, usize) {
             peer_set.insert(p);
         }
         let config = RaftConfig {
+            cluster_id: ClusterId::from_raw(1),
+            learners: BTreeSet::new(),
             node_id,
             peers: peer_set,
             election_timeout_ticks: 1_000_000,
