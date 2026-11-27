@@ -172,9 +172,12 @@ fn test_kv_snapshot_decode_rejects_garbage() {
     trailing.push(0xFF);
     assert!(KvStore::decode_snapshot(config, &trailing).is_err());
     let mut bad_count = snap.to_vec();
-    let len = bad_count.len();
-    bad_count.truncate(len - 8);
-    bad_count.extend_from_slice(&u64::MAX.to_le_bytes());
+    // v03 header before the map count: magic(8) + tick(8) + applied(8) +
+    // hash(32) + config(40) = 96 bytes. Overwriting the map count with
+    // u64::MAX must fail the 1M-entry bound before any reservation.
+    let map_count_offset = 8 + 8 + 8 + 32 + 40;
+    assert!(bad_count.len() > map_count_offset + 8);
+    bad_count[map_count_offset..map_count_offset + 8].copy_from_slice(&u64::MAX.to_le_bytes());
     assert!(KvStore::decode_snapshot(config, &bad_count).is_err());
     let restored = KvStore::decode_snapshot(config, &snap).expect("roundtrip");
     assert_eq!(restored.len(), 1);

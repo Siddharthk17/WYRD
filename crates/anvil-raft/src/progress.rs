@@ -4,6 +4,24 @@
 
 use anvil_types::{LogIndex, Term};
 
+/// Snapshot streaming cursor for one follower peer.
+///
+/// Chunks below `acked_chunk` are confirmed received; chunks in
+/// `[acked_chunk, send_next)` are in flight. Resends never inflate the
+/// window: only first-time sends consume it, and duplicate acks recompute
+/// rather than decrement, so a stalled stream always stays retransmissible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotProgress {
+    /// Last log index included in the streamed snapshot.
+    pub last_included_index: LogIndex,
+    /// Next never-yet-sent chunk.
+    pub send_next: u32,
+    /// Cumulative ack: every chunk below this arrived.
+    pub acked_chunk: u32,
+    /// Total chunk count of the snapshot.
+    pub total_chunks: u32,
+}
+
 /// Replication state of a follower peer from the leader's perspective.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgressState {
@@ -11,6 +29,10 @@ pub enum ProgressState {
     Probe,
     /// Replicate state: pipelined optimistic replication up to `max_inflight_messages`.
     Replicate,
+    /// Snapshot state: chunked `InstallSnapshot` stream under the same
+    /// in-flight window. Entered only when the follower is behind the
+    /// compacted prefix, so the log can no longer reach it.
+    Snapshot(SnapshotProgress),
 }
 
 /// Tracks replication progress and in-flight window for an individual follower.
@@ -47,6 +69,67 @@ impl PeerProgress {
         match self.state {
             ProgressState::Probe => self.inflight_count == 0,
             ProgressState::Replicate => self.inflight_count < self.max_inflight,
+            ProgressState::Snapshot(_) => false,
+        }
+    }
+
+    /// Returns true if flow control permits sending the next snapshot chunk.
+    #[must_use]
+    pub fn can_send_snapshot(&self) -> bool {
+        matches!(self.state, ProgressState::Snapshot(_)) && self.inflight_count < self.max_inflight
+    }
+
+    /// Enters snapshot streaming for the given snapshot. The in-flight
+    /// window restarts so a stale probe does not block the first chunk.
+    pub fn enter_snapshot(
+        &mut self,
+        last_included_index: LogIndex,
+        total_chunks: u32,
+        next_chunk: u32,
+    ) {
+        self.state = ProgressState::Snapshot(SnapshotProgress {
+            last_included_index,
+            send_next: next_chunk,
+            acked_chunk: next_chunk,
+            total_chunks,
+        });
+        self.inflight_count = 0;
+    }
+
+    /// Leaves snapshot streaming after the follower installed the snapshot.
+    pub fn exit_snapshot(&mut self, match_index: LogIndex) {
+        if match_index > self.match_index {
+            self.match_index = match_index;
+        }
+        let next = match_index.next().unwrap_or(match_index);
+        if next > self.next_index {
+            self.next_index = next;
+        }
+        self.state = ProgressState::Probe;
+        self.inflight_count = 0;
+    }
+
+    /// Records a first-time snapshot chunk send: advances the send pointer
+    /// and consumes one window slot.
+    pub fn on_snapshot_send_new(&mut self) {
+        if let ProgressState::Snapshot(progress) = &mut self.state {
+            progress.send_next = progress.send_next.saturating_add(1);
+        }
+        self.inflight_count = self.inflight_count.saturating_add(1);
+    }
+
+    /// Records a cumulative snapshot ack. Recomputes the window instead of
+    /// decrementing so duplicate acks can never deflate it.
+    pub fn on_snapshot_ack(&mut self, wanted: u32) {
+        if let ProgressState::Snapshot(progress) = &mut self.state {
+            let send_next = progress.send_next;
+            let ack = wanted.min(send_next);
+            if ack > progress.acked_chunk {
+                progress.acked_chunk = ack;
+            }
+            self.inflight_count = send_next.saturating_sub(progress.acked_chunk) as usize;
+        } else {
+            self.inflight_count = self.inflight_count.saturating_sub(1);
         }
     }
 

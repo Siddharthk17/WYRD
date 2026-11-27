@@ -5,13 +5,16 @@
 //! Deterministic KV store over `imbl::OrdMap` with session deduplication.
 
 use crate::command::{KvCommand, KvCommandError, KvResponse};
+use crate::snapshot::{
+    ChunkError, SnapshotChunk, reassemble_chunks, snapshot_digest, split_into_chunks,
+};
 use anvil_types::{LogIndex, SeqNo, SessionId};
 use bytes::Bytes;
 use std::collections::BTreeMap;
 use thiserror::Error;
 
 /// Limits and session policy for the state machine.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KvConfig {
     /// Maximum key length in bytes.
     pub max_key_bytes: usize,
@@ -48,6 +51,8 @@ pub enum KvError {
     Decode,
     #[error("too many sessions")]
     TooManySessions,
+    #[error("snapshot chunk corrupt")]
+    CorruptChunk,
 }
 
 impl From<KvCommandError> for KvError {
@@ -377,14 +382,37 @@ impl KvStore {
         self.read_register(key)
     }
 
-    /// Encodes a full snapshot. The map clone is `O(1)` structural sharing;
-    /// serialization walks live entries once.
+    /// Returns an `O(1)` snapshot handle. The persistent map clone shares
+    /// structure, so this never blocks the consensus path. Serialization
+    /// walks live entries once, off the path, through `encode_snapshot`.
+    #[must_use]
+    pub fn snapshot_handle(&self) -> Self {
+        self.clone()
+    }
+
+    /// Returns the index this snapshot restores, always the applied index.
+    /// Snapshots never describe state beyond what has applied.
+    #[must_use]
+    pub const fn snapshot_index(&self) -> LogIndex {
+        self.applied_index
+    }
+
+    /// Returns the number of live client sessions in the snapshot.
+    #[must_use]
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// Encodes a full v03 snapshot: map, tombstones, session table, config,
+    /// and state hash, at the applied index.
+    #[must_use]
     pub fn encode_snapshot(&self) -> Bytes {
         let mut buf = Vec::new();
-        buf.extend_from_slice(b"ANVKVS02");
+        buf.extend_from_slice(crate::snapshot::SNAPSHOT_MAGIC_V03);
         buf.extend_from_slice(&self.virtual_tick.to_le_bytes());
         buf.extend_from_slice(&self.applied_index.as_u64().to_le_bytes());
         buf.extend_from_slice(&self.state_hash);
+        encode_config(&self.config, &mut buf);
         let count = self.map.len() as u64;
         buf.extend_from_slice(&count.to_le_bytes());
         for (key, record) in &self.map {
@@ -404,12 +432,155 @@ impl KvStore {
             buf.extend_from_slice(key);
             buf.extend_from_slice(&version.as_u64().to_le_bytes());
         }
+        encode_sessions(
+            &self.sessions,
+            &self.session_order,
+            &mut buf,
+            self.config.max_key_bytes,
+            self.config.max_value_bytes,
+        );
         Bytes::from(buf)
     }
 
-    /// Decodes a snapshot produced by `encode_snapshot`.
+    /// Encodes the snapshot into chunks with per-chunk CRC32C.
+    ///
+    /// Call on a handle from `snapshot_handle`, off the consensus path.
+    /// Returns the chunks and the BLAKE3 digest of the full byte stream.
+    #[must_use]
+    pub fn encode_snapshot_chunked(&self, chunk_bytes: usize) -> (Vec<SnapshotChunk>, [u8; 32]) {
+        let full = self.encode_snapshot();
+        let digest = snapshot_digest(&full);
+        let chunks = split_into_chunks(&full, chunk_bytes);
+        (chunks, digest)
+    }
+
+    /// Reassembles verified chunks and decodes the snapshot.
+    ///
+    /// Verifies per-chunk CRC, concatenation order, and the final digest
+    /// before decoding. Rejects snapshots whose embedded config differs from
+    /// `config`.
+    pub fn decode_snapshot_chunked(
+        config: KvConfig,
+        chunks: &[SnapshotChunk],
+        expected_digest: &[u8; 32],
+    ) -> Result<Self, KvError> {
+        let full = reassemble_chunks(chunks).map_err(|err| match err {
+            ChunkError::Empty | ChunkError::Gap | ChunkError::TooMany => KvError::Decode,
+            ChunkError::Corrupt => KvError::CorruptChunk,
+        })?;
+        if snapshot_digest(&full) != *expected_digest {
+            return Err(KvError::CorruptChunk);
+        }
+        Self::decode_snapshot(config, &full)
+    }
+
+    /// Decodes a snapshot produced by `encode_snapshot`. Accepts v03 and the
+    /// legacy v02 format (no sessions or config). Bounds are checked before
+    /// any reservation.
     pub fn decode_snapshot(config: KvConfig, input: &[u8]) -> Result<Self, KvError> {
-        let rest = input.strip_prefix(b"ANVKVS02").ok_or(KvError::Decode)?;
+        if let Some(rest) = input.strip_prefix(crate::snapshot::SNAPSHOT_MAGIC_V03) {
+            return Self::decode_v03(config, rest);
+        }
+        if let Some(rest) = input.strip_prefix(crate::snapshot::SNAPSHOT_MAGIC_V02) {
+            return Self::decode_v02(config, rest);
+        }
+        Err(KvError::Decode)
+    }
+
+    fn decode_v03(config: KvConfig, rest: &[u8]) -> Result<Self, KvError> {
+        if rest.len() < 56 {
+            return Err(KvError::Decode);
+        }
+        let virtual_tick = u64::from_le_bytes(rest[0..8].try_into().map_err(|_| KvError::Decode)?);
+        let applied = u64::from_le_bytes(rest[8..16].try_into().map_err(|_| KvError::Decode)?);
+        let mut state_hash = [0u8; 32];
+        state_hash.copy_from_slice(&rest[16..48]);
+        let mut cursor = &rest[48..];
+        let snapshot_config = decode_config(&mut cursor)?;
+        if snapshot_config != config {
+            return Err(KvError::Decode);
+        }
+        let count = read_u64(&mut cursor)? as usize;
+        if count > 1_000_000 {
+            return Err(KvError::Decode);
+        }
+        let mut map = imbl::OrdMap::new();
+        for _ in 0..count {
+            let key_len = read_u64(&mut cursor)? as usize;
+            if key_len > config.max_key_bytes || cursor.len() < key_len {
+                return Err(KvError::Decode);
+            }
+            let key = Bytes::copy_from_slice(&cursor[..key_len]);
+            cursor = &cursor[key_len..];
+            if cursor.is_empty() {
+                return Err(KvError::Decode);
+            }
+            let is_list = cursor[0] != 0;
+            cursor = &cursor[1..];
+            let version = LogIndex::from_raw(read_u64(&mut cursor)?);
+            let elements_len = read_u64(&mut cursor)? as usize;
+            if elements_len > 1_000_000 {
+                return Err(KvError::Decode);
+            }
+            let mut elements = Vec::with_capacity(elements_len.min(16));
+            for _ in 0..elements_len {
+                let value_len = read_u64(&mut cursor)? as usize;
+                if value_len > config.max_value_bytes || cursor.len() < value_len {
+                    return Err(KvError::Decode);
+                }
+                elements.push(Bytes::copy_from_slice(&cursor[..value_len]));
+                cursor = &cursor[value_len..];
+            }
+            map.insert(
+                key,
+                KvRecord {
+                    is_list,
+                    elements,
+                    version,
+                },
+            );
+        }
+        if cursor.is_empty() {
+            return Err(KvError::Decode);
+        }
+        let tomb_count = read_u64(&mut cursor)? as usize;
+        if tomb_count > 1_000_000 {
+            return Err(KvError::Decode);
+        }
+        let mut tombstones = BTreeMap::new();
+        for _ in 0..tomb_count {
+            let key_len = read_u64(&mut cursor)? as usize;
+            if key_len > config.max_key_bytes || cursor.len() < key_len {
+                return Err(KvError::Decode);
+            }
+            let key = Bytes::copy_from_slice(&cursor[..key_len]);
+            cursor = &cursor[key_len..];
+            let version = LogIndex::from_raw(read_u64(&mut cursor)?);
+            tombstones.insert(key, version);
+        }
+        let (sessions, session_order) = decode_sessions(
+            &mut cursor,
+            config.max_sessions,
+            config.max_responses_per_session,
+            config.max_key_bytes,
+            config.max_value_bytes,
+        )?;
+        if !cursor.is_empty() {
+            return Err(KvError::Decode);
+        }
+        Ok(Self {
+            config,
+            map,
+            sessions,
+            session_order,
+            virtual_tick,
+            state_hash,
+            applied_index: LogIndex::from_raw(applied),
+            tombstones,
+        })
+    }
+
+    fn decode_v02(config: KvConfig, rest: &[u8]) -> Result<Self, KvError> {
         if rest.len() < 56 {
             return Err(KvError::Decode);
         }
@@ -613,4 +784,302 @@ fn read_u64(cursor: &mut &[u8]) -> Result<u64, KvError> {
     let value = u64::from_le_bytes(cursor[..8].try_into().map_err(|_| KvError::Decode)?);
     *cursor = &cursor[8..];
     Ok(value)
+}
+
+fn encode_config(config: &KvConfig, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&(config.max_key_bytes as u64).to_le_bytes());
+    buf.extend_from_slice(&(config.max_value_bytes as u64).to_le_bytes());
+    buf.extend_from_slice(&config.session_idle_ticks.to_le_bytes());
+    buf.extend_from_slice(&(config.max_sessions as u64).to_le_bytes());
+    buf.extend_from_slice(&(config.max_responses_per_session as u64).to_le_bytes());
+}
+
+fn decode_config(cursor: &mut &[u8]) -> Result<KvConfig, KvError> {
+    let max_key = read_u64(cursor)?;
+    let max_value = read_u64(cursor)?;
+    let idle = read_u64(cursor)?;
+    let max_sessions = read_u64(cursor)?;
+    let max_responses = read_u64(cursor)?;
+    let max_key = usize::try_from(max_key).map_err(|_| KvError::Decode)?;
+    let max_value = usize::try_from(max_value).map_err(|_| KvError::Decode)?;
+    let max_sessions = usize::try_from(max_sessions).map_err(|_| KvError::Decode)?;
+    let max_responses = usize::try_from(max_responses).map_err(|_| KvError::Decode)?;
+    if max_key == 0 || max_key > 16 * 1024 * 1024 {
+        return Err(KvError::Decode);
+    }
+    if max_value == 0 || max_value > 64 * 1024 * 1024 {
+        return Err(KvError::Decode);
+    }
+    if max_sessions == 0 || max_sessions > 1_000_000 {
+        return Err(KvError::Decode);
+    }
+    if max_responses == 0 || max_responses > 100_000 {
+        return Err(KvError::Decode);
+    }
+    Ok(KvConfig {
+        max_key_bytes: max_key,
+        max_value_bytes: max_value,
+        session_idle_ticks: idle,
+        max_sessions,
+        max_responses_per_session: max_responses,
+    })
+}
+
+fn encode_sessions(
+    sessions: &BTreeMap<SessionId, SessionState>,
+    order: &BTreeMap<SessionId, u64>,
+    buf: &mut Vec<u8>,
+    max_key: usize,
+    max_value: usize,
+) {
+    buf.extend_from_slice(&(sessions.len() as u64).to_le_bytes());
+    for (id, state) in sessions {
+        buf.extend_from_slice(&id.as_u64().to_le_bytes());
+        buf.extend_from_slice(&state.last_activity.to_le_bytes());
+        buf.extend_from_slice(&state.highest_seq.to_le_bytes());
+        buf.extend_from_slice(&(state.responses.len() as u64).to_le_bytes());
+        for (seq, response) in &state.responses {
+            buf.extend_from_slice(&seq.as_u64().to_le_bytes());
+            let mut tmp = Vec::new();
+            encode_response(response, &mut tmp, max_key, max_value);
+            buf.extend_from_slice(&(tmp.len() as u64).to_le_bytes());
+            buf.extend_from_slice(&tmp);
+        }
+        let tick = order.get(id).copied().unwrap_or(state.last_activity);
+        buf.extend_from_slice(&tick.to_le_bytes());
+    }
+}
+
+/// Live sessions plus their ordering ticks restored from a snapshot.
+type SessionTables = (BTreeMap<SessionId, SessionState>, BTreeMap<SessionId, u64>);
+
+fn decode_sessions(
+    cursor: &mut &[u8],
+    max_sessions: usize,
+    max_responses: usize,
+    max_key: usize,
+    max_value: usize,
+) -> Result<SessionTables, KvError> {
+    let count = read_u64(cursor)? as usize;
+    if count > max_sessions {
+        return Err(KvError::Decode);
+    }
+    let mut sessions = BTreeMap::new();
+    let mut order = BTreeMap::new();
+    for _ in 0..count {
+        let id = SessionId::from_raw(read_u64(cursor)?);
+        let last_activity = read_u64(cursor)?;
+        let highest_seq = read_u64(cursor)?;
+        let responses_len = read_u64(cursor)? as usize;
+        if responses_len > max_responses {
+            return Err(KvError::Decode);
+        }
+        let mut responses = BTreeMap::new();
+        for _ in 0..responses_len {
+            let seq = SeqNo::from_raw(read_u64(cursor)?);
+            let len = read_u64(cursor)? as usize;
+            if len > 8 * 1024 * 1024 || cursor.len() < len {
+                return Err(KvError::Decode);
+            }
+            let response = decode_response(&cursor[..len], max_key, max_value)?;
+            *cursor = &cursor[len..];
+            responses.insert(seq, response);
+        }
+        let tick = read_u64(cursor)?;
+        if sessions
+            .insert(
+                id,
+                SessionState {
+                    last_activity,
+                    responses,
+                    highest_seq,
+                },
+            )
+            .is_some()
+        {
+            return Err(KvError::Decode);
+        }
+        order.insert(id, tick);
+    }
+    Ok((sessions, order))
+}
+
+fn encode_response(response: &KvResponse, buf: &mut Vec<u8>, _max_key: usize, _max_value: usize) {
+    match response {
+        KvResponse::Ok => buf.push(0),
+        KvResponse::SessionRegistered { session } => {
+            buf.push(1);
+            buf.extend_from_slice(&session.as_u64().to_le_bytes());
+        }
+        KvResponse::Value { value, version } => {
+            buf.push(2);
+            match value {
+                Some(v) => {
+                    buf.push(1);
+                    buf.extend_from_slice(&(v.len() as u64).to_le_bytes());
+                    buf.extend_from_slice(v);
+                }
+                None => buf.push(0),
+            }
+            buf.extend_from_slice(&version.as_u64().to_le_bytes());
+        }
+        KvResponse::List { values, version } => {
+            buf.push(3);
+            buf.extend_from_slice(&(values.len() as u64).to_le_bytes());
+            for v in values {
+                buf.extend_from_slice(&(v.len() as u64).to_le_bytes());
+                buf.extend_from_slice(v);
+            }
+            buf.extend_from_slice(&version.as_u64().to_le_bytes());
+        }
+        KvResponse::Range { pairs } => {
+            buf.push(4);
+            buf.extend_from_slice(&(pairs.len() as u64).to_le_bytes());
+            for (k, v) in pairs {
+                buf.extend_from_slice(&(k.len() as u64).to_le_bytes());
+                buf.extend_from_slice(k);
+                buf.extend_from_slice(&(v.len() as u64).to_le_bytes());
+                buf.extend_from_slice(v);
+            }
+        }
+        KvResponse::CasConflict { version } => {
+            buf.push(5);
+            buf.extend_from_slice(&version.as_u64().to_le_bytes());
+        }
+        KvResponse::SessionExpired => buf.push(6),
+        KvResponse::UnknownSession => buf.push(7),
+        KvResponse::Duplicate => buf.push(8),
+    }
+}
+
+fn decode_response(input: &[u8], max_key: usize, max_value: usize) -> Result<KvResponse, KvError> {
+    let (tag, rest) = input.split_first().ok_or(KvError::Decode)?;
+    match tag {
+        0 => {
+            if !rest.is_empty() {
+                return Err(KvError::Decode);
+            }
+            Ok(KvResponse::Ok)
+        }
+        1 => {
+            if rest.len() != 8 {
+                return Err(KvError::Decode);
+            }
+            let raw = u64::from_le_bytes(rest.try_into().map_err(|_| KvError::Decode)?);
+            Ok(KvResponse::SessionRegistered {
+                session: SessionId::from_raw(raw),
+            })
+        }
+        2 => decode_value_response(rest, max_value),
+        3 => decode_list_response(rest, max_value),
+        4 => decode_range_response(rest, max_key, max_value),
+        5 => {
+            if rest.len() != 8 {
+                return Err(KvError::Decode);
+            }
+            let version = LogIndex::from_raw(u64::from_le_bytes(
+                rest.try_into().map_err(|_| KvError::Decode)?,
+            ));
+            Ok(KvResponse::CasConflict { version })
+        }
+        6 => {
+            if !rest.is_empty() {
+                return Err(KvError::Decode);
+            }
+            Ok(KvResponse::SessionExpired)
+        }
+        7 => {
+            if !rest.is_empty() {
+                return Err(KvError::Decode);
+            }
+            Ok(KvResponse::UnknownSession)
+        }
+        8 => {
+            if !rest.is_empty() {
+                return Err(KvError::Decode);
+            }
+            Ok(KvResponse::Duplicate)
+        }
+        _ => Err(KvError::Decode),
+    }
+}
+
+fn decode_value_response(mut rest: &[u8], max_value: usize) -> Result<KvResponse, KvError> {
+    if rest.is_empty() {
+        return Err(KvError::Decode);
+    }
+    let has_value = rest[0] != 0;
+    rest = &rest[1..];
+    let value = if has_value {
+        let len = read_u64(&mut rest)? as usize;
+        if len > max_value || rest.len() < len {
+            return Err(KvError::Decode);
+        }
+        let v = Bytes::copy_from_slice(&rest[..len]);
+        rest = &rest[len..];
+        Some(v)
+    } else {
+        None
+    };
+    if rest.len() != 8 {
+        return Err(KvError::Decode);
+    }
+    let version = LogIndex::from_raw(u64::from_le_bytes(
+        rest.try_into().map_err(|_| KvError::Decode)?,
+    ));
+    Ok(KvResponse::Value { value, version })
+}
+
+fn decode_list_response(mut rest: &[u8], max_value: usize) -> Result<KvResponse, KvError> {
+    let count = read_u64(&mut rest)? as usize;
+    if count > 1_000_000 {
+        return Err(KvError::Decode);
+    }
+    let mut values = Vec::with_capacity(count.min(16));
+    for _ in 0..count {
+        let len = read_u64(&mut rest)? as usize;
+        if len > max_value || rest.len() < len {
+            return Err(KvError::Decode);
+        }
+        values.push(Bytes::copy_from_slice(&rest[..len]));
+        rest = &rest[len..];
+    }
+    if rest.len() != 8 {
+        return Err(KvError::Decode);
+    }
+    let version = LogIndex::from_raw(u64::from_le_bytes(
+        rest.try_into().map_err(|_| KvError::Decode)?,
+    ));
+    Ok(KvResponse::List { values, version })
+}
+
+fn decode_range_response(
+    mut rest: &[u8],
+    max_key: usize,
+    max_value: usize,
+) -> Result<KvResponse, KvError> {
+    let count = read_u64(&mut rest)? as usize;
+    if count > 100_000 {
+        return Err(KvError::Decode);
+    }
+    let mut pairs = Vec::with_capacity(count.min(16));
+    for _ in 0..count {
+        let key_len = read_u64(&mut rest)? as usize;
+        if key_len > max_key || rest.len() < key_len {
+            return Err(KvError::Decode);
+        }
+        let key = Bytes::copy_from_slice(&rest[..key_len]);
+        rest = &rest[key_len..];
+        let value_len = read_u64(&mut rest)? as usize;
+        if value_len > max_value || rest.len() < value_len {
+            return Err(KvError::Decode);
+        }
+        let value = Bytes::copy_from_slice(&rest[..value_len]);
+        rest = &rest[value_len..];
+        pairs.push((key, value));
+    }
+    if !rest.is_empty() {
+        return Err(KvError::Decode);
+    }
+    Ok(KvResponse::Range { pairs })
 }

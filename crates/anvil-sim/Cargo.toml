@@ -18,11 +18,13 @@ anvil-check = { workspace = true }
 anvil-node = { workspace = true }
 bytes = { workspace = true }
 blake3 = { workspace = true }
+clap = { workspace = true }
 rand_chacha = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+crc32c = { workspace = true }
 
 [lints]
 workspace = true

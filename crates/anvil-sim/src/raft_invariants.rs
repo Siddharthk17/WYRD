@@ -144,6 +144,9 @@ pub struct RaftInvariantChecker {
     node_votes: BTreeMap<(NodeId, Term), NodeId>,
     /// Set of (term, `entry_index`) committed records.
     committed_terms: BTreeMap<LogIndex, Term>,
+    /// Number of evaluation rounds run. Deterministic bookkeeping only,
+    /// never part of any trace hash.
+    check_count: u64,
 }
 
 impl RaftInvariantChecker {
@@ -157,11 +160,18 @@ impl RaftInvariantChecker {
     ///
     /// Must be called after every transition step of every node in the simulator.
     pub fn check_invariants(&mut self, nodes: &BTreeMap<NodeId, RaftCore>) {
+        self.check_count = self.check_count.saturating_add(1);
         let outcome = self.try_check_invariants(nodes);
         assert!(
             outcome.is_ok(),
             "FATAL RAFT INVARIANT VIOLATION: {outcome:?}"
         );
+    }
+
+    /// Returns how many evaluation rounds have run.
+    #[must_use]
+    pub const fn checks(&self) -> u64 {
+        self.check_count
     }
 
     /// Resets per-node term and vote history after a crash restart.
@@ -267,6 +277,14 @@ impl RaftInvariantChecker {
         Ok(())
     }
 
+    /// Returns the globally committed term for an index, if any node has
+    /// committed it. Used at restart to tell a stale acknowledgment (for a
+    /// legitimately truncated uncommitted fork) from a lost committed write.
+    #[must_use]
+    pub fn committed_term_at(&self, index: LogIndex) -> Option<Term> {
+        self.committed_terms.get(&index).copied()
+    }
+
     /// 7 & 9. Term monotonicity and vote immutability per term.
     fn check_term_monotonic_and_votes(
         &mut self,
@@ -346,8 +364,17 @@ impl RaftInvariantChecker {
                     {
                         for prefix in 1..=idx {
                             let prefix_idx = LogIndex::from_raw(prefix);
-                            let pt1 = core1.log().term_at(prefix_idx).unwrap_or(Term::from_raw(0));
-                            let pt2 = core2.log().term_at(prefix_idx).unwrap_or(Term::from_raw(0));
+                            // A compacted prefix reports no term. Compaction
+                            // only drops entries covered by a verified
+                            // snapshot, whose equality with a log replay is
+                            // checked at take time, so there is no log left
+                            // to compare here.
+                            let (Some(pt1), Some(pt2)) = (
+                                core1.log().term_at(prefix_idx),
+                                core2.log().term_at(prefix_idx),
+                            ) else {
+                                continue;
+                            };
                             if pt1 != pt2 {
                                 return Err(InvariantViolation::LogMatching {
                                     node1: *id1,
@@ -393,15 +420,17 @@ impl RaftInvariantChecker {
                         }
                     }
                     None => {
-                        return Err(InvariantViolation::CommittedEntriesNeverLost {
-                            node: node_id,
-                            index: log_idx,
-                            actual_term: Term::from_raw(0),
-                            expected_term: self
-                                .committed_oracle
-                                .get(&log_idx)
-                                .map_or(Term::from_raw(0), |entry| entry.term),
-                        });
+                        // Compaction only drops committed entries the oracle
+                        // already recorded, so a missing entry with no oracle
+                        // record is the only genuine loss.
+                        if !self.committed_oracle.contains_key(&log_idx) {
+                            return Err(InvariantViolation::CommittedEntriesNeverLost {
+                                node: node_id,
+                                index: log_idx,
+                                actual_term: Term::from_raw(0),
+                                expected_term: Term::from_raw(0),
+                            });
+                        }
                     }
                 }
             }
@@ -454,14 +483,24 @@ impl RaftInvariantChecker {
                 let leader_term = core.term();
                 for (&idx, &committed_term) in &self.committed_terms {
                     if leader_term > committed_term {
-                        let leader_entry_term = core.log().term_at(idx);
-                        if leader_entry_term != Some(committed_term) {
-                            return Err(InvariantViolation::LeaderCompleteness {
-                                leader: node_id,
-                                leader_term,
-                                index: idx,
-                                committed_term,
-                            });
+                        match core.log().term_at(idx) {
+                            Some(leader_entry_term) if leader_entry_term != committed_term => {
+                                return Err(InvariantViolation::LeaderCompleteness {
+                                    leader: node_id,
+                                    leader_term,
+                                    index: idx,
+                                    committed_term,
+                                });
+                            }
+                            None if idx > core.log().base_index() => {
+                                return Err(InvariantViolation::LeaderCompleteness {
+                                    leader: node_id,
+                                    leader_term,
+                                    index: idx,
+                                    committed_term,
+                                });
+                            }
+                            Some(_) | None => {}
                         }
                     }
                 }

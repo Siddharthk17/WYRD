@@ -15,3 +15,17 @@ pub use codec::{
 };
 pub use entry::{Entry, EntryKind};
 pub use ids::{ClusterId, GroupId, LogIndex, NodeId, SeqNo, SessionId, Term, ZeroNodeIdError};
+
+/// Marks a rare protocol path for farm coverage tracking.
+///
+/// The sink is an explicit `&mut Vec<&'static str>` carried through sans-IO
+/// outputs, never a global: deterministic crates forbid statics with
+/// interior mutability, so every hit is recorded into caller-provided
+/// storage and drained by the simulator. Each name must appear in
+/// `anvil_sim::SOMETIMES_INVENTORY`, enforced by a source-scan test.
+#[macro_export]
+macro_rules! sometimes {
+    ($sink:expr, $name:expr) => {
+        $sink.push($name)
+    };
+}

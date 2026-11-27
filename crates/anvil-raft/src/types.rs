@@ -181,6 +181,39 @@ pub struct ReadIndexResult {
     pub read_index: LogIndex,
 }
 
+/// One snapshot chunk supplied by the node for the leader to stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotChunkData {
+    /// Snapshot payload slice for this chunk.
+    pub chunk: Bytes,
+    /// CRC32C over `chunk`.
+    pub chunk_crc: u32,
+}
+
+/// A fully reassembled and digest-verified snapshot ready for atomic install.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceivedSnapshot {
+    /// Last log index included in the snapshot.
+    pub last_included_index: LogIndex,
+    /// Term of `last_included_index`.
+    pub last_included_term: Term,
+    /// Full snapshot byte stream.
+    pub data: Bytes,
+    /// BLAKE3 digest of `data`, verified by the core before handing over.
+    pub snapshot_digest: [u8; 32],
+}
+
+/// A core request for snapshot bytes: follower `to` needs the log that is
+/// already compacted away, so the node must supply a snapshot at or above
+/// `least_index` through `Input::SnapshotReady`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotRequest {
+    /// Follower that can only be reached by snapshot.
+    pub to: NodeId,
+    /// Minimum snapshot index that would unblock the follower.
+    pub least_index: LogIndex,
+}
+
 /// Destination-addressed outbound message emitted by `RaftCore`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundMessage {
@@ -201,10 +234,18 @@ pub struct Output {
     pub committed_entries: Vec<Entry>,
     /// Completed linearizable read index queries.
     pub completed_reads: Vec<ReadIndexResult>,
+    /// Core requests for snapshot bytes the node must supply.
+    pub snapshot_requests: Vec<SnapshotRequest>,
+    /// Fully verified snapshots the node must atomically install.
+    pub ready_snapshots: Vec<ReceivedSnapshot>,
     /// Role transition notifications.
     pub role_changes: Vec<RoleChangeEvent>,
     /// Trace events projecting exact TLA+ spec state.
     pub spec_projections: Vec<SpecProjection>,
+    /// Rare protocol paths executed since the last drain, for farm coverage.
+    /// Entries are `&'static str` markers pushed by `sometimes!`; the
+    /// simulator drains them after every step.
+    pub sometimes_hits: Vec<&'static str>,
 }
 
 impl Output {
@@ -220,8 +261,11 @@ impl Output {
         self.persist_ops.clear();
         self.committed_entries.clear();
         self.completed_reads.clear();
+        self.snapshot_requests.clear();
+        self.ready_snapshots.clear();
         self.role_changes.clear();
         self.spec_projections.clear();
+        self.sometimes_hits.clear();
     }
 }
 
@@ -245,4 +289,22 @@ pub enum Input {
     Applied { index: LogIndex },
     /// Administrative request to transfer leadership to target node.
     TransferLeader { to: NodeId },
+    /// Node notifies the core that the log prefix is durable in a snapshot and
+    /// may be dropped. Ignored unless `up_to` is above the compacted base and
+    /// at most the applied index: snapshots never cover unapplied entries.
+    CompactLog { up_to: LogIndex },
+    /// Node supplies snapshot bytes for the leader to stream. Chunks share
+    /// ownership through `Bytes`, so supplying never copies the payload.
+    SnapshotReady {
+        /// Last log index included in the snapshot.
+        last_included_index: LogIndex,
+        /// Term of `last_included_index`.
+        last_included_term: Term,
+        /// Full snapshot byte length for bounds checks.
+        snapshot_bytes: u64,
+        /// BLAKE3 digest of the full snapshot byte stream.
+        snapshot_digest: [u8; 32],
+        /// Chunk payloads in index order.
+        chunks: Vec<SnapshotChunkData>,
+    },
 }

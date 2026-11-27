@@ -5,6 +5,7 @@
 
 use crate::history::{ClientOp, History, HistoryOp, OpResult};
 use crate::wgl::{KeyVerdict, check_key_history, check_range_history};
+use bytes::Bytes;
 use std::collections::BTreeMap;
 
 /// A linearizability failure with diagnostics for the visualizer.
@@ -120,6 +121,13 @@ fn minimize_failure_ids(history: &History, ids: &[usize]) -> CheckFailure {
                 i += 1;
                 continue;
             }
+            // Never orphan a read: dropping the only writer of an observed
+            // value yields a dangling read that fails for a trivial reason
+            // and hides the real stale read. Only closed candidates count.
+            if !is_closed(history, &candidate) {
+                i += 1;
+                continue;
+            }
             if sub_history_fails(history, &candidate) {
                 current = candidate;
                 changed = true;
@@ -135,6 +143,88 @@ fn minimize_failure_ids(history: &History, ids: &[usize]) -> CheckFailure {
         longest_prefix,
         json,
     }
+}
+
+/// What a remaining read needs from the candidate sub-history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Need {
+    /// No writer required.
+    None,
+    /// A writer of exactly this value (`None` means a tombstone).
+    Value(Option<Bytes>),
+    /// Any list-append on the key.
+    AnyAppend,
+}
+
+/// Whether every completed read in the candidate still has a writer that
+/// could have produced its observed value: a completed write of the same
+/// value, an indeterminate write that may have taken effect, or any append
+/// for a list read. Vacant reads, indeterminate reads without results,
+/// range reads, and failed CAS checks impose no constraint. Without this,
+/// delta debugging orphans reads whose writers were minimized away and
+/// reports a dangling read instead of the real stale one.
+fn is_closed(history: &History, ids: &[usize]) -> bool {
+    use std::collections::BTreeSet;
+    let present: BTreeSet<usize> = ids.iter().copied().collect();
+    let by_id = index_by_id(history);
+    for &id in &present {
+        let Some(&pos) = by_id.get(&id) else {
+            continue;
+        };
+        let op = &history.ops[pos];
+        if op.indeterminate && op.result.is_none() {
+            continue;
+        }
+        let need = match (&op.op, &op.result) {
+            (ClientOp::Get, Some(OpResult::Value { value, .. }))
+            | (ClientOp::Cas { .. }, Some(OpResult::Value { value, .. })) => {
+                Need::Value(value.clone())
+            }
+            (ClientOp::Get, Some(OpResult::List { .. })) => Need::AnyAppend,
+            _ => Need::None,
+        };
+        if matches!(need, Need::None) {
+            continue;
+        }
+        let mut explained = false;
+        for &other in &present {
+            if other == id {
+                continue;
+            }
+            let Some(&opos) = by_id.get(&other) else {
+                continue;
+            };
+            let writer = &history.ops[opos];
+            if writer.key != op.key {
+                continue;
+            }
+            let covers = match (&writer.op, &writer.result, writer.indeterminate, &need) {
+                // Any indeterminate write, or any append for a list read,
+                // may explain the observation.
+                (ClientOp::Put { .. } | ClientOp::Delete | ClientOp::Cas { .. }, _, true, _)
+                | (ClientOp::Append { .. }, _, _, Need::AnyAppend) => true,
+                (ClientOp::Put { value }, _, false, Need::Value(want)) => {
+                    Some(value) == want.as_ref()
+                }
+                (ClientOp::Delete, _, false, Need::Value(want)) => want.is_none(),
+                (
+                    ClientOp::Cas { .. },
+                    Some(OpResult::Value { value, .. }),
+                    false,
+                    Need::Value(want),
+                ) => value == want,
+                _ => false,
+            };
+            if covers {
+                explained = true;
+                break;
+            }
+        }
+        if !explained {
+            return false;
+        }
+    }
+    true
 }
 
 fn sub_history_fails(history: &History, ids: &[usize]) -> bool {

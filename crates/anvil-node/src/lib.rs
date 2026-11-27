@@ -8,8 +8,11 @@
 //! deliver messages, submit persistence operations to a `Device`, and feed
 //! completions back. The simulator and the production server share this code.
 
-use anvil_kv::{KvCommand, KvConfig, KvResponse, KvStore};
-use anvil_raft::{Input, Output, PersistOp, RaftConfig, RaftCore, ReadIndexResult, Role};
+use anvil_kv::{KvCommand, KvConfig, KvResponse, KvStore, SnapshotPolicy};
+use anvil_raft::{
+    Input, Output, PersistOp, RaftConfig, RaftCore, ReadIndexResult, ReceivedSnapshot, Role,
+    SnapshotChunkData,
+};
 use anvil_types::{LogIndex, NodeId};
 use bytes::Bytes;
 use rand_chacha::ChaCha8Rng;
@@ -28,10 +31,12 @@ pub enum ReadConsistency {
 }
 
 /// Node behavior switches.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct NodeConfig {
     /// State machine limits.
     pub kv: KvConfig,
+    /// Snapshot and compaction policy.
+    pub snapshot_policy: SnapshotPolicy,
     /// Whether lease reads are permitted. Off by default.
     pub lease_enabled: bool,
     /// Lease duration in ticks. Must be shorter than the minimum election
@@ -43,6 +48,24 @@ pub struct NodeConfig {
     /// answer leader reads immediately. The checker must catch the stale
     /// read. Never enabled in production.
     pub skip_read_confirmation: bool,
+    /// Bound on queued linearizable and follower reads waiting for quorum
+    /// confirmation or apply. When full the oldest waiter is shed (its
+    /// client times out and retries) instead of growing without bound.
+    pub max_pending_reads: usize,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            kv: KvConfig::default(),
+            snapshot_policy: SnapshotPolicy::default(),
+            lease_enabled: false,
+            lease_ticks: 0,
+            drift_bound_ticks: 0,
+            skip_read_confirmation: false,
+            max_pending_reads: 512,
+        }
+    }
 }
 
 /// A client write request. `RegisterSession` carries no session yet.
@@ -139,6 +162,9 @@ pub struct Node {
     applied: LogIndex,
     last_leader_contact: u64,
     now_tick: u64,
+    entries_since_snapshot: u64,
+    bytes_since_snapshot: u64,
+    last_snapshot_index: LogIndex,
 }
 
 impl Node {
@@ -162,6 +188,9 @@ impl Node {
             applied: LogIndex::from_raw(0),
             last_leader_contact: 0,
             now_tick: 0,
+            entries_since_snapshot: 0,
+            bytes_since_snapshot: 0,
+            last_snapshot_index: LogIndex::from_raw(0),
         }
     }
 
@@ -309,7 +338,7 @@ impl Node {
             ReadConsistency::Lease => self.read_lease(&read),
             ReadConsistency::Linearizable => self.read_leader(&read, output),
             ReadConsistency::FollowerLinearizable => {
-                self.pending_reads.push(PendingRead {
+                self.enqueue_pending_read(PendingRead {
                     read,
                     consistency,
                     read_index: Some(self.raft.commit_index()),
@@ -326,6 +355,12 @@ impl Node {
     /// the same call after contacting the leader.
     pub fn follower_read_target(&self) -> LogIndex {
         self.raft.commit_index()
+    }
+
+    /// Returns the number of reads currently waiting for confirmation.
+    #[must_use]
+    pub fn pending_read_count(&self) -> usize {
+        self.pending_reads.len()
     }
 
     /// Notifies the storage layer that a persist operation completed.
@@ -361,6 +396,15 @@ impl Node {
         self.kv.apply(index, payload).unwrap_or(KvResponse::Ok)
     }
 
+    /// Queues a pending read, shedding the oldest waiter when the
+    /// bounded wait queue is full.
+    fn enqueue_pending_read(&mut self, pending: PendingRead) {
+        while self.pending_reads.len() >= self.config.max_pending_reads.max(1) {
+            self.pending_reads.remove(0);
+        }
+        self.pending_reads.push(pending);
+    }
+
     fn read_lease(&mut self, read: &NodeRead) -> Option<ClientResponse> {
         if !self.config.lease_enabled {
             return None;
@@ -393,7 +437,7 @@ impl Node {
         ctx.extend_from_slice(&self.read_seq.to_le_bytes());
         ctx.extend_from_slice(&self.now_tick.to_le_bytes());
         let context = Bytes::from(ctx);
-        self.pending_reads.push(PendingRead {
+        self.enqueue_pending_read(PendingRead {
             read: read.clone(),
             consistency: ReadConsistency::Linearizable,
             read_index: None,
@@ -444,6 +488,10 @@ impl Node {
         output.persist_ops.append(&mut self.raft_output.persist_ops);
         let committed = std::mem::take(&mut self.raft_output.committed_entries);
         for entry in committed {
+            self.entries_since_snapshot = self.entries_since_snapshot.saturating_add(1);
+            self.bytes_since_snapshot = self
+                .bytes_since_snapshot
+                .saturating_add(entry.payload.len() as u64);
             if entry.kind == anvil_types::EntryKind::NoOp {
                 self.applied = entry.index;
                 let mut nested = Output::new();
@@ -472,7 +520,133 @@ impl Node {
         for item in &completed {
             self.serve_confirmed_read(item, output);
         }
+        self.process_snapshot_effects(output);
         self.raft_output.clear();
+    }
+
+    /// Takes snapshots on policy triggers or core requests, and installs
+    /// verified snapshots the core reassembled. Bounded per drain: each
+    /// supply satisfies a need, so the loop terminates.
+    fn process_snapshot_effects(&mut self, output: &mut NodeOutput) {
+        if self
+            .config
+            .snapshot_policy
+            .should_snapshot(self.entries_since_snapshot, self.bytes_since_snapshot)
+        {
+            self.take_snapshot(output);
+        }
+        for _ in 0..8 {
+            let requests = std::mem::take(&mut self.raft_output.snapshot_requests);
+            let ready = std::mem::take(&mut self.raft_output.ready_snapshots);
+            if requests.is_empty() && ready.is_empty() {
+                break;
+            }
+            for snap in &ready {
+                self.install_snapshot(snap, output);
+            }
+            for request in &requests {
+                self.supply_snapshot(request.least_index, output);
+            }
+        }
+    }
+
+    /// Encodes the state machine at the applied index, hands the chunks to
+    /// the core for streaming, and compacts the log prefix that the durable
+    /// snapshot now covers. Never snapshots beyond the applied index: the
+    /// handle is taken at `self.applied` by construction.
+    fn take_snapshot(&mut self, output: &mut NodeOutput) {
+        let handle = self.kv.snapshot_handle();
+        let applied = self.applied;
+        let Some(term) = self.raft.log().term_at(applied) else {
+            return;
+        };
+        let (chunks, digest) =
+            handle.encode_snapshot_chunked(self.config.snapshot_policy.chunk_bytes);
+        let mut total: u64 = 0;
+        let mut data = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            total = total.saturating_add(chunk.payload.len() as u64);
+            data.push(SnapshotChunkData {
+                chunk: chunk.payload.clone(),
+                chunk_crc: chunk.crc,
+            });
+        }
+        self.raft_output.clear();
+        self.raft.step(
+            Input::SnapshotReady {
+                last_included_index: applied,
+                last_included_term: term,
+                snapshot_bytes: total,
+                snapshot_digest: digest,
+                chunks: data,
+            },
+            &mut self.raft_output,
+        );
+        output.messages.append(&mut self.raft_output.messages);
+        output.persist_ops.append(&mut self.raft_output.persist_ops);
+        self.entries_since_snapshot = 0;
+        self.bytes_since_snapshot = 0;
+        self.last_snapshot_index = applied;
+        if let Some(up_to) = self
+            .config
+            .snapshot_policy
+            .compaction_index(applied, applied, true)
+        {
+            self.raft_output.clear();
+            self.raft
+                .step(Input::CompactLog { up_to }, &mut self.raft_output);
+            output.messages.append(&mut self.raft_output.messages);
+            output.persist_ops.append(&mut self.raft_output.persist_ops);
+        }
+        self.serve_ready_reads(output);
+    }
+
+    /// Supplies a snapshot for a lagging peer when the core has no usable
+    /// bytes buffered. The least index is always reachable: a need implies
+    /// the peer is behind the compacted base, and the base never passes the
+    /// applied index, so a snapshot at applied covers it.
+    fn supply_snapshot(&mut self, least_index: LogIndex, output: &mut NodeOutput) {
+        assert!(
+            self.applied.as_u64() + 1 >= least_index.as_u64(),
+            "snapshot need beyond applied state"
+        );
+        self.take_snapshot(output);
+    }
+
+    /// Atomically installs a core-verified snapshot: the state machine is
+    /// replaced, applied jumps, and the core is told so its bound checks
+    /// stay exact. Stale snapshots at or below applied never regress state.
+    fn install_snapshot(&mut self, snap: &ReceivedSnapshot, output: &mut NodeOutput) {
+        if snap.last_included_index <= self.applied {
+            return;
+        }
+        if anvil_kv::snapshot_digest(&snap.data) != snap.snapshot_digest {
+            return;
+        }
+        let Ok(restored) = self.kv_snapshot_decode(&snap.data) else {
+            return;
+        };
+        if restored.applied_index() != snap.last_included_index {
+            return;
+        }
+        self.kv = restored;
+        self.applied = snap.last_included_index;
+        self.entries_since_snapshot = 0;
+        self.bytes_since_snapshot = 0;
+        self.last_snapshot_index = snap.last_included_index;
+        self.raft_output.clear();
+        self.raft.step(
+            Input::Applied {
+                index: snap.last_included_index,
+            },
+            &mut self.raft_output,
+        );
+        self.serve_ready_reads(output);
+    }
+
+    /// Decodes install bytes against this node's state-machine limits.
+    fn kv_snapshot_decode(&self, data: &[u8]) -> Result<KvStore, anvil_kv::KvError> {
+        KvStore::decode_snapshot(self.config.kv, data)
     }
 
     fn serve_confirmed_read(&mut self, completed: &ReadIndexResult, output: &mut NodeOutput) {
