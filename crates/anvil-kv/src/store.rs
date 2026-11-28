@@ -761,7 +761,12 @@ impl KvStore {
     fn memoize(&mut self, session: SessionId, seq: SeqNo, response: &KvResponse) {
         if let Some(state) = self.sessions.get_mut(&session) {
             state.responses.insert(seq, response.clone());
-            while state.responses.len() > self.config.max_responses_per_session {
+            let limit = if anvil_types::mutants::is(anvil_types::MutantId::M14) {
+                0
+            } else {
+                self.config.max_responses_per_session
+            };
+            while state.responses.len() > limit {
                 let Some(first) = state.responses.keys().next().copied() else {
                     break;
                 };

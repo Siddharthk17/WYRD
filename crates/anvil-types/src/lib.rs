@@ -7,6 +7,7 @@ pub mod codec;
 pub mod config;
 pub mod entry;
 pub mod ids;
+pub mod mutants;
 
 pub use codec::{
     CODEC_VERSION_1, CodecError, FRAME_MAGIC, Frame, FrameHeader, FrameType, MAX_FRAME_PAYLOAD_LEN,
@@ -34,3 +35,5 @@ macro_rules! sometimes {
         $sink.push($name)
     };
 }
+
+pub use mutants::{ALL as ALL_MUTANTS, MutantId};

@@ -13,6 +13,7 @@ use anvil_raft::{
     Input, Output, PersistOp, RaftConfig, RaftCore, ReadIndexResult, ReceivedSnapshot, Role,
     SnapshotChunkData,
 };
+use anvil_types::mutants::{MutantId, is};
 use anvil_types::{ClusterId, Entry, LogIndex, NodeId};
 use bytes::Bytes;
 use rand_chacha::ChaCha8Rng;
@@ -563,7 +564,13 @@ impl Node {
             return None;
         }
         let since_contact = self.now_tick.saturating_sub(self.last_leader_contact);
-        if since_contact > self.config.lease_ticks {
+        let bound = self.config.lease_ticks
+            + if is(MutantId::M06) {
+                self.config.drift_bound_ticks
+            } else {
+                0
+            };
+        if since_contact > bound {
             return None;
         }
         Some(ClientResponse {
@@ -576,7 +583,7 @@ impl Node {
         if self.raft.role() != Role::Leader {
             return None;
         }
-        if self.config.skip_read_confirmation {
+        if self.config.skip_read_confirmation || is(MutantId::M05) {
             return Some(ClientResponse {
                 response: self.eval_read(read),
                 read_index: self.applied,
@@ -732,7 +739,11 @@ impl Node {
         self.raft_output.clear();
         self.raft.step(
             Input::SnapshotReady {
-                last_included_index: applied,
+                last_included_index: if is(MutantId::M09) {
+                    LogIndex::from_raw(applied.as_u64().saturating_add(1))
+                } else {
+                    applied
+                },
                 last_included_term: term,
                 snapshot_bytes: total,
                 snapshot_digest: digest,
@@ -793,7 +804,9 @@ impl Node {
         else {
             return;
         };
-        self.kv = restored;
+        if !is(MutantId::M10) {
+            self.kv = restored;
+        }
         self.applied = snap.last_included_index;
         self.entries_since_snapshot = 0;
         self.bytes_since_snapshot = 0;
