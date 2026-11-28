@@ -123,6 +123,11 @@ pub struct RaftCore {
     joint: Option<JointState>,
     pending_config: Option<LogIndex>,
     leave_index: Option<LogIndex>,
+    /// Index of the committed `LeaveJoint` that removed this node. A removed
+    /// node still answers vote requests from candidates whose log includes
+    /// that entry; otherwise joint consensus deadlocks when the removed node
+    /// is the only old-quorum partner left.
+    removed_after: Option<LogIndex>,
     committed_current_term: bool,
     installed_base: Option<LogIndex>,
     repair_from: Option<LogIndex>,
@@ -211,6 +216,7 @@ impl RaftCore {
             joint: None,
             pending_config: None,
             leave_index: None,
+            removed_after: None,
             committed_current_term: false,
             installed_base: None,
             repair_from: None,
@@ -409,6 +415,18 @@ impl RaftCore {
         self.joint = joint;
         self.pending_config = self.joint.as_ref().map(|state| state.enter_index);
         self.leave_index = None;
+        // A snapshot carries the config as of `base`. If it no longer names
+        // this node, the removal is committed at `base`, so the node may
+        // answer candidates whose logs cover it.
+        self.removed_after = if self.joint.is_none()
+            && !self.voters.is_empty()
+            && !self.voters.contains(&self.config.node_id)
+            && !self.learners.contains(&self.config.node_id)
+        {
+            Some(base)
+        } else {
+            None
+        };
         self.resolve_committed_configs(self.commit_index);
         let next = base.next().unwrap_or(base);
         let mut fresh = BTreeMap::new();
@@ -521,6 +539,11 @@ impl RaftCore {
                 for learner in config.learners() {
                     self.ensure_progress(*learner);
                 }
+                if config.voters().contains(&self.config.node_id)
+                    || config.learners().contains(&self.config.node_id)
+                {
+                    self.removed_after = None;
+                }
                 self.joint = Some(JointState {
                     old_voters: self.voters.clone(),
                     new_voters: config.voters().to_vec(),
@@ -536,6 +559,11 @@ impl RaftCore {
                 self.learners = config.learners().iter().copied().collect();
                 self.leave_index = Some(entry.index);
                 self.pending_config = Some(entry.index);
+                if !self.voters.contains(&self.config.node_id)
+                    && !self.learners.contains(&self.config.node_id)
+                {
+                    self.removed_after = Some(entry.index);
+                }
             }
             EntryKind::Normal | EntryKind::NoOp => {}
         }
@@ -552,11 +580,13 @@ impl RaftCore {
             self.joint = None;
             self.pending_config = None;
             self.leave_index = None;
+            self.removed_after = None;
         } else if self.leave_index.is_some_and(|leave| trunc_idx <= leave) {
             self.voters.clone_from(&joint.new_voters);
             self.learners.clone_from(&joint.new_learners);
             self.leave_index = None;
             self.pending_config = Some(joint.enter_index);
+            self.removed_after = None;
         }
     }
 
@@ -604,15 +634,46 @@ impl RaftCore {
         }
     }
 
-    /// Returns true when `node` may send protocol messages: a voter or a
-    /// learner in the effective config. A node with an empty voter set and
-    /// no joint state is still joining: it accepts appends and snapshots
-    /// from anyone so the cluster can configure it.
+    /// Returns true when `node` is a voter or a learner in the effective
+    /// config. A node with an empty voter set and no joint state is still
+    /// joining: it accepts traffic from anyone so the cluster can configure
+    /// it.
     fn is_member_sender(&self, node: NodeId) -> bool {
         if self.voters.is_empty() && self.joint.is_none() {
             return true;
         }
         self.is_effective_voter(node) || self.learners.contains(&node)
+    }
+
+    /// Returns true when `from` may send `message`.
+    ///
+    /// Election and transfer traffic is limited to members so a removed
+    /// server cannot disrupt the cluster. Replication requests are accepted
+    /// from any sender: a follower that missed a membership change while
+    /// partitioned still holds the old config, where the current leader is a
+    /// stranger, and ignoring its appends would strand that follower
+    /// forever. Log matching and the receiver-side commit clamp keep such
+    /// appends safe.
+    fn accepts_sender(&self, from: NodeId, message: &Message) -> bool {
+        match message {
+            Message::AppendEntriesRequest { .. }
+            | Message::HeartbeatRequest { .. }
+            | Message::InstallSnapshotRequest { .. } => true,
+            _ => self.is_member_sender(from),
+        }
+    }
+
+    /// Returns true when this node answers a candidate whose last log index
+    /// is `candidate_last`. Voters always do. A node removed by a committed
+    /// `LeaveJoint` also answers once the candidate's log covers that entry:
+    /// the candidate still counts this node in its joint old quorum, and
+    /// refusing would deadlock the handover.
+    fn may_grant_vote(&self, candidate_last: LogIndex) -> bool {
+        if self.is_effective_voter(self.config.node_id) {
+            return true;
+        }
+        self.removed_after
+            .is_some_and(|leave| candidate_last >= leave)
     }
 
     /// Returns true when this node may campaign: voters only, never learners,
@@ -840,7 +901,7 @@ impl RaftCore {
         // Only voters grant pre-votes. Learners, removed nodes, and nodes
         // under repair answer false so they can never feed a quorum.
         let grant = self.repair_from.is_none()
-            && self.is_effective_voter(self.config.node_id)
+            && self.may_grant_vote(last_log_index)
             && term >= self.term
             && is_log_ok
             && (!self.leader_sticky || self.role == Role::Leader);
@@ -943,7 +1004,7 @@ impl RaftCore {
             && can_vote
             && is_log_ok
             && self.repair_from.is_none()
-            && self.is_effective_voter(self.config.node_id);
+            && self.may_grant_vote(last_log_index);
 
         if grant {
             self.voted_for = Some(candidate_id);
@@ -2399,8 +2460,10 @@ impl RaftCore {
     #[allow(clippy::too_many_lines)]
     fn handle_message(&mut self, from: NodeId, message: Message, output: &mut Output) {
         // Removed servers and strangers cannot disrupt the cluster: only
-        // voters and learners in the effective config get a hearing.
-        if !self.is_member_sender(from) {
+        // voters and learners in the effective config get a hearing. The
+        // sole exception is replication from a leader this node does not
+        // know yet.
+        if !self.accepts_sender(from, &message) {
             sometimes!(output.sometimes_hits, "raft.unknown.sender");
             return;
         }

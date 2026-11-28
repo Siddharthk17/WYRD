@@ -48,6 +48,84 @@ pub use crate::network::PlanNet;
 /// wherever both cover an index.
 pub type CommittedArchive = BTreeMap<LogIndex, (Term, anvil_types::EntryKind, Option<Bytes>)>;
 
+/// One pending membership change with the tick it stops being retried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingReconfig {
+    /// Absolute node ids (stable across membership changes).
+    pub op: ReconfigOp,
+    /// Tick at which the intent expires.
+    pub deadline: u64,
+}
+
+/// Membership operations the nemesis can request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconfigOp {
+    /// Add a node as a learner.
+    Add(NodeId),
+    /// Remove a node from voters (and learners).
+    Remove(NodeId),
+    /// Replace a node whose storage is lost with a fresh node id.
+    Replace { old: NodeId, new: NodeId },
+    /// Promote a caught-up learner to voter.
+    Promote(NodeId),
+}
+
+/// Consecutive ticks a learner must stay within the catch-up lag bound
+/// before the nemesis promotes it.
+const RECONFIG_PROMOTE_TICKS: u64 = 10;
+/// Maximum log lag (entries behind the leader tip) for promotion readiness.
+const RECONFIG_LAG_BOUND: u64 = 4;
+
+/// Reconfiguration driver state, evolved only from executed steps (never
+/// from a mid-run generator), so shrinking a plan never reshuffles it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReconfigState {
+    /// Membership intents waiting for a leader, with deadlines.
+    pub pending: Vec<PendingReconfig>,
+    /// Consecutive ticks each learner stayed within the catch-up lag bound.
+    pub catchup_ticks: BTreeMap<NodeId, u64>,
+    /// Replace awaiting the new node's catch-up: (old, new).
+    pub pending_replace: Option<(NodeId, NodeId)>,
+    /// Nodes awaiting removal from the simulator once the committed config
+    /// no longer includes them. Removing from the sim early would break the
+    /// old-side quorum that joint consensus still needs.
+    pub pending_removal: Vec<(NodeId, u64)>,
+}
+
+/// Proposes a membership change on the current leader, if any. Returns true
+/// when the core accepted the proposal into its log.
+fn propose_config_inner(
+    cluster: &mut SimCluster,
+    voters: Vec<NodeId>,
+    learners: Vec<NodeId>,
+) -> bool {
+    let Some(leader) = cluster.leader() else {
+        return false;
+    };
+    let before = cluster.nodes.get(&leader).map(|core| {
+        (
+            core.membership_voters(),
+            core.membership_learners(),
+            core.in_joint(),
+        )
+    });
+    if before.as_ref().is_some_and(|(_, _, joint)| *joint) {
+        return false;
+    }
+    cluster.step_node(
+        leader,
+        anvil_raft::Input::ProposeConfig { voters, learners },
+    );
+    let after = cluster.nodes.get(&leader).map(|core| {
+        (
+            core.membership_voters(),
+            core.membership_learners(),
+            core.in_joint(),
+        )
+    });
+    before != after
+}
+
 /// Simulated storage layer for a single Raft node, holding its real `StorageEngine` and `SimDevice`.
 pub struct SimNodeStorage {
     /// Simulated disk device with fault injection and volatile page cache.
@@ -157,6 +235,12 @@ pub struct SimCluster {
     pub tick_rate_per_mille: BTreeMap<NodeId, u64>,
     /// Fractional tick credit accumulated for skewed nodes.
     tick_credit_mille: BTreeMap<NodeId, u64>,
+    /// Reconfiguration driver state: pending membership intents with
+    /// deadlines, per-learner catch-up counters, and in-flight replaces.
+    pub reconfig: ReconfigState,
+    /// Device configuration shared by every node (including members added
+    /// later), so joiners get identical disks.
+    dev_config: SimDeviceConfig,
     /// Nodes currently paused. A paused node steps no ticks and drops no
     /// state; missed ticks fire as a burst on resume.
     paused: BTreeSet<NodeId>,
@@ -284,6 +368,7 @@ impl SimCluster {
             configs,
             storage,
             master_seed,
+            dev_config: dev_config.clone(),
             current_tick: 0,
             network: SimNetwork::new(),
             plan_net: None,
@@ -292,6 +377,7 @@ impl SimCluster {
             restart_counts: BTreeMap::new(),
             tick_rate_per_mille: BTreeMap::new(),
             tick_credit_mille: BTreeMap::new(),
+            reconfig: ReconfigState::default(),
             paused: BTreeSet::new(),
             paused_missed: BTreeMap::new(),
             completed_reads: BTreeMap::new(),
@@ -303,6 +389,425 @@ impl SimCluster {
             last_projection: BTreeMap::new(),
             last_commit_before_crash: BTreeMap::new(),
             output_scratch: Output::new(),
+        }
+    }
+
+    /// Adds a node as a learner with empty storage: it waits to be
+    /// configured, follows the log or a snapshot, and never votes until
+    /// promoted. Idempotent for known ids.
+    pub fn add_node(&mut self, node_id: NodeId) {
+        if self.nodes.contains_key(&node_id) || node_id.get() == 0 {
+            return;
+        }
+        let mut peer_set = BTreeSet::new();
+        for &peer in self.nodes.keys() {
+            if peer != node_id {
+                peer_set.insert(peer);
+            }
+        }
+        let mut learner_set = BTreeSet::new();
+        learner_set.insert(node_id);
+        let config = RaftConfig {
+            cluster_id: ClusterId::from_raw(1),
+            learners: learner_set,
+            node_id,
+            peers: peer_set,
+            election_timeout_ticks: 10,
+            heartbeat_interval_ticks: 3,
+            max_inflight_messages: 256,
+            max_bytes_per_message: 64 * 1024,
+            pre_vote_enabled: true,
+            check_quorum: true,
+        };
+        assert!(
+            config.validate().is_ok(),
+            "joining node needs a valid RaftConfig"
+        );
+        let path = format!("cluster/node/{}/join", node_id.get());
+        let seed = derive_component_seed(self.master_seed, &path);
+        let rng = ChaCha8Rng::from_seed(seed);
+        let core = RaftCore::new(config.clone(), RecoveredState::default(), rng);
+        self.nodes.insert(node_id, core);
+        self.configs.insert(node_id, config);
+
+        let storage_config = StorageConfig::for_test(SectorSize::Sector512, 64 * 1024);
+        let dev_rng = DetRng::new(
+            self.master_seed,
+            &format!("cluster/storage/{}", node_id.get()),
+        );
+        let mut sim_dev = SimDevice::new(self.dev_config.clone(), dev_rng);
+        if let Some(shared_atlas) = &self.fault_atlas {
+            sim_dev = sim_dev.with_atlas(shared_atlas.clone(), node_id);
+        }
+        init_node_storage(&mut sim_dev, &storage_config);
+        let engine = StorageEngine::new_empty(storage_config.clone());
+        self.storage.insert(
+            node_id,
+            SimNodeStorage {
+                device: sim_dev,
+                engine,
+                engine_output: EngineOutput::default(),
+                crashed: false,
+                needs_repair: false,
+                repair_from: None,
+                refused_start: false,
+                acknowledged_entries: Vec::new(),
+                pending_ack_entries: BTreeMap::new(),
+                pending_ack_votes: BTreeMap::new(),
+                next_internal_token: u64::MAX,
+                persisted_votes: BTreeMap::new(),
+                config: storage_config,
+            },
+        );
+        self.tick_rate_per_mille.insert(node_id, 1000);
+        self.trace_line(format!("{node_id:?} added as learner"));
+    }
+
+    /// Removes a node from the cluster. In-flight messages to and from it
+    /// are dropped on delivery, and senders outside the config are ignored
+    /// by the core, so a removed node cannot disrupt the survivors.
+    pub fn remove_node(&mut self, node_id: NodeId) {
+        self.nodes.remove(&node_id);
+        self.storage.remove(&node_id);
+        self.configs.remove(&node_id);
+        self.restart_counts.remove(&node_id);
+        self.tick_rate_per_mille.remove(&node_id);
+        self.tick_credit_mille.remove(&node_id);
+        self.paused.remove(&node_id);
+        self.paused_missed.remove(&node_id);
+        self.completed_reads.remove(&node_id);
+        self.snapshot_requests.remove(&node_id);
+        self.ready_snapshots.remove(&node_id);
+        self.last_projection.remove(&node_id);
+        self.last_commit_before_crash.remove(&node_id);
+        self.reconfig.catchup_ticks.remove(&node_id);
+        self.reconfig.pending.retain(|intent| match &intent.op {
+            ReconfigOp::Add(id) | ReconfigOp::Remove(id) | ReconfigOp::Promote(id) => {
+                *id != node_id
+            }
+            ReconfigOp::Replace { old, new } => *old != node_id && *new != node_id,
+        });
+        if self
+            .reconfig
+            .pending_replace
+            .is_some_and(|(old, new)| old == node_id || new == node_id)
+        {
+            self.reconfig.pending_replace = None;
+        }
+        self.reconfig
+            .pending_removal
+            .retain(|(node, _)| *node != node_id);
+        self.trace_line(format!("{node_id:?} removed from the cluster"));
+    }
+
+    /// Returns voters and learners in the leader's applied config, or all
+    /// live nodes when there is no leader.
+    #[must_use]
+    pub fn live_members(&self) -> Vec<NodeId> {
+        let Some(leader) = self.leader() else {
+            return self.nodes.keys().copied().collect();
+        };
+        let Some(core) = self.nodes.get(&leader) else {
+            return self.nodes.keys().copied().collect();
+        };
+        let mut members = core.membership_voters();
+        for learner in core.membership_learners() {
+            if !members.contains(&learner) {
+                members.push(learner);
+            }
+        }
+        members.sort();
+        members
+    }
+
+    /// Returns the current effective voters from the leader's view, or an
+    /// empty set when there is no leader.
+    #[must_use]
+    pub fn live_voters(&self) -> Vec<NodeId> {
+        self.leader()
+            .and_then(|leader| self.nodes.get(&leader))
+            .map_or_else(Vec::new, |core| {
+                let mut voters = core.membership_voters();
+                voters.sort();
+                voters
+            })
+    }
+
+    /// Returns whether a node is currently tracked as a learner by the
+    /// leader (or by its own config when there is no leader).
+    #[must_use]
+    pub fn is_node_learner(&self, node_id: NodeId) -> bool {
+        if let Some(core) = self.leader().and_then(|leader| self.nodes.get(&leader)) {
+            return core.membership_learners().contains(&node_id);
+        }
+        self.nodes
+            .get(&node_id)
+            .is_some_and(|core| core.membership_learners().contains(&node_id))
+            || self
+                .configs
+                .get(&node_id)
+                .is_some_and(|cfg| cfg.learners.contains(&node_id))
+    }
+
+    /// Advances the reconfiguration nemesis one tick: retries pending
+    /// membership intents, auto-promotes caught-up learners, and advances
+    /// in-flight replaces. Every decision derives from committed core
+    /// state; nothing is drawn mid-run, so shrinking a plan never
+    /// reshuffles the driver.
+    pub fn drive_reconfig(&mut self) {
+        let now = self.current_tick;
+        let expired: Vec<_> = self
+            .reconfig
+            .pending
+            .iter()
+            .filter(|intent| intent.deadline < now)
+            .map(|intent| intent.op)
+            .collect();
+        self.reconfig
+            .pending
+            .retain(|intent| intent.deadline >= now);
+        for op in expired {
+            if let ReconfigOp::Add(node) = op {
+                let in_config = self
+                    .leader()
+                    .and_then(|leader| self.nodes.get(&leader))
+                    .is_some_and(|core| {
+                        core.membership_snapshot().voters.contains(&node)
+                            || core.membership_snapshot().learners.contains(&node)
+                    });
+                if !in_config && self.nodes.contains_key(&node) {
+                    self.trace_line(format!("{node:?} add expired; node discarded"));
+                    self.remove_node(node);
+                }
+            }
+        }
+        if let Some(intent) = self.reconfig.pending.first().cloned() {
+            if self.try_reconfig_op(&intent.op) {
+                self.reconfig.pending.remove(0);
+            } else {
+                self.trace_line(format!("reconfig rejected: {:?}", intent.op));
+                sometimes!(self.sometimes_hits, "sim.reconfig.rejected");
+            }
+        }
+        self.auto_promote_caught_up();
+        self.advance_replace();
+        self.retire_removed_nodes();
+        let learners: Vec<NodeId> = self.reconfig.catchup_ticks.keys().copied().collect();
+        let mut live_learners = Vec::new();
+        for node in learners {
+            if self.is_node_learner(node) {
+                live_learners.push(node);
+            }
+        }
+        let live_set: std::collections::BTreeSet<NodeId> = live_learners.into_iter().collect();
+        self.reconfig
+            .catchup_ticks
+            .retain(|node, _| live_set.contains(node));
+    }
+
+    /// Retires sim nodes once the committed config has dropped them and the
+    /// joint gate has closed. An expired intent is discarded so a rejected
+    /// removal does not leave a node sidelined forever.
+    fn retire_removed_nodes(&mut self) {
+        let now = self.current_tick;
+        let mut retire = Vec::new();
+        let snapshot = self
+            .leader()
+            .and_then(|leader| self.nodes.get(&leader))
+            .map(anvil_raft::RaftCore::membership_snapshot);
+        let mut keep = Vec::new();
+        for (node, deadline) in std::mem::take(&mut self.reconfig.pending_removal) {
+            if let Some(snap) = &snapshot {
+                let present = snap.voters.contains(&node) || snap.learners.contains(&node);
+                if !present && snap.joint.is_none() {
+                    retire.push(node);
+                    continue;
+                }
+            }
+            if deadline >= now {
+                keep.push((node, deadline));
+            }
+        }
+        self.reconfig.pending_removal = keep;
+        for node in retire {
+            self.trace_line(format!("{node:?} retired from the config"));
+        }
+    }
+
+    /// Schedules a node for simulator retirement after its removal commits.
+    fn schedule_removal(&mut self, node: NodeId) {
+        if !self
+            .reconfig
+            .pending_removal
+            .iter()
+            .any(|(candidate, _)| *candidate == node)
+        {
+            self.reconfig
+                .pending_removal
+                .push((node, self.current_tick + 200));
+        }
+    }
+
+    /// Attempts one membership op on the current leader. Returns true when
+    /// the core took the proposal.
+    fn try_reconfig_op(&mut self, op: &ReconfigOp) -> bool {
+        let Some(leader) = self.leader() else {
+            return false;
+        };
+        let Some(core) = self.nodes.get(&leader) else {
+            return false;
+        };
+        let snapshot = core.membership_snapshot();
+        let mut voters = snapshot.voters.clone();
+        let mut learners: Vec<NodeId> = snapshot.learners.clone();
+        match *op {
+            ReconfigOp::Add(node) => {
+                if voters.contains(&node) || learners.contains(&node) {
+                    return true;
+                }
+                if !self.nodes.contains_key(&node) {
+                    self.add_node(node);
+                }
+                learners.push(node);
+            }
+            ReconfigOp::Remove(node) => {
+                if !voters.contains(&node) && !learners.contains(&node) {
+                    return true;
+                }
+                voters.retain(|voter| *voter != node);
+                learners.retain(|learner| *learner != node);
+            }
+            ReconfigOp::Replace { old, new } => {
+                if !voters.contains(&old) && !learners.contains(&old) {
+                    return true;
+                }
+                if voters.contains(&new) || learners.contains(&new) {
+                    self.schedule_removal(old);
+                    return true;
+                }
+                self.add_node(new);
+                learners.push(new);
+                self.reconfig.pending_replace = Some((old, new));
+            }
+            ReconfigOp::Promote(node) => {
+                if voters.contains(&node) {
+                    return true;
+                }
+                if !learners.contains(&node) {
+                    return false;
+                }
+                voters.push(node);
+                learners.retain(|learner| *learner != node);
+            }
+        }
+        let accepted = propose_config_inner(self, voters, learners);
+        if accepted && let ReconfigOp::Remove(node) | ReconfigOp::Replace { old: node, .. } = *op {
+            self.schedule_removal(node);
+        }
+        accepted
+    }
+
+    /// Promotes learners that stayed within the catch-up lag bound long
+    /// enough. A leader that just won an election has no match history
+    /// yet, so unknown lags reset the counter instead of promoting blind.
+    fn auto_promote_caught_up(&mut self) {
+        let Some(leader) = self.leader() else {
+            return;
+        };
+        let tip = self
+            .nodes
+            .get(&leader)
+            .map_or(LogIndex::from_raw(0), anvil_raft::RaftCore::last_log_index);
+        let learners: Vec<NodeId> = self.nodes.get(&leader).map_or_else(Vec::new, |core| {
+            core.membership_learners().iter().copied().collect()
+        });
+        for learner in learners {
+            let lagged = self
+                .nodes
+                .get(&leader)
+                .and_then(|core| core.progress().get(&learner))
+                .is_none_or(|progress| {
+                    tip.as_u64().saturating_sub(progress.match_index.as_u64()) > RECONFIG_LAG_BOUND
+                });
+            let ticks = self.reconfig.catchup_ticks.entry(learner).or_insert(0);
+            if lagged {
+                *ticks = 0;
+            } else {
+                *ticks = ticks.saturating_add(1);
+            }
+            if *ticks >= RECONFIG_PROMOTE_TICKS {
+                *ticks = 0;
+                let mut voters = self
+                    .nodes
+                    .get(&leader)
+                    .map_or_else(Vec::new, anvil_raft::RaftCore::membership_voters);
+                if !voters.contains(&learner) {
+                    voters.push(learner);
+                    voters.sort();
+                    let learners: Vec<NodeId> =
+                        self.nodes.get(&leader).map_or_else(Vec::new, |core| {
+                            core.membership_learners()
+                                .iter()
+                                .copied()
+                                .filter(|id| *id != learner)
+                                .collect()
+                        });
+                    propose_config_inner(self, voters, learners);
+                }
+            }
+        }
+    }
+
+    /// Advances an in-flight replace: once the new node catches up, one
+    /// joint move swaps it in for the old node.
+    fn advance_replace(&mut self) {
+        let Some((old, new)) = self.reconfig.pending_replace else {
+            return;
+        };
+        let Some(leader) = self.leader() else {
+            return;
+        };
+        let (ready, already_swapped, voters, learners) = match self.nodes.get(&leader) {
+            Some(core) => {
+                let ready = core.membership_learners().contains(&new)
+                    && core.progress().get(&new).is_some_and(|progress| {
+                        core.last_log_index()
+                            .as_u64()
+                            .saturating_sub(progress.match_index.as_u64())
+                            <= RECONFIG_LAG_BOUND
+                    });
+                let swapped = {
+                    let current: Vec<NodeId> = core.membership_voters();
+                    !current.contains(&old) && current.contains(&new)
+                };
+                let mut next_voters: Vec<NodeId> = core
+                    .membership_voters()
+                    .iter()
+                    .copied()
+                    .filter(|voter| *voter != old)
+                    .collect();
+                next_voters.push(new);
+                next_voters.sort();
+                next_voters.dedup();
+                let next_learners: Vec<NodeId> = core
+                    .membership_learners()
+                    .iter()
+                    .copied()
+                    .filter(|id| *id != new)
+                    .collect();
+                (ready, swapped, next_voters, next_learners)
+            }
+            None => return,
+        };
+        if already_swapped {
+            self.reconfig.pending_replace = None;
+            return;
+        }
+        if !ready {
+            return;
+        }
+        if propose_config_inner(self, voters, learners) {
+            self.trace_line(format!("replace {old:?} with {new:?} proposed"));
         }
     }
 
@@ -532,6 +1037,10 @@ impl SimCluster {
         self.sometimes_hits
             .append(&mut self.output_scratch.sometimes_hits);
         fresh_reads.append(&mut self.output_scratch.completed_reads);
+        let member_events = std::mem::take(&mut self.output_scratch.membership_events);
+        for event in member_events {
+            self.trace_line(format!("{node_id:?} membership {event:?}"));
+        }
         self.stash_snapshot_outputs(node_id);
 
         let outbound = std::mem::take(&mut self.output_scratch.messages);
@@ -615,6 +1124,10 @@ impl SimCluster {
                 }
                 self.sometimes_hits
                     .append(&mut self.output_scratch.sometimes_hits);
+                let member_events = std::mem::take(&mut self.output_scratch.membership_events);
+                for event in member_events {
+                    self.trace_line(format!("{node_id:?} membership {event:?}"));
+                }
                 self.stash_snapshot_outputs(node_id);
                 let follow_up = std::mem::take(&mut self.output_scratch.messages);
                 for msg in follow_up {
@@ -654,6 +1167,10 @@ impl SimCluster {
                 self.sometimes_hits
                     .append(&mut self.output_scratch.sometimes_hits);
                 fresh_reads.append(&mut self.output_scratch.completed_reads);
+                let member_events = std::mem::take(&mut self.output_scratch.membership_events);
+                for event in member_events {
+                    self.trace_line(format!("{node_id:?} membership {event:?}"));
+                }
                 self.stash_snapshot_outputs(node_id);
             }
 

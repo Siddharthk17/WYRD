@@ -825,3 +825,79 @@ fn test_repair_zero_index_ignored() {
     assert!(leader.repair_from().is_none());
     assert_eq!(leader.role(), Role::Leader);
 }
+
+#[test]
+fn test_stale_config_accepts_replication_from_unknown_leader() {
+    // Node 1 was partitioned while the cluster added nodes 4, 5 and 6, so
+    // its config is still {1, 2, 3} and the new leader (4) is a stranger to
+    // it. Dropping the leader's appends would strand node 1 forever.
+    let mut follower = make_core(1, &[2, 3], &[], 11);
+    let mut output = Output::new();
+
+    let new_config = ClusterConfig::new(
+        vec![node_id(1), node_id(2), node_id(4), node_id(5), node_id(6)],
+        vec![],
+    )
+    .unwrap();
+    let enter = config_entry(
+        EntryKind::EnterJoint,
+        LogIndex::from_raw(1),
+        Term::from_raw(1),
+        &new_config,
+    );
+    let leave = config_entry(
+        EntryKind::LeaveJoint,
+        LogIndex::from_raw(2),
+        Term::from_raw(1),
+        &new_config,
+    );
+
+    follower.step(
+        Input::Recv {
+            from: node_id(4),
+            message: Message::AppendEntriesRequest {
+                term: Term::from_raw(1),
+                leader_id: node_id(4),
+                prev_log_index: LogIndex::from_raw(0),
+                prev_log_term: Term::from_raw(0),
+                entries: vec![enter, leave],
+                leader_commit: LogIndex::from_raw(2),
+            },
+        },
+        &mut output,
+    );
+    ack_persists(&mut follower, &mut output);
+
+    assert!(
+        output.messages.iter().any(|message| matches!(
+            &message.message,
+            Message::AppendEntriesResponse { success: true, .. }
+        )),
+        "a stale follower must answer the new leader"
+    );
+    assert_eq!(follower.role(), Role::Follower);
+    assert_eq!(follower.term(), Term::from_raw(1));
+    assert_eq!(follower.commit_index(), LogIndex::from_raw(2));
+    assert_eq!(
+        follower.membership_voters(),
+        vec![node_id(1), node_id(2), node_id(4), node_id(5), node_id(6)]
+    );
+
+    // Election traffic from a stranger is still refused.
+    let term_before = follower.term();
+    output.clear();
+    follower.step(
+        Input::Recv {
+            from: node_id(99),
+            message: Message::RequestVoteRequest {
+                term: Term::from_raw(50),
+                candidate_id: node_id(99),
+                last_log_index: LogIndex::from_raw(50),
+                last_log_term: Term::from_raw(50),
+            },
+        },
+        &mut output,
+    );
+    assert_eq!(follower.term(), term_before);
+    assert!(output.messages.is_empty());
+}

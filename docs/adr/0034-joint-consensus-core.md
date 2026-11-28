@@ -25,8 +25,11 @@ ignore nodes the config removed.
   not committed an entry in its own term. Refusals surface as
   `MembershipEvent::Rejected`.
 - Only effective voters grant votes and campaign. Learners follow the log
-  but never vote and never start elections. Messages from senders outside
-  the effective config are dropped and counted as `raft.unknown.sender`.
+  but never vote and never start elections. Election and transfer
+  messages from senders outside the effective config are dropped and
+  counted as `raft.unknown.sender`; replication requests are accepted
+  from any sender so a follower holding a stale config can catch up
+  (ADR 0037).
 - A removed leader sends `TimeoutNow` to a remaining voter, steps down,
   and emits `RemovedSteppedDown`. Truncation rolls membership back when it
   removes the joint entry.
