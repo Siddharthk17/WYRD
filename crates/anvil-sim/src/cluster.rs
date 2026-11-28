@@ -23,6 +23,7 @@ use anvil_storage::{
     WalSegmentHeader,
     format::wal::{WAL_RECORD_HEADER_FIXED_LEN, WalScanResult, decode_wal_frame},
 };
+use anvil_types::mutants::{MutantId, is};
 use anvil_types::{ClusterId, Entry, LogIndex, NodeId, Term, sometimes};
 use bytes::Bytes;
 use rand_chacha::ChaCha8Rng;
@@ -568,16 +569,11 @@ impl SimCluster {
             .retain(|intent| intent.deadline >= now);
         for op in expired {
             if let ReconfigOp::Add(node) = op {
-                let in_config = self
-                    .leader()
-                    .and_then(|leader| self.nodes.get(&leader))
-                    .is_some_and(|core| {
-                        core.membership_snapshot().voters.contains(&node)
-                            || core.membership_snapshot().learners.contains(&node)
-                    });
-                if !in_config && self.nodes.contains_key(&node) {
-                    self.trace_line(format!("{node:?} add expired; node discarded"));
-                    self.remove_node(node);
+                // An expired intent stops retries only. The node stays in
+                // the simulator because a committed config may still name
+                // it; deleting it would make that quorum impossible to form.
+                if self.nodes.contains_key(&node) {
+                    self.trace_line(format!("{node:?} add expired; node retired"));
                 }
             }
         }
@@ -2101,6 +2097,9 @@ impl SimCluster {
         archive: Option<&CommittedArchive>,
         peer_commit: Option<LogIndex>,
     ) -> bool {
+        if is(MutantId::M20) {
+            return true;
+        }
         if entry.index != expected || entry.index.is_zero() {
             return false;
         }
