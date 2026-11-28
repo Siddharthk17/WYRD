@@ -8,6 +8,7 @@ authors.workspace = true
 [features]
 default = []
 arbitrary = ["dep:arbitrary"]
+mutants = []
 
 [dependencies]
 bytes = { workspace = true }

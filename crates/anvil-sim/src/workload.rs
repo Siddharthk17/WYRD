@@ -31,6 +31,7 @@ use crate::rng::DetRng;
 use anvil_check::{ClientOp, History, HistoryOp, OpResult};
 use anvil_kv::{KvCommand, KvConfig, KvResponse, KvStore, SnapshotPolicy};
 use anvil_raft::{Input, ReceivedSnapshot, SnapshotChunkData};
+use anvil_types::mutants::{MutantId, is};
 use anvil_types::{LogIndex, MembershipSnapshot, NodeId, SeqNo, SessionId, sometimes};
 use bytes::Bytes;
 use std::collections::BTreeMap;
@@ -377,6 +378,7 @@ fn run_kv_plan_inner(
     stale_canary: bool,
     trace: bool,
 ) -> (History, bool, SnapshotStats, Vec<String>) {
+    let stale_canary = stale_canary || is(MutantId::M05) || is(MutantId::M06);
     let fault_window = FaultWindow::new(&plan);
     let mut cluster = if storage_faults {
         let dev =
@@ -1399,7 +1401,11 @@ fn apply_all(
         let Some(core) = cluster.nodes.get(&id) else {
             continue;
         };
-        let commit = core.commit_index();
+        let commit = if is(MutantId::M08) {
+            core.last_log_index()
+        } else {
+            core.commit_index()
+        };
         let from = applied.get(&id).copied().unwrap_or_default();
         // A truncated suffix (conflict repair or torn-tail recovery) leaves
         // store effects the log no longer has. Detect the divergence and

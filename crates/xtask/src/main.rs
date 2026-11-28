@@ -44,6 +44,11 @@ enum Commands {
     },
     /// Run performance and instruction-count benchmarks
     Bench,
+    /// Run the hand-authored mutant kill matrix (`ID` is M01..M20 or `all`)
+    Mutant {
+        /// Mutant id, or `all` for the full matrix
+        id: String,
+    },
     /// Run cargo-fuzz harness targets
     Fuzz {
         #[arg(long, default_value_t = 60)]
@@ -285,6 +290,16 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Commands::Repro { plan } => run_repro_command(&plan),
+        Commands::Mutant { id } => match xtask::mutant::run_mutant_matrix(
+            &std::env::current_dir().unwrap_or_default(),
+            &id,
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("Mutant gate error: {err}");
+                ExitCode::FAILURE
+            }
+        },
         Commands::Fuzz { duration_secs } => match xtask::fuzz::run_fuzz(duration_secs) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {

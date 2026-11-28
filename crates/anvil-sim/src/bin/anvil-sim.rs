@@ -6,6 +6,7 @@
 //! [--resume] [--time-budget SECS]`
 
 use anvil_sim::{FarmOptions, FarmProfile, FarmRange, run_farm_range};
+use anvil_types::MutantId;
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser)]
@@ -47,6 +48,10 @@ struct FarmArgs {
     /// of at least 100,000 seeds; small runs cannot reach every rare path.
     #[arg(long, default_value_t = false)]
     require_sometimes_coverage: bool,
+    /// Hand-authored mutation to inject (`M01`..`M20`, or `none`). Requires
+    /// the `mutants` feature; without it the selection is ignored.
+    #[arg(long, default_value = "none")]
+    mutant: String,
 }
 
 /// Trace one seed: consensus and client events in tick order.
@@ -87,6 +92,15 @@ fn run_farm(args: FarmArgs) {
         eprintln!("anvil-sim farm: {err}");
         std::process::exit(2);
     });
+    let mutant = if args.mutant.eq_ignore_ascii_case("none") {
+        None
+    } else {
+        Some(MutantId::parse(&args.mutant).unwrap_or_else(|| {
+            eprintln!("anvil-sim farm: unknown mutant '{}'", args.mutant);
+            std::process::exit(2);
+        }))
+    };
+    anvil_types::mutants::set_active(mutant);
     let jobs = args.jobs.unwrap_or_else(|| {
         std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get)
     });

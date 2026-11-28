@@ -12,6 +12,7 @@ use crate::format::wal::{
 use crate::recovery::{
     FramePlacement, LogRecoveryClassification, RecoveredLog, RecoveredStorageState,
 };
+use anvil_types::mutants::{MutantId, is};
 use anvil_types::{Entry, LogIndex, NodeId, Term};
 use bytes::Bytes;
 use std::collections::{BTreeMap, VecDeque};
@@ -1036,7 +1037,9 @@ impl StorageEngine {
     }
 
     fn handle_completion(&mut self, completion: &DeviceCompletion, output: &mut EngineOutput) {
-        if let Err(e) = &completion.result {
+        if let Err(e) = &completion.result
+            && !is(MutantId::M16)
+        {
             self.fatal_error = Some(e.clone());
             return;
         }
@@ -1197,7 +1200,7 @@ impl StorageEngine {
                             }
                         }
 
-                        if has_valid_after {
+                        if has_valid_after && !is(MutantId::M15) {
                             classification = LogRecoveryClassification::MidLogCorruption {
                                 corrupt_index: last_index.next().unwrap_or(last_index),
                                 corrupt_offset: offset as u64,

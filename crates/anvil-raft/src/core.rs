@@ -11,6 +11,7 @@ use crate::types::{
     RaftConfig, ReadIndexResult, ReceivedSnapshot, RecoveredState, Role, RoleChangeEvent,
     SnapshotChunkData, SnapshotRequest, SpecProjection,
 };
+use anvil_types::mutants::{MutantId, is};
 use anvil_types::{
     ClusterConfig, Entry, EntryKind, JointSnapshot, LogIndex, MembershipSnapshot, NodeId, Term,
     config_entry, decode_config_entry, sometimes,
@@ -127,7 +128,7 @@ pub struct RaftCore {
     /// node still answers vote requests from candidates whose log includes
     /// that entry; otherwise joint consensus deadlocks when the removed node
     /// is the only old-quorum partner left.
-    removed_after: Option<LogIndex>,
+    removed_after: Option<(LogIndex, Term)>,
     committed_current_term: bool,
     installed_base: Option<LogIndex>,
     repair_from: Option<LogIndex>,
@@ -188,7 +189,11 @@ impl RaftCore {
         let mut core = Self {
             config,
             term: recovered.current_term,
-            voted_for: recovered.voted_for,
+            voted_for: if is(MutantId::M11) {
+                None
+            } else {
+                recovered.voted_for
+            },
             role: Role::Follower,
             log: RaftLog::new(recovered.entries.clone()),
             commit_index: recovered.commit_index,
@@ -423,7 +428,7 @@ impl RaftCore {
             && !self.voters.contains(&self.config.node_id)
             && !self.learners.contains(&self.config.node_id)
         {
-            Some(base)
+            Some((base, self.log.term_at(base).unwrap_or_default()))
         } else {
             None
         };
@@ -562,7 +567,7 @@ impl RaftCore {
                 if !self.voters.contains(&self.config.node_id)
                     && !self.learners.contains(&self.config.node_id)
                 {
-                    self.removed_after = Some(entry.index);
+                    self.removed_after = Some((entry.index, entry.term));
                 }
             }
             EntryKind::Normal | EntryKind::NoOp => {}
@@ -663,24 +668,27 @@ impl RaftCore {
         }
     }
 
-    /// Returns true when this node answers a candidate whose last log index
-    /// is `candidate_last`. Voters always do. A node removed by a committed
-    /// `LeaveJoint` also answers once the candidate's log covers that entry:
-    /// the candidate still counts this node in its joint old quorum, and
-    /// refusing would deadlock the handover.
-    fn may_grant_vote(&self, candidate_last: LogIndex) -> bool {
-        if self.is_effective_voter(self.config.node_id) {
+    /// Returns true when this node answers a candidate whose last entry is
+    /// (`candidate_last`, `candidate_term`). Voters always do. A node removed
+    /// by a committed `LeaveJoint` answers only during that leave's term and
+    /// only when the candidate's log covers it: the candidate still counts
+    /// this node in its joint old quorum, and refusing would deadlock the
+    /// handover. A later-term stale-config candidate must not use the
+    /// removed node's vote to overwrite committed entries.
+    fn may_grant_vote(&self, candidate_last: LogIndex, _candidate_term: Term) -> bool {
+        if is(MutantId::M19) || self.is_effective_voter(self.config.node_id) {
             return true;
         }
         self.removed_after
-            .is_some_and(|leave| candidate_last >= leave)
+            .is_some_and(|(leave, _)| candidate_last >= leave)
     }
 
     /// Returns true when this node may campaign: voters only, never learners,
     /// never nodes removed from the effective config, and never nodes under
     /// repair.
     fn can_campaign(&self) -> bool {
-        self.repair_from.is_none() && self.is_effective_voter(self.config.node_id)
+        self.repair_from.is_none()
+            && (is(MutantId::M19) || self.is_effective_voter(self.config.node_id))
     }
 
     /// Majority quorum size for `count` voters.
@@ -691,7 +699,11 @@ impl RaftCore {
     /// Match index the leader attributes to `node`.
     fn match_of(&self, node: NodeId) -> LogIndex {
         if node == self.config.node_id {
-            return self.leader_persisted_index;
+            return if is(MutantId::M04) {
+                self.log.last_index()
+            } else {
+                self.leader_persisted_index
+            };
         }
         self.progress
             .get(&node)
@@ -719,6 +731,9 @@ impl RaftCore {
 
     /// Largest committable index under the effective config.
     fn effective_commit(&self) -> LogIndex {
+        if is(MutantId::M01) {
+            return self.log.last_index();
+        }
         if let Some(joint) = &self.joint {
             let old = self.quorum_commit_for(&joint.old_voters);
             let new = self.quorum_commit_for(&joint.new_voters);
@@ -749,8 +764,13 @@ impl RaftCore {
         if let Some(joint) = &self.joint {
             let old_votes = self.count_votes_in(ids, include_self, &joint.old_voters);
             let new_votes = self.count_votes_in(ids, include_self, &joint.new_voters);
-            old_votes >= Self::majority_of(joint.old_voters.len())
-                && new_votes >= Self::majority_of(joint.new_voters.len())
+            let old_ok = old_votes >= Self::majority_of(joint.old_voters.len());
+            let new_ok = new_votes >= Self::majority_of(joint.new_voters.len());
+            if is(MutantId::M13) {
+                old_ok || new_ok
+            } else {
+                old_ok && new_ok
+            }
         } else {
             let votes = self.count_votes_in(ids, include_self, &self.voters);
             votes >= Self::majority_of(self.voters.len())
@@ -802,7 +822,7 @@ impl RaftCore {
                     if !self.can_campaign() {
                         return;
                     }
-                    if self.config.pre_vote_enabled {
+                    if self.config.pre_vote_enabled && !is(MutantId::M18) {
                         self.start_pre_vote(output);
                     } else {
                         self.start_election(output);
@@ -841,6 +861,7 @@ impl RaftCore {
 
                 if self.config.check_quorum
                     && self.election_elapsed_ticks >= self.config.election_timeout_ticks
+                    && !is(MutantId::M17)
                 {
                     self.election_elapsed_ticks = 0;
                     if !self.effective_quorum_met(&self.heartbeat_acks, true) {
@@ -848,6 +869,12 @@ impl RaftCore {
                     }
                     self.heartbeat_acks.clear();
                 }
+
+                // A committed membership change can shrink the quorum after
+                // the last ack or persist completed. Recheck on every tick so
+                // a leader that already holds a majority commits without
+                // waiting for another network event.
+                self.maybe_advance_commit(output);
             }
         }
     }
@@ -901,7 +928,7 @@ impl RaftCore {
         // Only voters grant pre-votes. Learners, removed nodes, and nodes
         // under repair answer false so they can never feed a quorum.
         let grant = self.repair_from.is_none()
-            && self.may_grant_vote(last_log_index)
+            && self.may_grant_vote(last_log_index, last_log_term)
             && term >= self.term
             && is_log_ok
             && (!self.leader_sticky || self.role == Role::Leader);
@@ -932,7 +959,11 @@ impl RaftCore {
             return;
         }
 
-        if vote_granted && term == self.term {
+        // A lagging peer grants the prospective term carried in the
+        // request but answers with its own older term. Counting that reply
+        // keeps a candidate that fell back from a failed election from
+        // deadlocking against a peer that never saw its newer term.
+        if vote_granted {
             self.pre_votes_granted.insert(from);
             if self.effective_quorum_met(&self.pre_votes_granted, true) {
                 self.start_election(output);
@@ -1004,7 +1035,7 @@ impl RaftCore {
             && can_vote
             && is_log_ok
             && self.repair_from.is_none()
-            && self.may_grant_vote(last_log_index);
+            && self.may_grant_vote(last_log_index, last_log_term);
 
         if grant {
             self.voted_for = Some(candidate_id);
@@ -1025,7 +1056,11 @@ impl RaftCore {
                     from: self.config.node_id,
                 },
             };
-            self.queue_pending_action(token, PendingAction::SendMessage(resp));
+            if is(MutantId::M02) {
+                output.messages.push(resp);
+            } else {
+                self.queue_pending_action(token, PendingAction::SendMessage(resp));
+            }
         } else if let Some(token) = persisted_token {
             let resp = OutboundMessage {
                 to: from,
@@ -1160,11 +1195,13 @@ impl RaftCore {
         self.log.append(entry.clone());
 
         let token = self.next_token();
-        output.persist_ops.push(PersistOp::AppendEntries {
-            prev_index: entry_index.prev().unwrap_or(LogIndex::from_raw(0)),
-            entries: vec![entry],
-            token,
-        });
+        if !is(MutantId::M04) {
+            output.persist_ops.push(PersistOp::AppendEntries {
+                prev_index: entry_index.prev().unwrap_or(LogIndex::from_raw(0)),
+                entries: vec![entry],
+                token,
+            });
+        }
 
         // Parallel persist contract: count match for self only after disk completes
         self.queue_pending_action(token, PendingAction::LeaderPersisted { entry_index });
@@ -1198,7 +1235,7 @@ impl RaftCore {
         }
         // The leader must have committed an entry in its own term first, so
         // the new config cannot commit over an uncommitted past.
-        if !self.committed_current_term {
+        if !self.committed_current_term && !is(MutantId::M12) {
             sometimes!(output.sometimes_hits, "raft.config.rejected");
             output.membership_events.push(MembershipEvent::Rejected {
                 reason: ConfigReject::NoCurrentTermCommit,
@@ -1656,8 +1693,10 @@ impl RaftCore {
         }
 
         if let Some(trunc_idx) = truncate_from {
-            self.log
-                .truncate_and_append(trunc_idx, entries_to_append.clone());
+            if !is(MutantId::M07) {
+                self.log
+                    .truncate_and_append(trunc_idx, entries_to_append.clone());
+            }
             new_match = self.log.last_index();
             // A truncated joint entry never took effect on this follower.
             self.rollback_config_for_truncate(trunc_idx);
@@ -1684,7 +1723,12 @@ impl RaftCore {
                     from: self.config.node_id,
                 },
             };
-            self.queue_pending_action(token, PendingAction::SendMessage(resp));
+            if is(MutantId::M03) {
+                output.persist_ops.clear();
+                output.messages.push(resp);
+            } else {
+                self.queue_pending_action(token, PendingAction::SendMessage(resp));
+            }
         } else if !entries_to_append.is_empty() {
             let start_append_idx = entries_to_append[0].index;
             let prev_idx = start_append_idx.prev().unwrap_or(LogIndex::from_raw(0));
@@ -1714,7 +1758,12 @@ impl RaftCore {
                     from: self.config.node_id,
                 },
             };
-            self.queue_pending_action(token, PendingAction::SendMessage(resp));
+            if is(MutantId::M03) {
+                output.persist_ops.clear();
+                output.messages.push(resp);
+            } else {
+                self.queue_pending_action(token, PendingAction::SendMessage(resp));
+            }
         } else if let Some(token) = term_persist_token {
             let resp = OutboundMessage {
                 to: from,
@@ -1813,7 +1862,7 @@ impl RaftCore {
             return;
         }
         // Raft Section 5.4.2 rule: leader only commits entries from its CURRENT term
-        if self.log.term_at(candidate) != Some(self.term) {
+        if self.log.term_at(candidate) != Some(self.term) && !is(MutantId::M01) {
             return;
         }
         self.commit_to(candidate, output);

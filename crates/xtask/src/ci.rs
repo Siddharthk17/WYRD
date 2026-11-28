@@ -330,7 +330,11 @@ fn run_extended_gates(workspace_root: &Path) -> Result<(), String> {
     hack_cmd.args(["hack", "check", "--feature-powerset", "--no-dev-deps"]);
     run_step("Feature Powerset (`cargo hack check`)", &mut hack_cmd)?;
 
-    // 14. Coverage floors per crate, aggregated from one workspace run so
+    // 14. The mutation library is a test-only feature. It must not be
+    // reachable from the production server's dependency graph.
+    run_server_mutant_isolation_gate(workspace_root)?;
+
+    // 15. Coverage floors per crate, aggregated from one workspace run so
     // cross-crate exercise (for example sim tests driving the storage
     // engine) counts toward the owning crate.
     run_coverage_gate(workspace_root)?;
@@ -460,6 +464,27 @@ fn aggregate_coverage(
         return Err("Coverage report contained no per-file rows".to_string());
     }
     Ok(totals)
+}
+
+/// Fails when the `mutants` feature can be enabled from `anvild`'s graph.
+fn run_server_mutant_isolation_gate(workspace_root: &Path) -> Result<(), String> {
+    println!("\n>>> Running Gate: Server mutant isolation ...");
+    let output = Command::new("cargo")
+        .current_dir(workspace_root)
+        .args(["tree", "-p", "anvil-server", "-e", "features"])
+        .output()
+        .map_err(|e| format!("Failed to launch cargo tree: {e}"))?;
+    if !output.status.success() {
+        return Err(String::from("Server dependency graph could not be read"));
+    }
+    let graph = String::from_utf8_lossy(&output.stdout);
+    if graph.lines().any(|line| line.contains("mutants")) {
+        return Err(String::from(
+            "the mutants feature is reachable from anvild; it must stay test-only",
+        ));
+    }
+    println!(">>> [PASS] Server mutant isolation");
+    Ok(())
 }
 
 #[cfg(test)]
