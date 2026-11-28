@@ -13,7 +13,7 @@ use anvil_raft::{
     Input, Output, PersistOp, RaftConfig, RaftCore, ReadIndexResult, ReceivedSnapshot, Role,
     SnapshotChunkData,
 };
-use anvil_types::{LogIndex, NodeId};
+use anvil_types::{ClusterId, Entry, LogIndex, NodeId};
 use bytes::Bytes;
 use rand_chacha::ChaCha8Rng;
 
@@ -72,6 +72,9 @@ impl Default for NodeConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeWrite {
     RegisterSession,
+    ExpireSessions {
+        up_to_tick: u64,
+    },
     Put {
         session: anvil_types::SessionId,
         seq: anvil_types::SeqNo,
@@ -153,6 +156,7 @@ struct PendingRead {
 #[allow(clippy::struct_field_names)]
 pub struct Node {
     id: NodeId,
+    cluster_id: ClusterId,
     raft: RaftCore,
     kv: KvStore,
     config: NodeConfig,
@@ -165,6 +169,8 @@ pub struct Node {
     entries_since_snapshot: u64,
     bytes_since_snapshot: u64,
     last_snapshot_index: LogIndex,
+    cluster_rejects: u64,
+    expired_sessions_total: u64,
 }
 
 impl Node {
@@ -177,8 +183,13 @@ impl Node {
         node_config: NodeConfig,
         rng: ChaCha8Rng,
     ) -> Self {
+        assert_eq!(
+            node_id, raft_config.node_id,
+            "node id must match the Raft config"
+        );
         Self {
             id: node_id,
+            cluster_id: raft_config.cluster_id,
             raft: RaftCore::new(raft_config, recovered, rng),
             kv: KvStore::new(node_config.kv),
             config: node_config,
@@ -191,7 +202,134 @@ impl Node {
             entries_since_snapshot: 0,
             bytes_since_snapshot: 0,
             last_snapshot_index: LogIndex::from_raw(0),
+            cluster_rejects: 0,
+            expired_sessions_total: 0,
         }
+    }
+
+    /// Creates a founding node. Every founder runs this with the same voter
+    /// set, so each writes the identical initial config entry at index 1.
+    #[must_use]
+    pub fn bootstrap(raft_config: RaftConfig, node_config: NodeConfig, rng: ChaCha8Rng) -> Self {
+        let node_id = raft_config.node_id;
+        let voters = raft_config.initial_voters();
+        let learners: Vec<NodeId> = raft_config.learners.iter().copied().collect();
+        let bootstrap = anvil_types::bootstrap_config_entry(&voters, &learners);
+        let recovered = anvil_raft::RecoveredState {
+            current_term: anvil_types::Term::from_raw(0),
+            voted_for: None,
+            commit_index: LogIndex::from_raw(0),
+            entries: vec![bootstrap],
+        };
+        Self::new(node_id, raft_config, recovered, node_config, rng)
+    }
+
+    /// Creates a node with empty storage that waits to be added. It never
+    /// campaigns and never votes until a snapshot or config entry configures
+    /// it. Callers build the config with no peers and the local node as the
+    /// only learner.
+    #[must_use]
+    pub fn joining(raft_config: RaftConfig, node_config: NodeConfig, rng: ChaCha8Rng) -> Self {
+        assert!(
+            raft_config.initial_voters().is_empty(),
+            "a joining node starts with no voters"
+        );
+        let node_id = raft_config.node_id;
+        Self::new(
+            node_id,
+            raft_config,
+            anvil_raft::RecoveredState::default(),
+            node_config,
+            rng,
+        )
+    }
+
+    /// Returns the cluster id.
+    #[must_use]
+    pub const fn cluster_id(&self) -> ClusterId {
+        self.cluster_id
+    }
+
+    /// Returns messages rejected for a foreign cluster id.
+    #[must_use]
+    pub const fn cluster_rejects(&self) -> u64 {
+        self.cluster_rejects
+    }
+
+    /// Returns sessions expired by applied `ExpireSessions` entries.
+    #[must_use]
+    pub const fn expired_sessions_total(&self) -> u64 {
+        self.expired_sessions_total
+    }
+
+    /// Returns the current effective voters.
+    #[must_use]
+    pub fn membership_voters(&self) -> Vec<NodeId> {
+        self.raft.membership_voters()
+    }
+
+    /// Returns true while joint consensus is active.
+    #[must_use]
+    pub fn in_joint(&self) -> bool {
+        self.raft.in_joint()
+    }
+
+    /// Returns the leader's match index for a replication target.
+    #[must_use]
+    pub fn replication_match(&self, peer: NodeId) -> Option<LogIndex> {
+        self.raft
+            .progress()
+            .get(&peer)
+            .map(|progress| progress.match_index)
+    }
+
+    /// Proposes a membership change to the cluster. Only the leader's call
+    /// has an effect; refusal reasons surface in the core's membership
+    /// events. Returns false when this node is not the leader.
+    pub fn propose_config(
+        &mut self,
+        voters: Vec<NodeId>,
+        learners: Vec<NodeId>,
+        output: &mut NodeOutput,
+    ) -> bool {
+        if self.raft.role() != Role::Leader {
+            return false;
+        }
+        self.raft_output.clear();
+        self.raft.step(
+            Input::ProposeConfig { voters, learners },
+            &mut self.raft_output,
+        );
+        self.drain_raft_output(output);
+        self.serve_ready_reads(output);
+        true
+    }
+
+    /// Promotes a caught-up learner to voter. Returns false when this node
+    /// is not the leader or the target is not a learner.
+    pub fn propose_promote(&mut self, target: NodeId, output: &mut NodeOutput) -> bool {
+        if self.raft.role() != Role::Leader {
+            return false;
+        }
+        let membership = self.raft.membership_snapshot();
+        if !membership.learners.contains(&target) || membership.voters.contains(&target) {
+            return false;
+        }
+        let mut voters = membership.voters.clone();
+        voters.push(target);
+        let learners: Vec<NodeId> = membership
+            .learners
+            .iter()
+            .copied()
+            .filter(|learner| *learner != target)
+            .collect();
+        self.propose_config(voters, learners, output)
+    }
+
+    /// Returns the log entry at an index, for bootstrap and debug flows.
+    #[must_use]
+    pub fn log_entry(&self, index: LogIndex) -> Option<Entry> {
+        self.raft.log().entry_at(index).cloned()
     }
 
     /// Returns the node id.
@@ -239,8 +377,19 @@ impl Node {
         self.serve_ready_reads(output);
     }
 
-    /// Delivers a Raft message.
-    pub fn receive(&mut self, from: NodeId, message: anvil_raft::Message, output: &mut NodeOutput) {
+    /// Delivers a Raft message. Messages carrying a foreign cluster id are
+    /// dropped before reaching the core and counted for operators.
+    pub fn receive(
+        &mut self,
+        from: NodeId,
+        cluster_id: ClusterId,
+        message: anvil_raft::Message,
+        output: &mut NodeOutput,
+    ) {
+        if cluster_id != self.cluster_id {
+            self.cluster_rejects = self.cluster_rejects.saturating_add(1);
+            return;
+        }
         self.last_leader_contact = self.now_tick;
         self.raft_output.clear();
         self.raft
@@ -257,6 +406,7 @@ impl Node {
         let mut buf = Vec::new();
         let cmd = match write {
             NodeWrite::RegisterSession => KvCommand::RegisterSession,
+            NodeWrite::ExpireSessions { up_to_tick } => KvCommand::ExpireSessions { up_to_tick },
             NodeWrite::Put {
                 session,
                 seq,
@@ -492,7 +642,10 @@ impl Node {
             self.bytes_since_snapshot = self
                 .bytes_since_snapshot
                 .saturating_add(entry.payload.len() as u64);
-            if entry.kind == anvil_types::EntryKind::NoOp {
+            if entry.kind == anvil_types::EntryKind::NoOp || entry.kind.is_config_change() {
+                // No-ops and config entries carry no state-machine effect:
+                // they advance applied and acknowledge the core without
+                // touching the store or answering a client.
                 self.applied = entry.index;
                 let mut nested = Output::new();
                 self.raft
@@ -506,6 +659,9 @@ impl Node {
                 .kv
                 .apply(index, &entry.payload)
                 .unwrap_or(KvResponse::Ok);
+            if let KvResponse::SessionsExpired { removed } = response {
+                self.expired_sessions_total = self.expired_sessions_total.saturating_add(removed);
+            }
             self.applied = index;
             output.client_responses.push(ClientResponse {
                 response,
@@ -553,15 +709,17 @@ impl Node {
     /// Encodes the state machine at the applied index, hands the chunks to
     /// the core for streaming, and compacts the log prefix that the durable
     /// snapshot now covers. Never snapshots beyond the applied index: the
-    /// handle is taken at `self.applied` by construction.
+    /// handle is taken at `self.applied` by construction. The snapshot
+    /// carries the live membership so installers adopt the same config.
     fn take_snapshot(&mut self, output: &mut NodeOutput) {
         let handle = self.kv.snapshot_handle();
         let applied = self.applied;
         let Some(term) = self.raft.log().term_at(applied) else {
             return;
         };
+        let membership = self.raft.membership_snapshot();
         let (chunks, digest) =
-            handle.encode_snapshot_chunked(self.config.snapshot_policy.chunk_bytes);
+            handle.encode_snapshot_chunked(self.config.snapshot_policy.chunk_bytes, &membership);
         let mut total: u64 = 0;
         let mut data = Vec::with_capacity(chunks.len());
         for chunk in &chunks {
@@ -616,6 +774,8 @@ impl Node {
     /// Atomically installs a core-verified snapshot: the state machine is
     /// replaced, applied jumps, and the core is told so its bound checks
     /// stay exact. Stale snapshots at or below applied never regress state.
+    /// The embedded membership restores the core config, which lets a fresh
+    /// joiner adopt the cluster through a snapshot.
     fn install_snapshot(&mut self, snap: &ReceivedSnapshot, output: &mut NodeOutput) {
         if snap.last_included_index <= self.applied {
             return;
@@ -629,6 +789,10 @@ impl Node {
         if restored.applied_index() != snap.last_included_index {
             return;
         }
+        let Ok(membership) = anvil_kv::KvStore::decode_membership(self.config.kv, &snap.data)
+        else {
+            return;
+        };
         self.kv = restored;
         self.applied = snap.last_included_index;
         self.entries_since_snapshot = 0;
@@ -638,6 +802,14 @@ impl Node {
         self.raft.step(
             Input::Applied {
                 index: snap.last_included_index,
+            },
+            &mut self.raft_output,
+        );
+        self.raft_output.clear();
+        self.raft.step(
+            Input::RestoreMembership {
+                base: snap.last_included_index,
+                membership,
             },
             &mut self.raft_output,
         );

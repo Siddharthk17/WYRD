@@ -3,7 +3,7 @@
 
 use anvil_raft::{Input, Message, Output, RaftConfig, RaftCore, RecoveredState, Role};
 use anvil_sim::SimCluster;
-use anvil_types::{Entry, LogIndex, NodeId, Term};
+use anvil_types::{ClusterId, Entry, LogIndex, NodeId, Term};
 use bytes::Bytes;
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
@@ -21,6 +21,8 @@ fn create_node(
         peer_set.insert(NodeId::new(peer).expect("valid peer id"));
     }
     let config = RaftConfig {
+        cluster_id: ClusterId::from_raw(1),
+        learners: BTreeSet::new(),
         node_id: NodeId::new(node_id).expect("valid node id"),
         peers: peer_set,
         election_timeout_ticks: 10,

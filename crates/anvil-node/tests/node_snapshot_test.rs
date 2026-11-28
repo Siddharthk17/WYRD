@@ -4,7 +4,7 @@
 use anvil_kv::{KvResponse, SnapshotPolicy};
 use anvil_node::{Node, NodeConfig, NodeOutput, NodeRead, NodeWrite, ReadConsistency};
 use anvil_raft::{PersistToken, RaftConfig, RecoveredState, Role};
-use anvil_types::{LogIndex, NodeId, SeqNo, SessionId};
+use anvil_types::{ClusterId, LogIndex, NodeId, SeqNo, SessionId};
 use bytes::Bytes;
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
@@ -16,6 +16,8 @@ fn node_id(n: u64) -> NodeId {
 
 fn raft_config(id: NodeId, peers: &[NodeId]) -> RaftConfig {
     RaftConfig {
+        cluster_id: ClusterId::from_raw(1),
+        learners: BTreeSet::new(),
         node_id: id,
         peers: peers.iter().copied().collect::<BTreeSet<_>>(),
         election_timeout_ticks: 5,
@@ -133,7 +135,8 @@ fn pump_round(
             }
             let node = nodes.get_mut(&outbound.to).expect("peer");
             let out = outs.get_mut(&outbound.to).expect("peer out");
-            node.receive(*from, outbound.message, out);
+            let cluster = node.cluster_id();
+            node.receive(*from, cluster, outbound.message, out);
             ack_persisted(node, out);
         }
     }

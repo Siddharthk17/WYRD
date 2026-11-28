@@ -10,6 +10,11 @@ pub enum EntryKind {
     Normal = 1,
     /// Empty no-op entry appended by leader upon winning election.
     NoOp = 2,
+    /// Joint-consensus entry: quorum needs a majority of the old config
+    /// and a majority of the new config. Takes effect when appended.
+    EnterJoint = 3,
+    /// Final membership entry: leaves the joint config once committed.
+    LeaveJoint = 4,
 }
 
 impl EntryKind {
@@ -18,8 +23,16 @@ impl EntryKind {
         match tag {
             1 => Some(Self::Normal),
             2 => Some(Self::NoOp),
+            3 => Some(Self::EnterJoint),
+            4 => Some(Self::LeaveJoint),
             _ => None,
         }
+    }
+
+    /// Returns true for membership change entries.
+    #[must_use]
+    pub const fn is_config_change(self) -> bool {
+        matches!(self, Self::EnterJoint | Self::LeaveJoint)
     }
 
     /// Returns the wire discriminant byte.

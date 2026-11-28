@@ -4,7 +4,7 @@
 use anvil_kv::KvResponse;
 use anvil_node::{Node, NodeConfig, NodeRead, NodeWrite, ReadConsistency};
 use anvil_raft::{PersistToken, RaftConfig, RecoveredState, Role};
-use anvil_types::{LogIndex, NodeId, SeqNo, SessionId};
+use anvil_types::{ClusterId, LogIndex, NodeId, SeqNo, SessionId};
 use bytes::Bytes;
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
@@ -13,6 +13,8 @@ use std::collections::BTreeSet;
 fn single_node(skip_confirm: bool, lease_ticks: u64) -> Node {
     let id = NodeId::new(1).expect("id");
     let config = RaftConfig {
+        cluster_id: ClusterId::from_raw(1),
+        learners: BTreeSet::new(),
         node_id: id,
         peers: BTreeSet::new(),
         election_timeout_ticks: 5,

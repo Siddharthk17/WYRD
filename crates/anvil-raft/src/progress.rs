@@ -165,6 +165,14 @@ impl PeerProgress {
     /// If `conflict_term` is present and leader has entries in that term, leader sets
     /// `next_index` to the entry following the last leader entry in `conflict_term`.
     /// Otherwise, leader sets `next_index` directly to `conflict_index`.
+    ///
+    /// A rejection proves the follower lacks every index at or above the
+    /// conflict hint. A recorded match above it is stale: the follower's
+    /// disk lost acknowledged bytes (torn write) after acking them. The
+    /// match comes down, or the floor below keeps `next_index` above the
+    /// compacted prefix the follower actually needs and log replication
+    /// can never resume. Lowering is always safe: fewer counted replicas
+    /// only delay commits, and the commit index never moves backward.
     pub fn on_rejection(
         &mut self,
         conflict_term: Option<Term>,
@@ -173,6 +181,13 @@ impl PeerProgress {
     ) {
         self.inflight_count = self.inflight_count.saturating_sub(1);
         self.state = ProgressState::Probe;
+
+        if let Some(hint) = conflict_index {
+            let ceiling = hint.prev().unwrap_or(LogIndex::from_raw(0));
+            if ceiling < self.match_index {
+                self.match_index = ceiling;
+            }
+        }
 
         let resolved_next = if let Some(conflicting) = conflict_term {
             if let Some(leader_last_idx) = last_index_for_term(conflicting) {

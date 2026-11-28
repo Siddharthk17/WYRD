@@ -3,7 +3,7 @@
 
 use anvil_raft::{RaftConfig, RaftCore, RecoveredState, Role};
 use anvil_sim::{InvariantViolation, RaftInvariantChecker, SimCluster};
-use anvil_types::{LogIndex, NodeId, Term};
+use anvil_types::{ClusterId, LogIndex, NodeId, Term};
 use bytes::Bytes;
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
@@ -165,6 +165,8 @@ fn test_invariant_checker_catches_violations() {
     peers2.insert(node1);
 
     let config1 = RaftConfig {
+        cluster_id: ClusterId::from_raw(1),
+        learners: BTreeSet::new(),
         node_id: node1,
         peers: peers1,
         election_timeout_ticks: 10,
@@ -175,6 +177,8 @@ fn test_invariant_checker_catches_violations() {
         check_quorum: true,
     };
     let config2 = RaftConfig {
+        cluster_id: ClusterId::from_raw(1),
+        learners: BTreeSet::new(),
         node_id: node2,
         peers: peers2,
         election_timeout_ticks: 10,

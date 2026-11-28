@@ -17,7 +17,7 @@
 //! 10. `GlobalOracle`: All committed entries agree with the global oracle.
 
 use anvil_raft::{RaftCore, Role};
-use anvil_types::{Entry, LogIndex, NodeId, Term};
+use anvil_types::{Entry, EntryKind, LogIndex, NodeId, Term};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
@@ -124,6 +124,17 @@ pub enum InvariantViolation {
         recovered_term: Option<Term>,
     },
     #[error(
+        "CommittedConfigDiverged at index {index}: oracle term {oracle_term} and config {oracle:?} disagree with node {node} term {actual_term} and config {actual:?}"
+    )]
+    CommittedConfigDiverged {
+        node: NodeId,
+        index: LogIndex,
+        oracle_term: Term,
+        actual_term: Term,
+        oracle: Box<anvil_types::ClusterConfig>,
+        actual: Box<anvil_types::ClusterConfig>,
+    },
+    #[error(
         "CommittedNeverLostAcrossCrashes violated at index {index}: committed entry in term {expected_term} was lost across crash recovery (actual: {actual_term:?})"
     )]
     CommittedNeverLostAcrossCrashes {
@@ -144,6 +155,10 @@ pub struct RaftInvariantChecker {
     node_votes: BTreeMap<(NodeId, Term), NodeId>,
     /// Set of (term, `entry_index`) committed records.
     committed_terms: BTreeMap<LogIndex, Term>,
+    /// Per-index config oracle: the first committed config at each index is
+    /// final. Every later member of the cluster must carry the same config
+    /// at that index, whatever term it currently leads in.
+    config_oracle: BTreeMap<LogIndex, (Term, anvil_types::ClusterConfig)>,
     /// Number of evaluation rounds run. Deterministic bookkeeping only,
     /// never part of any trace hash.
     check_count: u64,
@@ -232,6 +247,7 @@ impl RaftInvariantChecker {
         Self::check_state_machine_safety(nodes)?;
         self.check_leader_completeness(nodes)?;
         self.check_committed_entries_never_lost(nodes)?;
+        self.update_and_check_config_oracle(nodes)?;
         Ok(())
     }
 
@@ -529,6 +545,46 @@ impl RaftInvariantChecker {
                         actual_term: node_entry.term,
                         expected_term: oracle_entry.term,
                     });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 11. Per-index config oracle: the first committed config at an index
+    ///     is final. A leader can never rewrite a committed membership and
+    ///     every later config entry at the same index must carry the same
+    ///     payload.
+    fn update_and_check_config_oracle(
+        &mut self,
+        nodes: &BTreeMap<NodeId, RaftCore>,
+    ) -> Result<(), InvariantViolation> {
+        for (&node_id, core) in nodes {
+            let commit = core.commit_index().as_u64();
+            for idx in 1..=commit {
+                let log_idx = LogIndex::from_raw(idx);
+                let Some(entry) = core.log().entry_at(log_idx) else {
+                    continue;
+                };
+                if entry.kind != EntryKind::EnterJoint && entry.kind != EntryKind::LeaveJoint {
+                    continue;
+                }
+                let Ok(config) = anvil_types::decode_config_entry(entry) else {
+                    continue;
+                };
+                if let Some((oracle_term, oracle_config)) = self.config_oracle.get(&log_idx) {
+                    if *oracle_term != entry.term || *oracle_config != config {
+                        return Err(InvariantViolation::CommittedConfigDiverged {
+                            node: node_id,
+                            index: log_idx,
+                            oracle_term: *oracle_term,
+                            actual_term: entry.term,
+                            oracle: Box::new(oracle_config.clone()),
+                            actual: Box::new(config),
+                        });
+                    }
+                } else {
+                    self.config_oracle.insert(log_idx, (entry.term, config));
                 }
             }
         }

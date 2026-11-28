@@ -443,7 +443,7 @@ fn test_boost_cluster_storage_helpers() {
         payload: Bytes::from_static(b"backfill"),
     }];
     let _backfilled = cluster.backfill_log_prefix(target, single);
-    let empty_archive: BTreeMap<LogIndex, (Term, Option<Bytes>)> = BTreeMap::new();
+    let empty_archive: anvil_sim::CommittedArchive = BTreeMap::new();
     cluster.reconcile_snapshot_prefix(target, &empty_archive, LogIndex::from_raw(0));
     cluster.crash_node(node(2));
     cluster.reconcile_snapshot_prefix(node(2), &empty_archive, LogIndex::from_raw(0));

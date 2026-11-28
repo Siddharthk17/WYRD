@@ -246,13 +246,18 @@ fn test_crash_with_mid_log_corruption_needs_repair() {
         recovered.log.classification
     );
 
-    // Node is marked NeedsRepair
+    // Node is marked NeedsRepair with a live but flagged core: it keeps
+    // following through appends without voting or campaigning.
     assert!(cluster.is_node_needs_repair(follower_id));
-    assert!(!cluster.nodes.contains_key(&follower_id));
+    assert_eq!(
+        cluster.nodes[&follower_id].repair_from(),
+        cluster.storage[&follower_id].repair_from
+    );
 
-    // Stepping cluster does not activate or elect this damaged node
+    // Stepping the cluster never campaigns or elects the damaged node.
     cluster.tick_n(20);
-    assert!(!cluster.nodes.contains_key(&follower_id));
+    assert_eq!(cluster.nodes[&follower_id].role(), Role::Follower);
+    assert!(cluster.is_node_needs_repair(follower_id));
 }
 
 #[test]

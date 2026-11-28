@@ -24,14 +24,14 @@
 //! generator state: network faults come from the plan salt hash, and client
 //! timing comes from the pre-generated schedule.
 
-use crate::cluster::{PlanNet, SimCluster};
+use crate::cluster::{CommittedArchive, PlanNet, SimCluster};
 use crate::device::SimDeviceConfig;
 use crate::plan::{FaultKind, Plan, WorkloadSpec};
 use crate::rng::DetRng;
 use anvil_check::{ClientOp, History, HistoryOp, OpResult};
 use anvil_kv::{KvCommand, KvConfig, KvResponse, KvStore, SnapshotPolicy};
 use anvil_raft::{Input, ReceivedSnapshot, SnapshotChunkData};
-use anvil_types::{LogIndex, NodeId, SeqNo, SessionId, sometimes};
+use anvil_types::{LogIndex, MembershipSnapshot, NodeId, SeqNo, SessionId, sometimes};
 use bytes::Bytes;
 use std::collections::BTreeMap;
 
@@ -104,7 +104,7 @@ pub fn swarm_profile(seed: u64) -> SwarmProfile {
 struct SnapshotHarness {
     policy: SnapshotPolicy,
     chunk_bytes: usize,
-    archive: BTreeMap<LogIndex, (anvil_types::Term, Option<Bytes>)>,
+    archive: CommittedArchive,
     since_entries: BTreeMap<NodeId, u64>,
     since_bytes: BTreeMap<NodeId, u64>,
     last_snapshot: BTreeMap<NodeId, LogIndex>,
@@ -136,15 +136,12 @@ impl SnapshotHarness {
 
 /// Replays the archived committed prefix into a fresh store and asserts the
 /// state hash equals the snapshot's: `SnapshotEqualsReplay`.
-fn assert_snapshot_equals_replay(
-    snapshot: &KvStore,
-    archive: &BTreeMap<LogIndex, (anvil_types::Term, Option<Bytes>)>,
-) {
+fn assert_snapshot_equals_replay(snapshot: &KvStore, archive: &CommittedArchive) {
     let mut replay = KvStore::new(snapshot.config());
     let mut idx = 1u64;
     let applied = snapshot.applied_index().as_u64();
     while idx <= applied {
-        if let Some((_, payload)) = archive.get(&LogIndex::from_raw(idx)) {
+        if let Some((_, _, payload)) = archive.get(&LogIndex::from_raw(idx)) {
             if let Some(bytes) = payload {
                 // Committed commands can legitimately fail application: a
                 // client may pipeline writes against a session whose
@@ -520,6 +517,8 @@ fn run_kv_plan_inner(
             );
             op_cursor += 1;
             cluster.tick();
+            cluster.drive_reconfig();
+            sync_workload_nodes(&cluster, &mut stores, &mut applied, &mut applied_terms);
             tick += 1;
             apply_all(
                 &mut cluster,
@@ -583,7 +582,8 @@ fn run_kv_plan_inner(
         seed,
     );
 
-    let audit = convergence_audit(&cluster, &stores, &applied);
+    let members = cluster.live_members();
+    let audit = convergence_audit_members(&cluster, &stores, &applied, &members);
     sometimes_hits.append(&mut cluster.sometimes_hits);
     let stats = SnapshotStats {
         snapshots_taken: harness.snapshots_taken,
@@ -604,10 +604,11 @@ fn heal_step(
     cluster: &mut SimCluster,
     node_ids: &[NodeId],
     base_skew: &BTreeMap<NodeId, u64>,
-    archive: &BTreeMap<LogIndex, (anvil_types::Term, Option<Bytes>)>,
+    archive: &CommittedArchive,
 ) {
     cluster.heal_all();
     cluster.repair_step(Some(archive));
+    cluster.drive_reconfig();
     for id in node_ids.iter().copied() {
         if cluster.is_paused(id) {
             cluster.resume_node(id);
@@ -640,12 +641,13 @@ fn drain_to_convergence(
     for _ in 0..500 {
         heal_step(cluster, node_ids, base_skew, &harness.archive);
         cluster.tick();
+        cluster.drive_reconfig();
+        sync_workload_nodes(cluster, stores, applied, applied_terms);
         apply_all(cluster, stores, applied, applied_terms, harness);
         snapshot_maintenance(cluster, stores, applied, applied_terms, harness);
         let live: Vec<NodeId> = cluster
-            .nodes
-            .keys()
-            .copied()
+            .live_members()
+            .into_iter()
             .filter(|id| !cluster.is_node_crashed(*id))
             .collect();
         let commits: Vec<LogIndex> = live
@@ -715,9 +717,31 @@ fn advance_with_faults(
         max_delay: plan.max_delay.saturating_add(spike),
     });
     cluster.tick();
+    cluster.drive_reconfig();
+    sync_workload_nodes(cluster, stores, applied, applied_terms);
     apply_all(cluster, stores, applied, applied_terms, harness);
     snapshot_maintenance(cluster, stores, applied, applied_terms, harness);
     tick + 1
+}
+
+/// Drops workload bookkeeping for nodes removed by the nemesis. Stores for
+/// added nodes are created lazily by `apply_all`, which starts them from an
+/// empty state and replays the log or installs a snapshot.
+fn sync_workload_nodes(
+    cluster: &SimCluster,
+    stores: &mut BTreeMap<NodeId, KvStore>,
+    applied: &mut BTreeMap<NodeId, LogIndex>,
+    applied_terms: &mut BTreeMap<NodeId, (LogIndex, anvil_types::Term)>,
+) {
+    stores.retain(|id, _| cluster.nodes.contains_key(id));
+    applied.retain(|id, _| cluster.nodes.contains_key(id));
+    applied_terms.retain(|id, _| cluster.nodes.contains_key(id));
+    for id in cluster.nodes.keys() {
+        stores
+            .entry(*id)
+            .or_insert_with(|| KvStore::new(KvConfig::default()));
+        applied.entry(*id).or_insert(LogIndex::from_raw(0));
+    }
 }
 
 /// Starts one workload fault event.
@@ -762,6 +786,59 @@ fn begin_workload_event(
             {
                 sometimes!(cluster.sometimes_hits, "sim.transfer.begin");
                 cluster.step_node(leader, anvil_raft::Input::TransferLeader { to: target });
+            }
+        }
+        // Membership changes run on workload plans only; the nemesis
+        // driver turns these into intents with a deadline and retry loop.
+        FaultKind::AddMember { node } => {
+            if let Some(id) = NodeId::new(node) {
+                sometimes!(cluster.sometimes_hits, "sim.reconfig.add");
+                cluster
+                    .reconfig
+                    .pending
+                    .push(crate::cluster::PendingReconfig {
+                        op: crate::cluster::ReconfigOp::Add(id),
+                        deadline: event.end + 60,
+                    });
+            }
+        }
+        FaultKind::RemoveMember { node } => {
+            if let Some(id) = NodeId::new(node) {
+                sometimes!(cluster.sometimes_hits, "sim.reconfig.remove");
+                cluster
+                    .reconfig
+                    .pending
+                    .push(crate::cluster::PendingReconfig {
+                        op: crate::cluster::ReconfigOp::Remove(id),
+                        deadline: event.end + 40,
+                    });
+            }
+        }
+        FaultKind::ReplaceMember { old, new } => {
+            if let (Some(old_id), Some(new_id)) = (NodeId::new(old), NodeId::new(new)) {
+                sometimes!(cluster.sometimes_hits, "sim.reconfig.replace");
+                cluster
+                    .reconfig
+                    .pending
+                    .push(crate::cluster::PendingReconfig {
+                        op: crate::cluster::ReconfigOp::Replace {
+                            old: old_id,
+                            new: new_id,
+                        },
+                        deadline: event.end + 60,
+                    });
+            }
+        }
+        FaultKind::PromoteMember { node } => {
+            if let Some(id) = NodeId::new(node) {
+                sometimes!(cluster.sometimes_hits, "sim.reconfig.promote");
+                cluster
+                    .reconfig
+                    .pending
+                    .push(crate::cluster::PendingReconfig {
+                        op: crate::cluster::ReconfigOp::Promote(id),
+                        deadline: event.end + 40,
+                    });
             }
         }
         FaultKind::DelaySpike { .. } => {}
@@ -816,8 +893,14 @@ fn end_workload_event(
                 cluster.set_tick_skew(*id, base_skew.get(id).copied().unwrap_or(1000));
             }
         }
-        FaultKind::DelaySpike { .. } => {}
-        FaultKind::Transfer { .. } => {}
+        // Membership changes are implemented by the reconfiguration
+        // nemesis; until it lands, the events trace and no-op here.
+        FaultKind::DelaySpike { .. }
+        | FaultKind::Transfer { .. }
+        | FaultKind::AddMember { .. }
+        | FaultKind::RemoveMember { .. }
+        | FaultKind::ReplaceMember { .. }
+        | FaultKind::PromoteMember { .. } => {}
     }
     cluster.trace_line(format!("fault end id={} {:?}", event.id, event.fault));
 }
@@ -1363,15 +1446,21 @@ fn apply_all(
             };
             let (index, kind, term, payload) =
                 (entry.index, entry.kind, entry.term, entry.payload.clone());
-            if kind == anvil_types::EntryKind::NoOp {
-                harness.archive.insert(index, (term, None));
+            if kind == anvil_types::EntryKind::NoOp || kind.is_config_change() {
+                // Config entries carry membership, not state: they advance
+                // applied like no-ops and never reach the state machine. The
+                // archive records no payload for them; Week 6 extends the
+                // archive with entry kinds for protocol-aware repair.
+                harness.archive.insert(index, (term, kind, None));
                 applied.insert(id, index);
                 applied_terms.insert(id, (index, term));
             } else {
                 if let Some(store) = stores.get_mut(&id) {
                     let _ = store.apply(index, &payload);
                 }
-                harness.archive.insert(index, (term, Some(payload.clone())));
+                harness
+                    .archive
+                    .insert(index, (term, kind, Some(payload.clone())));
                 harness
                     .since_entries
                     .entry(id)
@@ -1468,7 +1557,13 @@ fn take_snapshot_for(
     }
     let handle = store.snapshot_handle();
     assert_snapshot_equals_replay(&handle, &harness.archive);
-    let full = handle.encode_snapshot();
+    let membership = cluster
+        .nodes
+        .get(&id)
+        .map_or(MembershipSnapshot::empty(), |core| {
+            core.membership_snapshot()
+        });
+    let full = handle.encode_snapshot(&membership);
     let digest = anvil_kv::snapshot_digest(&full);
     let chunks = anvil_kv::split_into_chunks(&full, harness.chunk_bytes);
     let mut total: u64 = 0;
@@ -1513,12 +1608,12 @@ fn backfill_engine_from_archive(
     let mut idx = tip.as_u64() + 1;
     while idx <= up_to.as_u64() {
         let at = LogIndex::from_raw(idx);
-        let Some((term, payload)) = harness.archive.get(&at) else {
+        let Some((term, kind, payload)) = harness.archive.get(&at) else {
             return;
         };
         let (kind, bytes) = match payload {
-            Some(bytes) => (anvil_types::EntryKind::Normal, bytes.clone()),
-            None => (anvil_types::EntryKind::NoOp, Bytes::new()),
+            Some(bytes) => (*kind, bytes.clone()),
+            None => (*kind, Bytes::new()),
         };
         entries.push(anvil_types::Entry {
             index: at,
@@ -1580,15 +1675,40 @@ fn install_snapshot_state(
         return;
     }
 
+    // A snapshot that fails verification sidelines the node on the same
+    // repair path as mid-log corruption: it re-fetches the missing range
+    // from peers and clears the flag once a good snapshot installs.
     if anvil_kv::snapshot_digest(&snap.data) != snap.snapshot_digest {
+        cluster.mark_needs_repair(id, snap.last_included_index);
         return;
     }
     let config = KvConfig::default();
     let Ok(restored) = KvStore::decode_snapshot(config, &snap.data) else {
+        cluster.mark_needs_repair(id, snap.last_included_index);
         return;
     };
     if restored.applied_index() != snap.last_included_index {
+        cluster.mark_needs_repair(id, snap.last_included_index);
         return;
+    }
+    if cluster
+        .storage
+        .get(&id)
+        .and_then(|storage| storage.repair_from)
+        .is_some_and(|from| from <= snap.last_included_index)
+    {
+        cluster.clear_repair(id);
+    }
+    // The snapshot carries the live membership: adopt it so an installer
+    // that missed config entries (or a fresh joiner) converges.
+    if let Ok(membership) = KvStore::decode_membership(config, &snap.data) {
+        cluster.step_node(
+            id,
+            Input::RestoreMembership {
+                base: snap.last_included_index,
+                membership,
+            },
+        );
     }
     if let Some(storage) = cluster.storage.get_mut(&id) {
         storage.engine.discard_gap_buffer();
@@ -1824,6 +1944,8 @@ fn liveness_check(
     while cluster.leader().is_none() && waited < 100 {
         heal_step(cluster, node_ids, base_skew, &harness.archive);
         cluster.tick();
+        cluster.drive_reconfig();
+        sync_workload_nodes(cluster, stores, applied, applied_terms);
         waited += 1;
         apply_all(cluster, stores, applied, applied_terms, harness);
         snapshot_maintenance(cluster, stores, applied, applied_terms, harness);
@@ -1875,10 +1997,12 @@ fn liveness_check(
         while waited < 200 {
             heal_step(cluster, node_ids, base_skew, &harness.archive);
             cluster.tick();
+            cluster.drive_reconfig();
+            sync_workload_nodes(cluster, stores, applied, applied_terms);
             waited += 1;
             apply_all(cluster, stores, applied, applied_terms, harness);
             snapshot_maintenance(cluster, stores, applied, applied_terms, harness);
-            let converged = cluster.nodes.keys().copied().all(|id| {
+            let converged = cluster.live_members().into_iter().all(|id| {
                 cluster.is_node_crashed(id)
                     || cluster
                         .nodes
@@ -1949,9 +2073,22 @@ pub fn convergence_audit(
     stores: &BTreeMap<NodeId, KvStore>,
     applied: &BTreeMap<NodeId, LogIndex>,
 ) -> bool {
-    let live: Vec<NodeId> = cluster
-        .nodes
-        .keys()
+    let live: Vec<NodeId> = cluster.nodes.keys().copied().collect();
+    convergence_audit_members(cluster, stores, applied, &live)
+}
+
+/// Convergence audit restricted to the nodes in the leader's current config.
+/// Nodes removed by reconfiguration stay in the simulator so joint consensus
+/// keeps its old quorum, but they no longer carry cluster state.
+#[must_use]
+pub fn convergence_audit_members(
+    cluster: &SimCluster,
+    stores: &BTreeMap<NodeId, KvStore>,
+    applied: &BTreeMap<NodeId, LogIndex>,
+    members: &[NodeId],
+) -> bool {
+    let live: Vec<NodeId> = members
+        .iter()
         .copied()
         .filter(|id| !cluster.is_node_crashed(*id))
         .collect();

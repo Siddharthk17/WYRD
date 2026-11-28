@@ -8,11 +8,12 @@
 //! TLC Model Checker automation for ANVIL formal specifications.
 //!
 //! Validates `specs/anvil_raft.tla` under the smoke config
-//! `specs/anvil_raft_smoke.cfg` via seeded random simulation (no invariant
+//! `specs/anvil_raft_smoke.cfg` and `specs/anvil_reconfig.tla` under
+//! `specs/anvil_reconfig_smoke.cfg` via seeded random simulation (no invariant
 //! violations on any trace). Each run is bounded to a fixed trace count, so
 //! the gate always terminates; without the bound TLC simulates without end.
 //!
-//! The negative configs (`specs/anvil_raft_negative*.cfg`) are kept for
+//! The Raft negative configs (`specs/anvil_raft_negative*.cfg`) are kept for
 //! large-host exhaustive runs via `cargo xtask tlc-full`, but random
 //! simulation is not asked to find the Figure 8 counterexample: it is
 //! unreachable by sampling in the 3-server bound (see `run_simulation_gate`),
@@ -20,11 +21,12 @@
 //! at the smoke bound on small machines. The Figure 8 rule is enforced
 //! instead by deterministic Rust tests driving the real core.
 //!
-//! Exhaustive model checking of the reference 3-server, 3-term, 3-entry
-//! bounds exceeds small machines (measured: 300M+ states, disk exhaustion),
-//! so the reference bounds run via `cargo xtask tlc-full` on larger hosts.
-//! Simulation uses fixed seeds, so the gate is deterministic for a given
-//! spec and tool version.
+//! The reconfig negative config (`specs/anvil_reconfig_negative.cfg`) IS
+//! simulated: concurrent joint entries violate `SerializedConfig` within a few
+//! traces, so the gate asserts the violation appears. Exhaustive checking of
+//! the 4-server reconfig bound exceeds small hosts (90M+ states in minutes
+//! without finishing), so exhaustive runs stay out of the gate; the bounds
+//! and the simulation-mode choice are documented in docs/spec/README.md.
 
 use crate::determinism::find_workspace_root;
 use std::path::{Path, PathBuf};
@@ -190,7 +192,7 @@ fn run_simulation(
         let stale = stale.map_err(|e| format!("Failed to read specs entry: {e}"))?;
         let name = stale.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with("anvil_raft_TTrace_")
+        if (name.starts_with("anvil_raft_TTrace_") || name.starts_with("anvil_reconfig_TTrace_"))
             && name.ends_with(".tla")
             && let Err(e) = std::fs::remove_file(stale.path())
         {
@@ -244,6 +246,120 @@ fn run_simulation_gate(
     let _ = neg_cfg_path;
     println!(
         ">>> [SKIP] Negative simulation: unreachable by random sampling in 3-server bounds; covered by deterministic Rust Figure 8 tests."
+    );
+
+    run_reconfig_gate(jar, workspace_root)?;
+    Ok(())
+}
+
+/// Seeded simulation for the reconfiguration spec: 4 servers (3 voters plus
+/// a joining learner), 2 terms, a 3-entry log, and 3 faults per trace.
+const RECONFIG_SIM_SEEDS: [u64; 3] = [1, 7, 42];
+const RECONFIG_SIM_DEPTH: u64 = 150;
+const RECONFIG_SIM_TRACES: u64 = 200;
+
+/// Runs one seeded reconfig simulation, sharing the trace bound so the gate
+/// terminates. Returns TLC's combined output and exit status.
+fn run_reconfig_simulation(
+    jar: &Path,
+    workspace_root: &Path,
+    spec_path: &Path,
+    cfg_path: &Path,
+    seed: u64,
+) -> Result<(String, bool), String> {
+    let jar_text = jar
+        .to_str()
+        .ok_or_else(|| format!("Non-UTF8 tla2tools jar path: {}", jar.display()))?;
+    let spec_text = spec_path
+        .to_str()
+        .ok_or_else(|| format!("Non-UTF8 spec path: {}", spec_path.display()))?;
+    let cfg_text = cfg_path
+        .to_str()
+        .ok_or_else(|| format!("Non-UTF8 config path: {}", cfg_path.display()))?;
+    let output = Command::new("java")
+        .args([
+            "-XX:+UseParallelGC",
+            "-cp",
+            jar_text,
+            "tlc2.TLC",
+            "-simulate",
+            &format!("num={RECONFIG_SIM_TRACES}"),
+            "-seed",
+            &seed.to_string(),
+            "-depth",
+            &RECONFIG_SIM_DEPTH.to_string(),
+            "-config",
+            cfg_text,
+            spec_text,
+        ])
+        .current_dir(workspace_root)
+        .output()
+        .map_err(|e| format!("Failed to execute TLC reconfig simulation: {e}"))?;
+    let success = output.status.success();
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    for stale in std::fs::read_dir(workspace_root.join("specs"))
+        .map_err(|e| format!("Failed to list specs dir: {e}"))?
+    {
+        let stale = stale.map_err(|e| format!("Failed to read specs entry: {e}"))?;
+        let name = stale.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("anvil_reconfig_TTrace_")
+            && name.ends_with(".tla")
+            && let Err(e) = std::fs::remove_file(stale.path())
+        {
+            return Err(format!("Failed to remove stale TLC trace: {e}"));
+        }
+    }
+    Ok((combined, success))
+}
+
+/// Simulates the joint-consensus spec: the positive config must stay clean
+/// on every seed, and the negative config (concurrent joints allowed) must
+/// produce the `SerializedConfig` counterexample.
+fn run_reconfig_gate(jar: &Path, workspace_root: &Path) -> Result<(), String> {
+    let spec_path = workspace_root.join("specs").join("anvil_reconfig.tla");
+    let cfg_path = workspace_root
+        .join("specs")
+        .join("anvil_reconfig_smoke.cfg");
+    let neg_cfg_path = workspace_root
+        .join("specs")
+        .join("anvil_reconfig_negative.cfg");
+    for path in [&spec_path, &cfg_path, &neg_cfg_path] {
+        if !path.exists() {
+            return Err(format!(
+                "Reconfig spec file not found at {}",
+                path.display()
+            ));
+        }
+    }
+
+    println!(
+        "\n>>> 2. Simulating reconfig positive model ({} seeds x depth {RECONFIG_SIM_DEPTH} x {RECONFIG_SIM_TRACES} traces)...",
+        RECONFIG_SIM_SEEDS.len()
+    );
+    for seed in RECONFIG_SIM_SEEDS {
+        let (output, success) =
+            run_reconfig_simulation(jar, workspace_root, &spec_path, &cfg_path, seed)?;
+        if !success || simulation_failed(&output) {
+            return Err(format!(
+                "TLC reconfig positive simulation FAILED on seed {seed}!\nOUTPUT:\n{output}"
+            ));
+        }
+    }
+    println!(">>> [PASS] Reconfig positive simulation: no invariant violations on any trace.");
+
+    println!(
+        "\n>>> 3. Simulating reconfig negative model (expecting SerializedConfig counterexample)..."
+    );
+    let (output, _) = run_reconfig_simulation(jar, workspace_root, &spec_path, &neg_cfg_path, 1)?;
+    if !output.contains("SerializedConfig") || !simulation_failed(&output) {
+        return Err(format!(
+            "TLC reconfig negative simulation FAILED: expected a SerializedConfig counterexample, but TLC stayed clean.\nOUTPUT:\n{output}"
+        ));
+    }
+    println!(
+        ">>> [PASS] Reconfig negative simulation: concurrent joints violate SerializedConfig as expected."
     );
     Ok(())
 }

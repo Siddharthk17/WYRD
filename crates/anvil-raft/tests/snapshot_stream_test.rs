@@ -11,7 +11,7 @@ use anvil_raft::{
     Input, Message, Output, PersistOp, ProgressState, RaftConfig, RaftCore, ReceivedSnapshot,
     RecoveredState, Role, SnapshotChunkData,
 };
-use anvil_types::{LogIndex, NodeId, Term};
+use anvil_types::{ClusterId, LogIndex, NodeId, Term};
 use bytes::Bytes;
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
@@ -28,6 +28,8 @@ fn make_core(n: u64, peers: &[u64]) -> RaftCore {
     }
     RaftCore::new(
         RaftConfig {
+            cluster_id: ClusterId::from_raw(1),
+            learners: BTreeSet::new(),
             node_id: node_id(n),
             peers: set,
             election_timeout_ticks: 5,

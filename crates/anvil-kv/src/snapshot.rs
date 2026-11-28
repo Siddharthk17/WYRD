@@ -10,6 +10,8 @@
 use anvil_types::LogIndex;
 use bytes::Bytes;
 
+/// Magic for snapshot format v04 (v03 plus the membership section).
+pub const SNAPSHOT_MAGIC_V04: &[u8; 8] = b"ANVKVS04";
 /// Magic and version for snapshot format v03 (sessions plus config).
 pub const SNAPSHOT_MAGIC_V03: &[u8; 8] = b"ANVKVS03";
 /// Magic for the legacy v02 format (no sessions), still accepted on decode.

@@ -164,10 +164,14 @@ fn test_fixed_width_roundtrip_and_truncation() {
 fn test_entry_kind_discriminants() {
     assert_eq!(EntryKind::from_u8(1), Some(EntryKind::Normal));
     assert_eq!(EntryKind::from_u8(2), Some(EntryKind::NoOp));
+    assert_eq!(EntryKind::from_u8(3), Some(EntryKind::EnterJoint));
+    assert_eq!(EntryKind::from_u8(4), Some(EntryKind::LeaveJoint));
     assert_eq!(EntryKind::from_u8(0), None);
-    assert_eq!(EntryKind::from_u8(3), None);
+    assert_eq!(EntryKind::from_u8(5), None);
     assert_eq!(EntryKind::Normal.as_u8(), 1);
     assert_eq!(EntryKind::NoOp.as_u8(), 2);
+    assert_eq!(EntryKind::EnterJoint.as_u8(), 3);
+    assert_eq!(EntryKind::LeaveJoint.as_u8(), 4);
 }
 
 #[test]

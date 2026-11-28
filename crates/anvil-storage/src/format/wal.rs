@@ -196,6 +196,8 @@ pub fn compute_wal_record_crc(
     meta[36] = match kind {
         EntryKind::Normal => 0,
         EntryKind::NoOp => 1,
+        EntryKind::EnterJoint => 2,
+        EntryKind::LeaveJoint => 3,
     };
 
     let step1 = crc32c::crc32c_append(prev_crc, &meta);
@@ -283,6 +285,8 @@ impl WalRecordFrame {
         header[20] = match self.kind {
             EntryKind::Normal => 0,
             EntryKind::NoOp => 1,
+            EntryKind::EnterJoint => 2,
+            EntryKind::LeaveJoint => 3,
         };
         header[21..25].copy_from_slice(&self.crc32c.to_le_bytes());
         out.extend_from_slice(&header);
@@ -350,6 +354,8 @@ pub fn decode_wal_frame(
     let kind = match kind_byte {
         0 => EntryKind::Normal,
         1 => EntryKind::NoOp,
+        2 => EntryKind::EnterJoint,
+        3 => EntryKind::LeaveJoint,
         _ => {
             return WalScanResult::Corrupted(StorageError::InvalidField {
                 context: "wal_record_kind",

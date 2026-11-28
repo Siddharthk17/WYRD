@@ -48,7 +48,9 @@ pub struct FaultEvent {
     pub fault: FaultKind,
 }
 
-/// Fault vocabulary: network, process, clock, and disk faults.
+/// Fault vocabulary: network, process, clock, and disk faults, plus
+/// cluster membership changes. Reconfiguration events carry absolute node
+/// ids (stable across membership changes), not member indexes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FaultKind {
     /// Cut both directions of one member's links.
@@ -67,6 +69,18 @@ pub enum FaultKind {
     Transfer { node: usize },
     /// Add delivery delay in ticks while active.
     DelaySpike { extra_ticks: u64 },
+    /// Add a node as a learner. It catches up by log or snapshot, and the
+    /// nemesis promotes it once it stays within lag for enough ticks.
+    AddMember { node: u64 },
+    /// Remove a node from the voters (and learners). Removing the leader
+    /// is allowed and hands leadership off.
+    RemoveMember { node: u64 },
+    /// Replace a node whose storage is lost with a fresh node id. The new
+    /// node joins as a learner and catches up before promotion.
+    ReplaceMember { old: u64, new: u64 },
+    /// Explicitly promote a learner to voter. The nemesis also auto-promotes
+    /// learners that stay caught up; an explicit promote names one directly.
+    PromoteMember { node: u64 },
 }
 
 /// Swarm client-profile parameters. The client operation list expands
@@ -265,6 +279,15 @@ impl Plan {
             &mut events,
             &mut next_id,
         );
+        Self::push_reconfig_events(
+            seed,
+            workload.is_some(),
+            warmup_end,
+            heal_start,
+            cluster_size,
+            &mut events,
+            &mut next_id,
+        );
         events.sort_by_key(|event| (event.start, event.id));
 
         let mut proposals = Vec::new();
@@ -332,6 +355,87 @@ impl Plan {
                 start,
                 end,
                 fault: FaultKind::Transfer { node },
+            });
+        }
+    }
+
+    /// Adds membership-change events to workload plans so joint consensus,
+    /// learner catch-up, promotion, and removal execute under faults. The
+    /// presence draw uses an independent stream, so existing plans never
+    /// shift; per-event parameters still come from the stream keyed by
+    /// event id. New node ids continue past the initial cluster; at most
+    /// three join per plan to bound simulation cost.
+    fn push_reconfig_events(
+        seed: u64,
+        is_workload: bool,
+        warmup_end: u64,
+        heal_start: u64,
+        cluster_size: usize,
+        events: &mut Vec<FaultEvent>,
+        next_id: &mut u32,
+    ) {
+        if !is_workload {
+            return;
+        }
+        let mut rrng = DetRng::new(seed, "sim/plan/reconfig");
+        if rrng.gen_range(0..100) >= 25 {
+            return;
+        }
+        let mut voters: Vec<u64> = (1..=cluster_size as u64).collect();
+        let mut learners: Vec<u64> = Vec::new();
+        let mut next_node: u64 = cluster_size as u64 + 1;
+        let ops = 1 + rrng.gen_range(0..3);
+        for _ in 0..ops {
+            if events.len() >= MAX_EVENTS || next_node > cluster_size as u64 + 3 {
+                break;
+            }
+            let id = *next_id;
+            *next_id = next_id.saturating_add(1);
+            let mut erng = DetRng::new(seed, &format!("sim/plan/event/{id}"));
+            let span = heal_start.saturating_sub(warmup_end + 1).max(1);
+            let start = warmup_end + 1 + erng.gen_range(0..span) % span;
+            let end = (start + 1).min(heal_start);
+            let choice = erng.gen_range(0..100);
+            let fault = if choice < 35 && voters.len() + learners.len() < 6 {
+                let node = next_node;
+                next_node += 1;
+                learners.push(node);
+                FaultKind::AddMember { node }
+            } else if choice < 55 && !learners.is_empty() {
+                let at = usize::try_from(erng.gen_range(0..learners.len() as u64)).unwrap_or(0)
+                    % learners.len();
+                let node = learners.remove(at);
+                voters.push(node);
+                voters.sort_unstable();
+                FaultKind::PromoteMember { node }
+            } else if choice < 80 && voters.len() > 1 {
+                let at = usize::try_from(erng.gen_range(0..voters.len() as u64)).unwrap_or(0)
+                    % voters.len();
+                let node = voters.remove(at);
+                FaultKind::RemoveMember { node }
+            } else if voters.len() > 1 && next_node <= cluster_size as u64 + 3 {
+                let at = usize::try_from(erng.gen_range(0..voters.len() as u64)).unwrap_or(0)
+                    % voters.len();
+                let old = voters.remove(at);
+                let new = next_node;
+                next_node += 1;
+                learners.push(new);
+                FaultKind::ReplaceMember { old, new }
+            } else if !learners.is_empty() {
+                let at = usize::try_from(erng.gen_range(0..learners.len() as u64)).unwrap_or(0)
+                    % learners.len();
+                let node = learners.remove(at);
+                voters.push(node);
+                voters.sort_unstable();
+                FaultKind::PromoteMember { node }
+            } else {
+                continue;
+            };
+            events.push(FaultEvent {
+                id,
+                start,
+                end,
+                fault,
             });
         }
     }
@@ -490,6 +594,10 @@ fn encode_event(event: &FaultEvent) -> String {
         } => ("clock", format!("{node}-{rate_per_mille}")),
         FaultKind::Transfer { node } => ("xfer", node.to_string()),
         FaultKind::DelaySpike { extra_ticks } => ("delay", extra_ticks.to_string()),
+        FaultKind::AddMember { node } => ("add", node.to_string()),
+        FaultKind::RemoveMember { node } => ("remove", node.to_string()),
+        FaultKind::ReplaceMember { old, new } => ("replace", format!("{old}-{new}")),
+        FaultKind::PromoteMember { node } => ("promote", node.to_string()),
     };
     format!("{}:{}-{}:{kind}:{params}", event.id, event.start, event.end)
 }
@@ -540,6 +648,24 @@ fn decode_event(raw: &str) -> Result<FaultEvent, PlanError> {
         },
         "delay" => FaultKind::DelaySpike {
             extra_ticks: parse_bounded(params)?,
+        },
+        "add" => FaultKind::AddMember {
+            node: parse_node_id(params)?,
+        },
+        "remove" => FaultKind::RemoveMember {
+            node: parse_node_id(params)?,
+        },
+        "replace" => {
+            let (old_raw, new_raw) = params.split_once('-').ok_or(PlanError::BadField("event"))?;
+            let old = parse_node_id(old_raw)?;
+            let new = parse_node_id(new_raw)?;
+            if old == new {
+                return Err(PlanError::BadField("event"));
+            }
+            FaultKind::ReplaceMember { old, new }
+        }
+        "promote" => FaultKind::PromoteMember {
+            node: parse_node_id(params)?,
         },
         _ => return Err(PlanError::BadField("event")),
     };
@@ -664,7 +790,16 @@ impl DecodedPlan {
         if warmup_end > heal_start || heal_start > ticks {
             return Err(PlanError::BadField("phase"));
         }
-        if self.events.iter().any(|event| event_member(event) >= size) {
+        let has_bad_member = self.events.iter().any(|event| {
+            !matches!(
+                event.fault,
+                FaultKind::AddMember { .. }
+                    | FaultKind::RemoveMember { .. }
+                    | FaultKind::ReplaceMember { .. }
+                    | FaultKind::PromoteMember { .. }
+            ) && event_member(event) >= size
+        });
+        if has_bad_member {
             return Err(PlanError::BadField("member"));
         }
         let mut ids: Vec<u32> = self.events.iter().map(|event| event.id).collect();
@@ -695,7 +830,10 @@ impl DecodedPlan {
     }
 }
 
-/// Highest member or node index referenced by an event.
+/// Highest member or node index referenced by an event. Membership events
+/// carry absolute node ids, which may exceed the initial cluster size when
+/// members are added; shrinking the cluster size stays conservative and
+/// refuses while any event names a node outside the shrunken set.
 fn event_member(event: &FaultEvent) -> usize {
     match event.fault {
         FaultKind::Partition { member }
@@ -705,6 +843,12 @@ fn event_member(event: &FaultEvent) -> usize {
         | FaultKind::SlowClock { node: member, .. } => member,
         FaultKind::Asymmetric { from, to } => from.max(to),
         FaultKind::DelaySpike { .. } => 0,
+        FaultKind::AddMember { node }
+        | FaultKind::RemoveMember { node }
+        | FaultKind::PromoteMember { node } => usize::try_from(node).unwrap_or(usize::MAX),
+        FaultKind::ReplaceMember { old, new } => {
+            usize::try_from(old.max(new)).unwrap_or(usize::MAX)
+        }
     }
 }
 
@@ -734,6 +878,16 @@ fn parse_idx(raw: &str) -> Result<usize, PlanError> {
         return Err(PlanError::BadField("range"));
     }
     usize::try_from(value).map_err(|_| PlanError::BadField("range"))
+}
+
+/// Parses an absolute node id for membership events. Zero is rejected:
+/// `NodeId` is non-zero by construction.
+fn parse_node_id(raw: &str) -> Result<u64, PlanError> {
+    let value: u64 = raw.parse().map_err(|_| PlanError::BadField("number"))?;
+    if value == 0 || value > PLAN_LIMIT {
+        return Err(PlanError::BadField("range"));
+    }
+    Ok(value)
 }
 
 /// Outcome counters for one consensus-plan run. The farm aggregates these.
@@ -903,10 +1057,16 @@ fn begin_event(node_ids: &[anvil_types::NodeId], event: &FaultEvent, cluster: &m
                 cluster.step_node(leader, anvil_raft::Input::TransferLeader { to: target });
             }
         }
-        FaultKind::DelaySpike { .. } => {
-            // Delay spikes compose through the per-tick plan_net override in
-            // the run loop, so overlapping spikes add instead of clobbering.
-        }
+        // Delay spikes compose through the per-tick plan_net override in
+        // the run loop, so overlapping spikes add instead of clobbering.
+        // Membership changes run on workload plans only; consensus plans
+        // never generate them, so reaching here means a hand-written
+        // plan. The workload nemesis implements them elsewhere.
+        FaultKind::DelaySpike { .. }
+        | FaultKind::AddMember { .. }
+        | FaultKind::RemoveMember { .. }
+        | FaultKind::ReplaceMember { .. }
+        | FaultKind::PromoteMember { .. } => {}
     }
     cluster.trace_line(format!("fault begin id={} {:?}", event.id, event.fault));
 }
@@ -954,7 +1114,12 @@ fn end_event(
         FaultKind::SlowClock { node, .. } => {
             cluster.set_tick_skew(at(node), 1000);
         }
-        FaultKind::Transfer { .. } | FaultKind::DelaySpike { .. } => {}
+        FaultKind::Transfer { .. }
+        | FaultKind::DelaySpike { .. }
+        | FaultKind::AddMember { .. }
+        | FaultKind::RemoveMember { .. }
+        | FaultKind::ReplaceMember { .. }
+        | FaultKind::PromoteMember { .. } => {}
     }
     cluster.trace_line(format!("fault end id={} {:?}", event.id, event.fault));
 }

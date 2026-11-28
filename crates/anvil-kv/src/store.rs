@@ -8,7 +8,7 @@ use crate::command::{KvCommand, KvCommandError, KvResponse};
 use crate::snapshot::{
     ChunkError, SnapshotChunk, reassemble_chunks, snapshot_digest, split_into_chunks,
 };
-use anvil_types::{LogIndex, SeqNo, SessionId};
+use anvil_types::{LogIndex, MembershipSnapshot, SeqNo, SessionId};
 use bytes::Bytes;
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -177,9 +177,9 @@ impl KvStore {
                 Ok(KvResponse::Ok)
             }
             KvCommand::ExpireSessions { up_to_tick } => {
-                self.expire_sessions(up_to_tick);
+                let removed = self.expire_sessions(up_to_tick);
                 self.mix_hash(index, 7, &[], &up_to_tick.to_le_bytes());
-                Ok(KvResponse::Ok)
+                Ok(KvResponse::SessionsExpired { removed })
             }
             KvCommand::RegisterSession => {
                 let session = SessionId::from_raw(index.as_u64());
@@ -403,12 +403,12 @@ impl KvStore {
         self.sessions.len()
     }
 
-    /// Encodes a full v03 snapshot: map, tombstones, session table, config,
-    /// and state hash, at the applied index.
+    /// Encodes a full v04 snapshot: map, tombstones, session table, config,
+    /// membership section, and state hash, at the applied index.
     #[must_use]
-    pub fn encode_snapshot(&self) -> Bytes {
+    pub fn encode_snapshot(&self, membership: &MembershipSnapshot) -> Bytes {
         let mut buf = Vec::new();
-        buf.extend_from_slice(crate::snapshot::SNAPSHOT_MAGIC_V03);
+        buf.extend_from_slice(crate::snapshot::SNAPSHOT_MAGIC_V04);
         buf.extend_from_slice(&self.virtual_tick.to_le_bytes());
         buf.extend_from_slice(&self.applied_index.as_u64().to_le_bytes());
         buf.extend_from_slice(&self.state_hash);
@@ -439,6 +439,7 @@ impl KvStore {
             self.config.max_key_bytes,
             self.config.max_value_bytes,
         );
+        membership.encode(&mut buf);
         Bytes::from(buf)
     }
 
@@ -447,8 +448,12 @@ impl KvStore {
     /// Call on a handle from `snapshot_handle`, off the consensus path.
     /// Returns the chunks and the BLAKE3 digest of the full byte stream.
     #[must_use]
-    pub fn encode_snapshot_chunked(&self, chunk_bytes: usize) -> (Vec<SnapshotChunk>, [u8; 32]) {
-        let full = self.encode_snapshot();
+    pub fn encode_snapshot_chunked(
+        &self,
+        chunk_bytes: usize,
+        membership: &MembershipSnapshot,
+    ) -> (Vec<SnapshotChunk>, [u8; 32]) {
+        let full = self.encode_snapshot(membership);
         let digest = snapshot_digest(&full);
         let chunks = split_into_chunks(&full, chunk_bytes);
         (chunks, digest)
@@ -474,10 +479,13 @@ impl KvStore {
         Self::decode_snapshot(config, &full)
     }
 
-    /// Decodes a snapshot produced by `encode_snapshot`. Accepts v03 and the
-    /// legacy v02 format (no sessions or config). Bounds are checked before
-    /// any reservation.
+    /// Decodes a snapshot produced by `encode_snapshot`. Accepts v04 (with
+    /// the membership section) and the legacy v03 and v02 formats. Bounds
+    /// are checked before any reservation.
     pub fn decode_snapshot(config: KvConfig, input: &[u8]) -> Result<Self, KvError> {
+        if let Some(rest) = input.strip_prefix(crate::snapshot::SNAPSHOT_MAGIC_V04) {
+            return Self::decode_v04(config, rest);
+        }
         if let Some(rest) = input.strip_prefix(crate::snapshot::SNAPSHOT_MAGIC_V03) {
             return Self::decode_v03(config, rest);
         }
@@ -487,7 +495,48 @@ impl KvStore {
         Err(KvError::Decode)
     }
 
+    /// Extracts the membership section of a snapshot. v04 carries the live
+    /// config; older formats predate cluster membership and decode empty.
+    ///
+    /// # Errors
+    /// Returns [`KvError::Decode`] on unknown magics or malformed sections.
+    pub fn decode_membership(
+        config: KvConfig,
+        input: &[u8],
+    ) -> Result<MembershipSnapshot, KvError> {
+        if let Some(rest) = input.strip_prefix(crate::snapshot::SNAPSHOT_MAGIC_V04) {
+            let (_, mut cursor) = Self::parse_v03_body(config, rest)?;
+            return MembershipSnapshot::decode(&mut cursor).map_err(|_| KvError::Decode);
+        }
+        if input
+            .strip_prefix(crate::snapshot::SNAPSHOT_MAGIC_V03)
+            .is_some()
+            || input
+                .strip_prefix(crate::snapshot::SNAPSHOT_MAGIC_V02)
+                .is_some()
+        {
+            return Ok(MembershipSnapshot::empty());
+        }
+        Err(KvError::Decode)
+    }
+
+    fn decode_v04(config: KvConfig, rest: &[u8]) -> Result<Self, KvError> {
+        let (store, mut cursor) = Self::parse_v03_body(config, rest)?;
+        MembershipSnapshot::decode(&mut cursor).map_err(|_| KvError::Decode)?;
+        Ok(store)
+    }
+
     fn decode_v03(config: KvConfig, rest: &[u8]) -> Result<Self, KvError> {
+        let (store, cursor) = Self::parse_v03_body(config, rest)?;
+        if !cursor.is_empty() {
+            return Err(KvError::Decode);
+        }
+        Ok(store)
+    }
+
+    /// Parses the v03 body shared by v03 and v04, returning the store and
+    /// the unconsumed tail (empty for v03, the membership section for v04).
+    fn parse_v03_body(config: KvConfig, rest: &[u8]) -> Result<(Self, &[u8]), KvError> {
         if rest.len() < 56 {
             return Err(KvError::Decode);
         }
@@ -565,19 +614,19 @@ impl KvStore {
             config.max_key_bytes,
             config.max_value_bytes,
         )?;
-        if !cursor.is_empty() {
-            return Err(KvError::Decode);
-        }
-        Ok(Self {
-            config,
-            map,
-            sessions,
-            session_order,
-            virtual_tick,
-            state_hash,
-            applied_index: LogIndex::from_raw(applied),
-            tombstones,
-        })
+        Ok((
+            Self {
+                config,
+                map,
+                sessions,
+                session_order,
+                virtual_tick,
+                state_hash,
+                applied_index: LogIndex::from_raw(applied),
+                tombstones,
+            },
+            cursor,
+        ))
     }
 
     fn decode_v02(config: KvConfig, rest: &[u8]) -> Result<Self, KvError> {
@@ -721,7 +770,7 @@ impl KvStore {
         }
     }
 
-    fn expire_sessions(&mut self, up_to_tick: u64) {
+    fn expire_sessions(&mut self, up_to_tick: u64) -> u64 {
         let idle = self.config.session_idle_ticks;
         let expired: Vec<SessionId> = self
             .sessions
@@ -734,10 +783,12 @@ impl KvStore {
                 }
             })
             .collect();
+        let removed = expired.len() as u64;
         for id in expired {
             self.sessions.remove(&id);
             self.session_order.remove(&id);
         }
+        removed
     }
 
     fn evict_oldest_session(&mut self) {
@@ -949,6 +1000,10 @@ fn encode_response(response: &KvResponse, buf: &mut Vec<u8>, _max_key: usize, _m
         KvResponse::SessionExpired => buf.push(6),
         KvResponse::UnknownSession => buf.push(7),
         KvResponse::Duplicate => buf.push(8),
+        KvResponse::SessionsExpired { removed } => {
+            buf.push(9);
+            buf.extend_from_slice(&removed.to_le_bytes());
+        }
     }
 }
 
@@ -999,6 +1054,13 @@ fn decode_response(input: &[u8], max_key: usize, max_value: usize) -> Result<KvR
                 return Err(KvError::Decode);
             }
             Ok(KvResponse::Duplicate)
+        }
+        9 => {
+            if rest.len() != 8 {
+                return Err(KvError::Decode);
+            }
+            let removed = u64::from_le_bytes(rest.try_into().map_err(|_| KvError::Decode)?);
+            Ok(KvResponse::SessionsExpired { removed })
         }
         _ => Err(KvError::Decode),
     }

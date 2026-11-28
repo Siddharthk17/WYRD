@@ -115,6 +115,10 @@ fn test_plan_events_cover_fault_vocabulary() {
                 FaultKind::SlowClock { .. } => "clock",
                 FaultKind::Transfer { .. } => "transfer",
                 FaultKind::DelaySpike { .. } => "delay",
+                FaultKind::AddMember { .. } => "add",
+                FaultKind::RemoveMember { .. } => "remove",
+                FaultKind::ReplaceMember { .. } => "replace",
+                FaultKind::PromoteMember { .. } => "promote",
             };
             seen.insert(kind);
             classes.insert(kind);
@@ -177,4 +181,59 @@ fn test_shrinker_keeps_failure_minimal() {
     assert_eq!(shrunk.events.len(), 2);
     assert_eq!(shrunk.proposals.len(), 1);
     assert_eq!(shrunk.drop_pct, 0);
+}
+
+#[test]
+fn test_reconfig_events_encode_decode_roundtrip() {
+    use anvil_sim::Plan;
+    let plan = Plan::decode(
+        "anvil-plan/2;seed=9;size=3;ticks=60;warm=5;heal=55;net=0,0,0;salt=1;storage=0;\
+         ev=0:10-11:add:4;ev=1:20-21:promote:4;ev=2:30-31:remove:2;ev=3:40-41:replace:1-5",
+    )
+    .expect("reconfig events decode");
+    assert_eq!(plan.events.len(), 4);
+    let back = Plan::decode(&plan.encode()).expect("re-encode roundtrip");
+    assert_eq!(plan, back);
+
+    assert!(Plan::decode("anvil-plan/2;seed=1;size=3;ticks=30;warm=3;heal=27;net=0,0,0;salt=1;storage=0;ev=0:1-2:add:0").is_err());
+    assert!(Plan::decode("anvil-plan/2;seed=1;size=3;ticks=30;warm=3;heal=27;net=0,0,0;salt=1;storage=0;ev=0:1-2:replace:3-3").is_err());
+    assert!(Plan::decode("anvil-plan/2;seed=1;size=3;ticks=30;warm=3;heal=27;net=0,0,0;salt=1;storage=0;ev=0:1-2:bogus:3").is_err());
+}
+
+#[test]
+fn test_reconfig_generation_stays_within_bounds() {
+    use anvil_sim::WorkloadSpec;
+    let workload = WorkloadSpec {
+        clients: 2,
+        keys: 4,
+        ops_per_client: 2,
+        list_pct: 0,
+        think_ticks: 1,
+        timeout_ticks: 10,
+        client_crashes: false,
+        unordered: false,
+    };
+    let mut saw_reconfig = false;
+    for seed in 0..200u64 {
+        let plan = Plan::generate_for_workload(seed, false, workload.clone());
+        for event in &plan.events {
+            match event.fault {
+                FaultKind::AddMember { node }
+                | FaultKind::RemoveMember { node }
+                | FaultKind::PromoteMember { node } => {
+                    assert!(node != 0, "node ids are non-zero");
+                    assert!(event.end > event.start);
+                    saw_reconfig = true;
+                }
+                FaultKind::ReplaceMember { old, new } => {
+                    assert!(old != 0 && new != 0 && old != new);
+                    saw_reconfig = true;
+                }
+                _ => {}
+            }
+        }
+        let back = Plan::decode(&plan.encode()).expect("roundtrip");
+        assert_eq!(plan, back);
+    }
+    assert!(saw_reconfig, "reconfig events never generated");
 }

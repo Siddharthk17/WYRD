@@ -55,3 +55,4 @@ MC.cfg
 
 # Go cross-check build output
 crates/anvil-check/tests/porcupine/anvilporcupine
+specs/*TTrace*.tla

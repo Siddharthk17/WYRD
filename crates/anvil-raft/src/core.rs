@@ -7,11 +7,14 @@ use crate::messages::Message;
 use crate::progress::PeerProgress;
 use crate::progress::SnapshotProgress;
 use crate::types::{
-    Input, OutboundMessage, Output, PersistOp, PersistToken, RaftConfig, ReadIndexResult,
-    ReceivedSnapshot, RecoveredState, Role, RoleChangeEvent, SnapshotChunkData, SnapshotRequest,
-    SpecProjection,
+    ConfigReject, Input, MembershipEvent, OutboundMessage, Output, PersistOp, PersistToken,
+    RaftConfig, ReadIndexResult, ReceivedSnapshot, RecoveredState, Role, RoleChangeEvent,
+    SnapshotChunkData, SnapshotRequest, SpecProjection,
 };
-use anvil_types::{Entry, LogIndex, NodeId, Term, sometimes};
+use anvil_types::{
+    ClusterConfig, Entry, EntryKind, JointSnapshot, LogIndex, MembershipSnapshot, NodeId, Term,
+    config_entry, decode_config_entry, sometimes,
+};
 use bytes::Bytes;
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::Rng;
@@ -75,6 +78,18 @@ const MAX_SNAPSHOT_CHUNKS: usize = 65_536;
 const MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_SNAPSHOT_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
+/// Joint-consensus state between an appended `EnterJoint` and the commit of
+/// the matching `LeaveJoint`. A quorum needs a majority of the old voters
+/// and a majority of the new voters.
+#[derive(Debug, Clone)]
+struct JointState {
+    old_voters: Vec<NodeId>,
+    new_voters: Vec<NodeId>,
+    old_learners: BTreeSet<NodeId>,
+    new_learners: BTreeSet<NodeId>,
+    enter_index: LogIndex,
+}
+
 /// The sans-IO consensus core implementing election, replication, and safety.
 #[derive(Debug)]
 pub struct RaftCore {
@@ -103,10 +118,27 @@ pub struct RaftCore {
     leader_snapshot: Option<LeaderSnapshot>,
     follower_snapshot: Option<FollowerSnapshot>,
     snapshot_requested: BTreeMap<NodeId, LogIndex>,
+    voters: Vec<NodeId>,
+    learners: BTreeSet<NodeId>,
+    joint: Option<JointState>,
+    pending_config: Option<LogIndex>,
+    leave_index: Option<LogIndex>,
+    /// Index of the committed `LeaveJoint` that removed this node. A removed
+    /// node still answers vote requests from candidates whose log includes
+    /// that entry; otherwise joint consensus deadlocks when the removed node
+    /// is the only old-quorum partner left.
+    removed_after: Option<LogIndex>,
+    committed_current_term: bool,
+    installed_base: Option<LogIndex>,
+    repair_from: Option<LogIndex>,
 }
 
 impl RaftCore {
     /// Constructs a new `RaftCore` instance from configuration, recovered state, and a `ChaCha8` RNG.
+    ///
+    /// Recovery replays the log into the membership before the log moves
+    /// into the store, which keeps one extra clone on this cold path.
+    #[allow(clippy::needless_pass_by_value)]
     #[must_use]
     pub fn new(config: RaftConfig, recovered: RecoveredState, mut rng: ChaCha8Rng) -> Self {
         assert!(
@@ -141,13 +173,24 @@ impl RaftCore {
                 PeerProgress::new(initial_next, config.max_inflight_messages),
             );
         }
+        for &learner in &config.learners {
+            progress.insert(
+                learner,
+                PeerProgress::new(initial_next, config.max_inflight_messages),
+            );
+        }
 
-        Self {
+        let mut voters: Vec<NodeId> = config.initial_voters();
+        voters.sort();
+        voters.dedup();
+        let learners = config.learners.clone();
+
+        let mut core = Self {
             config,
             term: recovered.current_term,
             voted_for: recovered.voted_for,
             role: Role::Follower,
-            log: RaftLog::new(recovered.entries),
+            log: RaftLog::new(recovered.entries.clone()),
             commit_index: recovered.commit_index,
             applied_index: LogIndex::from_raw(0),
             progress,
@@ -168,7 +211,18 @@ impl RaftCore {
             leader_snapshot: None,
             follower_snapshot: None,
             snapshot_requested: BTreeMap::new(),
-        }
+            voters,
+            learners,
+            joint: None,
+            pending_config: None,
+            leave_index: None,
+            removed_after: None,
+            committed_current_term: false,
+            installed_base: None,
+            repair_from: None,
+        };
+        core.rebuild_membership_from_log(&recovered.entries, recovered.commit_index);
+        core
     }
 
     /// Primary sans-IO transition function: consumes an input event and writes side-effects to `output`.
@@ -177,11 +231,23 @@ impl RaftCore {
             Input::Tick => self.handle_tick(output),
             Input::Recv { from, message } => self.handle_message(from, message, output),
             Input::Propose { payload } => self.handle_propose(payload, output),
+            Input::ProposeConfig { voters, learners } => {
+                self.handle_propose_config(voters, learners, output);
+            }
             Input::ReadIndex { context } => self.handle_read_index(context, output),
             Input::Persisted { token } => self.handle_persisted(token, output),
             Input::Applied { index } => self.handle_applied(index),
             Input::CompactLog { up_to } => self.handle_compact_log(up_to),
             Input::TransferLeader { to } => self.handle_transfer_leader(to, output),
+            Input::RestoreMembership { base, membership } => {
+                self.handle_restore_membership(base, membership, output);
+            }
+            Input::SetNeedsRepair { from_index } => {
+                self.handle_set_needs_repair(from_index, output);
+            }
+            Input::ClearNeedsRepair => {
+                self.handle_clear_needs_repair(output);
+            }
             Input::SnapshotReady {
                 last_included_index,
                 last_included_term,
@@ -248,6 +314,461 @@ impl RaftCore {
         &self.progress
     }
 
+    /// Returns the cluster this node belongs to.
+    #[must_use]
+    pub const fn cluster_id(&self) -> anvil_types::ClusterId {
+        self.config.cluster_id
+    }
+
+    /// Returns the current effective voters. During joint consensus the
+    /// union of the old and the new voters is returned.
+    #[must_use]
+    pub fn membership_voters(&self) -> Vec<NodeId> {
+        if let Some(joint) = &self.joint {
+            let mut union = joint.old_voters.clone();
+            for node in &joint.new_voters {
+                if !union.contains(node) {
+                    union.push(*node);
+                }
+            }
+            union.sort();
+            union
+        } else {
+            self.voters.clone()
+        }
+    }
+
+    /// Returns the current effective learners (union during joint consensus).
+    #[must_use]
+    pub fn membership_learners(&self) -> BTreeSet<NodeId> {
+        self.learners.clone()
+    }
+
+    /// Returns true while an `EnterJoint` is active and its `LeaveJoint`
+    /// has not yet committed.
+    #[must_use]
+    pub const fn in_joint(&self) -> bool {
+        self.joint.is_some()
+    }
+
+    /// Returns the current membership as a snapshot carrier: effective
+    /// voters and learners plus joint state. The node embeds this in
+    /// snapshots so installers adopt the same config.
+    #[must_use]
+    pub fn membership_snapshot(&self) -> MembershipSnapshot {
+        let joint = self.joint.as_ref().map(|joint| JointSnapshot {
+            old_voters: joint.old_voters.clone(),
+            new_voters: joint.new_voters.clone(),
+            old_learners: joint.old_learners.iter().copied().collect(),
+            new_learners: joint.new_learners.iter().copied().collect(),
+            enter_index: joint.enter_index,
+        });
+        MembershipSnapshot {
+            voters: self.membership_voters(),
+            learners: self.learners.iter().copied().collect(),
+            joint,
+        }
+    }
+
+    /// Restores membership from an installed snapshot. Only the snapshot
+    /// just installed counts; anything older is ignored.
+    fn handle_restore_membership(
+        &mut self,
+        base: LogIndex,
+        membership: MembershipSnapshot,
+        output: &mut Output,
+    ) {
+        if self.installed_base != Some(base) {
+            return;
+        }
+        self.installed_base = None;
+        if membership.voters.is_empty() {
+            return;
+        }
+        let mut voters = membership.voters.clone();
+        voters.sort();
+        voters.dedup();
+        let mut learners: BTreeSet<NodeId> = membership.learners.iter().copied().collect();
+        learners.retain(|learner| !voters.contains(learner));
+        let joint = membership.joint.and_then(|joint| {
+            if joint.enter_index > base || joint.new_voters.is_empty() {
+                return None;
+            }
+            let mut old_voters = joint.old_voters.clone();
+            old_voters.sort();
+            old_voters.dedup();
+            let mut new_voters = joint.new_voters.clone();
+            new_voters.sort();
+            new_voters.dedup();
+            let old_learners: BTreeSet<NodeId> = joint.old_learners.iter().copied().collect();
+            let new_learners: BTreeSet<NodeId> = joint.new_learners.iter().copied().collect();
+            Some(JointState {
+                old_voters,
+                new_voters,
+                old_learners,
+                new_learners,
+                enter_index: joint.enter_index,
+            })
+        });
+        self.voters = voters;
+        self.learners = learners;
+        self.joint = joint;
+        self.pending_config = self.joint.as_ref().map(|state| state.enter_index);
+        self.leave_index = None;
+        // A snapshot carries the config as of `base`. If it no longer names
+        // this node, the removal is committed at `base`, so the node may
+        // answer candidates whose logs cover it.
+        self.removed_after = if self.joint.is_none()
+            && !self.voters.is_empty()
+            && !self.voters.contains(&self.config.node_id)
+            && !self.learners.contains(&self.config.node_id)
+        {
+            Some(base)
+        } else {
+            None
+        };
+        self.resolve_committed_configs(self.commit_index);
+        let next = base.next().unwrap_or(base);
+        let mut fresh = BTreeMap::new();
+        let mut targets = self.membership_voters();
+        for learner in &self.learners {
+            if !targets.contains(learner) {
+                targets.push(*learner);
+            }
+        }
+        for target in targets {
+            if target == self.config.node_id {
+                continue;
+            }
+            fresh.insert(
+                target,
+                PeerProgress::new(next, self.config.max_inflight_messages),
+            );
+        }
+        self.progress = fresh;
+        sometimes!(output.sometimes_hits, "raft.config.restore");
+    }
+
+    /// Returns the repair base when flagged, `None` once verified whole.
+    #[must_use]
+    pub const fn repair_from(&self) -> Option<LogIndex> {
+        self.repair_from
+    }
+
+    /// Marks the node as needing repair from `from_index`. A flagged leader
+    /// hands off and steps down: it must not lead while its storage is
+    /// unverified.
+    fn handle_set_needs_repair(&mut self, from_index: LogIndex, output: &mut Output) {
+        if from_index.is_zero() {
+            return;
+        }
+        if self.repair_from == Some(from_index) {
+            return;
+        }
+        self.repair_from = Some(from_index);
+        sometimes!(output.sometimes_hits, "raft.repair.enter");
+        if self.role == Role::Leader {
+            if let Some(&heir) = self
+                .membership_voters()
+                .iter()
+                .find(|voter| **voter != self.config.node_id)
+            {
+                output.messages.push(OutboundMessage {
+                    to: heir,
+                    message: Message::TimeoutNow {
+                        term: self.term,
+                        leader_id: self.config.node_id,
+                    },
+                });
+            }
+            self.transition_to_follower(self.term, output);
+        }
+    }
+
+    /// Clears the repair flag once the missing range is verified whole.
+    fn handle_clear_needs_repair(&mut self, output: &mut Output) {
+        if self.repair_from.is_none() {
+            return;
+        }
+        self.repair_from = None;
+        sometimes!(output.sometimes_hits, "raft.repair.cleared");
+    }
+
+    /// Match index this node reports: the last good index while flagged, so
+    /// the leader re-replicates the unverified suffix through the validated
+    /// path instead of counting it as durable.
+    fn report_match(&self, matched: LogIndex) -> LogIndex {
+        match self.repair_from {
+            Some(from) => {
+                let last_good = from.prev().unwrap_or(LogIndex::from_raw(0));
+                std::cmp::min(matched, last_good)
+            }
+            None => matched,
+        }
+    }
+
+    /// Rebuilds membership by replaying config entries in log order, then
+    /// clearing state the commit index proves durable.
+    fn rebuild_membership_from_log(&mut self, entries: &[Entry], commit: LogIndex) {
+        for entry in entries {
+            match entry.kind {
+                EntryKind::EnterJoint | EntryKind::LeaveJoint => {
+                    self.note_config_appended(entry);
+                }
+                EntryKind::Normal | EntryKind::NoOp => {}
+            }
+        }
+        self.resolve_committed_configs(commit);
+    }
+
+    /// Applies an appended config entry to the effective membership.
+    fn note_config_appended(&mut self, entry: &Entry) {
+        let Ok(config) = decode_config_entry(entry) else {
+            return;
+        };
+        match entry.kind {
+            EntryKind::EnterJoint => {
+                let old_learners = self.learners.clone();
+                let mut learners = old_learners.clone();
+                for learner in config.learners() {
+                    learners.insert(*learner);
+                }
+                for voter in config.voters() {
+                    self.ensure_progress(*voter);
+                }
+                for learner in config.learners() {
+                    self.ensure_progress(*learner);
+                }
+                if config.voters().contains(&self.config.node_id)
+                    || config.learners().contains(&self.config.node_id)
+                {
+                    self.removed_after = None;
+                }
+                self.joint = Some(JointState {
+                    old_voters: self.voters.clone(),
+                    new_voters: config.voters().to_vec(),
+                    old_learners,
+                    new_learners: config.learners().iter().copied().collect(),
+                    enter_index: entry.index,
+                });
+                self.learners = learners;
+                self.pending_config = Some(entry.index);
+            }
+            EntryKind::LeaveJoint => {
+                self.voters = config.voters().to_vec();
+                self.learners = config.learners().iter().copied().collect();
+                self.leave_index = Some(entry.index);
+                self.pending_config = Some(entry.index);
+                if !self.voters.contains(&self.config.node_id)
+                    && !self.learners.contains(&self.config.node_id)
+                {
+                    self.removed_after = Some(entry.index);
+                }
+            }
+            EntryKind::Normal | EntryKind::NoOp => {}
+        }
+    }
+
+    /// Rolls membership back when conflicting entries are truncated away.
+    fn rollback_config_for_truncate(&mut self, trunc_idx: LogIndex) {
+        let Some(joint) = self.joint.clone() else {
+            return;
+        };
+        if trunc_idx <= joint.enter_index {
+            self.voters = joint.old_voters;
+            self.learners = joint.old_learners;
+            self.joint = None;
+            self.pending_config = None;
+            self.leave_index = None;
+            self.removed_after = None;
+        } else if self.leave_index.is_some_and(|leave| trunc_idx <= leave) {
+            self.voters.clone_from(&joint.new_voters);
+            self.learners.clone_from(&joint.new_learners);
+            self.leave_index = None;
+            self.pending_config = Some(joint.enter_index);
+            self.removed_after = None;
+        }
+    }
+
+    /// Clears joint and pending state the commit index proves durable.
+    fn resolve_committed_configs(&mut self, commit: LogIndex) {
+        if let Some(pending) = self.pending_config
+            && pending <= commit
+            && self.leave_index.is_none_or(|leave| leave > commit)
+        {
+            self.pending_config = None;
+        }
+        if let Some(leave) = self.leave_index
+            && leave <= commit
+        {
+            self.joint = None;
+            self.leave_index = None;
+            self.pending_config = None;
+        }
+    }
+
+    /// Ensures a replication target has progress tracking.
+    fn ensure_progress(&mut self, node: NodeId) {
+        if node == self.config.node_id {
+            return;
+        }
+        if !self.progress.contains_key(&node) {
+            let next = self
+                .log
+                .last_index()
+                .next()
+                .unwrap_or(self.log.last_index());
+            self.progress.insert(
+                node,
+                PeerProgress::new(next, self.config.max_inflight_messages),
+            );
+        }
+    }
+
+    /// Returns true when `node` votes in the current effective config.
+    fn is_effective_voter(&self, node: NodeId) -> bool {
+        if let Some(joint) = &self.joint {
+            joint.old_voters.contains(&node) || joint.new_voters.contains(&node)
+        } else {
+            self.voters.contains(&node)
+        }
+    }
+
+    /// Returns true when `node` is a voter or a learner in the effective
+    /// config. A node with an empty voter set and no joint state is still
+    /// joining: it accepts traffic from anyone so the cluster can configure
+    /// it.
+    fn is_member_sender(&self, node: NodeId) -> bool {
+        if self.voters.is_empty() && self.joint.is_none() {
+            return true;
+        }
+        self.is_effective_voter(node) || self.learners.contains(&node)
+    }
+
+    /// Returns true when `from` may send `message`.
+    ///
+    /// Election and transfer traffic is limited to members so a removed
+    /// server cannot disrupt the cluster. Replication requests are accepted
+    /// from any sender: a follower that missed a membership change while
+    /// partitioned still holds the old config, where the current leader is a
+    /// stranger, and ignoring its appends would strand that follower
+    /// forever. Log matching and the receiver-side commit clamp keep such
+    /// appends safe.
+    fn accepts_sender(&self, from: NodeId, message: &Message) -> bool {
+        match message {
+            Message::AppendEntriesRequest { .. }
+            | Message::HeartbeatRequest { .. }
+            | Message::InstallSnapshotRequest { .. } => true,
+            _ => self.is_member_sender(from),
+        }
+    }
+
+    /// Returns true when this node answers a candidate whose last log index
+    /// is `candidate_last`. Voters always do. A node removed by a committed
+    /// `LeaveJoint` also answers once the candidate's log covers that entry:
+    /// the candidate still counts this node in its joint old quorum, and
+    /// refusing would deadlock the handover.
+    fn may_grant_vote(&self, candidate_last: LogIndex) -> bool {
+        if self.is_effective_voter(self.config.node_id) {
+            return true;
+        }
+        self.removed_after
+            .is_some_and(|leave| candidate_last >= leave)
+    }
+
+    /// Returns true when this node may campaign: voters only, never learners,
+    /// never nodes removed from the effective config, and never nodes under
+    /// repair.
+    fn can_campaign(&self) -> bool {
+        self.repair_from.is_none() && self.is_effective_voter(self.config.node_id)
+    }
+
+    /// Majority quorum size for `count` voters.
+    const fn majority_of(count: usize) -> usize {
+        count / 2 + 1
+    }
+
+    /// Match index the leader attributes to `node`.
+    fn match_of(&self, node: NodeId) -> LogIndex {
+        if node == self.config.node_id {
+            return self.leader_persisted_index;
+        }
+        self.progress
+            .get(&node)
+            .map_or(LogIndex::from_raw(0), |progress| progress.match_index)
+    }
+
+    /// Largest index a majority of `voters` has matched.
+    fn quorum_commit_for(&self, voters: &[NodeId]) -> LogIndex {
+        let mut matches = [LogIndex::from_raw(0); 32];
+        let mut len = 0usize;
+        for voter in voters {
+            if len < matches.len() {
+                matches[len] = self.match_of(*voter);
+                len += 1;
+            }
+        }
+        let active = &mut matches[..len];
+        active.sort_unstable();
+        let quorum = Self::majority_of(active.len());
+        if active.len() < quorum {
+            return LogIndex::from_raw(0);
+        }
+        active[active.len() - quorum]
+    }
+
+    /// Largest committable index under the effective config.
+    fn effective_commit(&self) -> LogIndex {
+        if let Some(joint) = &self.joint {
+            let old = self.quorum_commit_for(&joint.old_voters);
+            let new = self.quorum_commit_for(&joint.new_voters);
+            std::cmp::min(old, new)
+        } else {
+            self.quorum_commit_for(&self.voters)
+        }
+    }
+
+    /// Votes inside `voters` from `ids`, counting this node when requested.
+    fn count_votes_in(
+        &self,
+        ids: &BTreeSet<NodeId>,
+        include_self: bool,
+        voters: &[NodeId],
+    ) -> usize {
+        let mut count = 0usize;
+        for voter in voters {
+            if ids.contains(voter) || (include_self && *voter == self.config.node_id) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Returns true when `ids` plus this node hold the effective quorum.
+    fn effective_quorum_met(&self, ids: &BTreeSet<NodeId>, include_self: bool) -> bool {
+        if let Some(joint) = &self.joint {
+            let old_votes = self.count_votes_in(ids, include_self, &joint.old_voters);
+            let new_votes = self.count_votes_in(ids, include_self, &joint.new_voters);
+            old_votes >= Self::majority_of(joint.old_voters.len())
+                && new_votes >= Self::majority_of(joint.new_voters.len())
+        } else {
+            let votes = self.count_votes_in(ids, include_self, &self.voters);
+            votes >= Self::majority_of(self.voters.len())
+        }
+    }
+
+    /// Copies replication target ids into a stack buffer without allocating.
+    fn replica_array(&self, buf: &mut [NodeId; 32]) -> usize {
+        let mut len = 0usize;
+        for &node in self.progress.keys() {
+            if len < buf.len() {
+                buf[len] = node;
+                len += 1;
+            }
+        }
+        len
+    }
+
     /// Testing helper to set consensus role directly.
     #[doc(hidden)]
     pub fn testing_set_role(&mut self, role: Role) {
@@ -277,6 +798,10 @@ impl RaftCore {
                         &mut self.rng,
                     );
                     self.leader_sticky = false;
+                    // Learners and removed nodes never campaign.
+                    if !self.can_campaign() {
+                        return;
+                    }
                     if self.config.pre_vote_enabled {
                         self.start_pre_vote(output);
                     } else {
@@ -307,28 +832,18 @@ impl RaftCore {
 
                 // Pump snapshot streams within the flow-control window so a
                 // full window is in flight even before the first ack returns.
-                if self.config.peers.len() < 16 {
-                    let mut peers = [NodeId::from_nonzero(core::num::NonZeroU64::MIN); 16];
-                    let peer_len = self.peer_array(&mut peers);
-                    for &peer in &peers[..peer_len] {
-                        self.resend_snapshot_chunk(peer, output);
-                        self.send_snapshot_chunk(peer, output);
-                    }
-                } else {
-                    let peers: Vec<NodeId> = self.config.peers.iter().copied().collect();
-                    for peer in peers {
-                        self.resend_snapshot_chunk(peer, output);
-                        self.send_snapshot_chunk(peer, output);
-                    }
+                let mut replicas = [NodeId::from_nonzero(core::num::NonZeroU64::MIN); 32];
+                let replica_len = self.replica_array(&mut replicas);
+                for &peer in &replicas[..replica_len] {
+                    self.resend_snapshot_chunk(peer, output);
+                    self.send_snapshot_chunk(peer, output);
                 }
 
                 if self.config.check_quorum
                     && self.election_elapsed_ticks >= self.config.election_timeout_ticks
                 {
                     self.election_elapsed_ticks = 0;
-                    // Cluster quorum requires majority including self
-                    let acks_count = self.heartbeat_acks.len() + 1;
-                    if acks_count < self.config.quorum_size() {
+                    if !self.effective_quorum_met(&self.heartbeat_acks, true) {
                         self.transition_to_follower(self.term, output);
                     }
                     self.heartbeat_acks.clear();
@@ -338,7 +853,7 @@ impl RaftCore {
     }
 
     fn start_pre_vote(&mut self, output: &mut Output) {
-        if self.config.peers.is_empty() {
+        if self.membership_voters().len() <= 1 {
             self.start_election(output);
             return;
         }
@@ -352,7 +867,7 @@ impl RaftCore {
         let last_log_index = self.log.last_index();
         let last_log_term = self.log.last_term();
 
-        for &peer in &self.config.peers {
+        for peer in self.election_targets() {
             output.messages.push(OutboundMessage {
                 to: peer,
                 message: Message::PreVoteRequest {
@@ -365,6 +880,14 @@ impl RaftCore {
         }
     }
 
+    /// Other effective voters this node solicits votes from.
+    fn election_targets(&self) -> Vec<NodeId> {
+        self.membership_voters()
+            .into_iter()
+            .filter(|node| *node != self.config.node_id)
+            .collect()
+    }
+
     fn handle_pre_vote_request(
         &mut self,
         from: NodeId,
@@ -375,8 +898,13 @@ impl RaftCore {
         output: &mut Output,
     ) {
         let is_log_ok = self.is_log_up_to_date(last_log_index, last_log_term);
-        let grant =
-            term >= self.term && is_log_ok && (!self.leader_sticky || self.role == Role::Leader);
+        // Only voters grant pre-votes. Learners, removed nodes, and nodes
+        // under repair answer false so they can never feed a quorum.
+        let grant = self.repair_from.is_none()
+            && self.may_grant_vote(last_log_index)
+            && term >= self.term
+            && is_log_ok
+            && (!self.leader_sticky || self.role == Role::Leader);
 
         output.messages.push(OutboundMessage {
             to: from,
@@ -406,7 +934,7 @@ impl RaftCore {
 
         if vote_granted && term == self.term {
             self.pre_votes_granted.insert(from);
-            if self.pre_votes_granted.len() >= self.config.quorum_size() {
+            if self.effective_quorum_met(&self.pre_votes_granted, true) {
                 self.start_election(output);
             }
         }
@@ -428,7 +956,8 @@ impl RaftCore {
             token,
         });
 
-        if self.config.peers.is_empty() {
+        let targets = self.election_targets();
+        if targets.is_empty() {
             self.become_leader(output);
             return;
         }
@@ -437,10 +966,9 @@ impl RaftCore {
         let last_log_term = self.log.last_term();
         let term = self.term;
         let candidate_id = self.config.node_id;
-        let peers: Vec<NodeId> = self.config.peers.iter().copied().collect();
 
         // Term and vote reach disk before any message reveals them.
-        for peer in peers {
+        for peer in targets {
             let request = OutboundMessage {
                 to: peer,
                 message: Message::RequestVoteRequest {
@@ -470,7 +998,13 @@ impl RaftCore {
 
         let can_vote = self.voted_for.is_none() || self.voted_for == Some(candidate_id);
         let is_log_ok = self.is_log_up_to_date(last_log_index, last_log_term);
-        let grant = term == self.term && can_vote && is_log_ok;
+        // Only voters grant votes. Learners, removed nodes, and nodes under
+        // repair never vote.
+        let grant = term == self.term
+            && can_vote
+            && is_log_ok
+            && self.repair_from.is_none()
+            && self.may_grant_vote(last_log_index);
 
         if grant {
             self.voted_for = Some(candidate_id);
@@ -532,7 +1066,7 @@ impl RaftCore {
 
         if vote_granted {
             self.votes_granted.insert(from);
-            if self.votes_granted.len() >= self.config.quorum_size() {
+            if self.effective_quorum_met(&self.votes_granted, true) {
                 self.become_leader(output);
             }
         }
@@ -548,6 +1082,7 @@ impl RaftCore {
         self.heartbeat_elapsed_ticks = 0;
         self.election_elapsed_ticks = 0;
         self.heartbeat_acks.clear();
+        self.committed_current_term = false;
         // Snapshot streams abort on leader change. A new leader streams only
         // snapshots its own node supplies for this term.
         self.leader_snapshot = None;
@@ -563,12 +1098,26 @@ impl RaftCore {
             .last_index()
             .next()
             .unwrap_or(self.log.last_index());
-        for peer_progress in self.progress.values_mut() {
-            peer_progress.next_index = next_idx;
-            peer_progress.match_index = LogIndex::from_raw(0);
-            peer_progress.state = crate::progress::ProgressState::Probe;
-            peer_progress.inflight_count = 0;
+        // Rebuild progress for every replication target: voters, learners,
+        // and both sides of a joint config. Entries the new config dropped
+        // lose their tracking here.
+        let mut targets = self.membership_voters();
+        for learner in &self.learners {
+            if !targets.contains(learner) {
+                targets.push(*learner);
+            }
         }
+        let mut fresh = BTreeMap::new();
+        for target in targets {
+            if target == self.config.node_id {
+                continue;
+            }
+            fresh.insert(
+                target,
+                PeerProgress::new(next_idx, self.config.max_inflight_messages),
+            );
+        }
+        self.progress = fresh;
 
         // Leader appends a no-op entry upon election (charter requirement)
         let noop_index = next_idx;
@@ -623,6 +1172,145 @@ impl RaftCore {
         self.broadcast_append_entries(output);
     }
 
+    fn handle_propose_config(
+        &mut self,
+        voters: Vec<NodeId>,
+        learners: Vec<NodeId>,
+        output: &mut Output,
+    ) {
+        if self.role != Role::Leader || self.lead_transferee.is_some() {
+            output.membership_events.push(MembershipEvent::Rejected {
+                reason: ConfigReject::NotLeader,
+            });
+            return;
+        }
+        // Serialized changes: one uncommitted config entry at a time.
+        if self.joint.is_some()
+            || self
+                .pending_config
+                .is_some_and(|pending| pending > self.commit_index)
+        {
+            sometimes!(output.sometimes_hits, "raft.config.rejected");
+            output.membership_events.push(MembershipEvent::Rejected {
+                reason: ConfigReject::ConfigInProgress,
+            });
+            return;
+        }
+        // The leader must have committed an entry in its own term first, so
+        // the new config cannot commit over an uncommitted past.
+        if !self.committed_current_term {
+            sometimes!(output.sometimes_hits, "raft.config.rejected");
+            output.membership_events.push(MembershipEvent::Rejected {
+                reason: ConfigReject::NoCurrentTermCommit,
+            });
+            return;
+        }
+        let config = match ClusterConfig::new(voters, learners) {
+            Ok(config) => config,
+            Err(err) => {
+                output.membership_events.push(MembershipEvent::Rejected {
+                    reason: ConfigReject::InvalidConfig(err),
+                });
+                return;
+            }
+        };
+
+        assert!(
+            self.log.last_index().next().is_some(),
+            "log index overflow on config propose"
+        );
+        let entry_index = self
+            .log
+            .last_index()
+            .next()
+            .unwrap_or(self.log.last_index());
+        let entry = config_entry(EntryKind::EnterJoint, entry_index, self.term, &config);
+        self.log.append(entry.clone());
+
+        let token = self.next_token();
+        output.persist_ops.push(PersistOp::AppendEntries {
+            prev_index: entry_index.prev().unwrap_or(LogIndex::from_raw(0)),
+            entries: vec![entry.clone()],
+            token,
+        });
+        self.queue_pending_action(token, PendingAction::LeaderPersisted { entry_index });
+        self.note_config_appended(&entry);
+        sometimes!(output.sometimes_hits, "raft.config.enter");
+        output
+            .membership_events
+            .push(MembershipEvent::Proposed { index: entry_index });
+
+        self.broadcast_append_entries(output);
+    }
+
+    /// Appends `LeaveJoint` carrying the final config once the joint entry
+    /// commits. Takes effect on append; the joint marker stays until commit
+    /// so concurrent changes stay refused and the removed leader knows when
+    /// to step down.
+    fn append_leave_joint(&mut self, output: &mut Output) {
+        let Some(joint) = self.joint.clone() else {
+            return;
+        };
+        let Ok(config) = ClusterConfig::new(
+            joint.new_voters.clone(),
+            joint.new_learners.iter().copied().collect(),
+        ) else {
+            return;
+        };
+        assert!(
+            self.log.last_index().next().is_some(),
+            "log index overflow on auto leave"
+        );
+        let entry_index = self
+            .log
+            .last_index()
+            .next()
+            .unwrap_or(self.log.last_index());
+        let entry = config_entry(EntryKind::LeaveJoint, entry_index, self.term, &config);
+        self.log.append(entry.clone());
+
+        let token = self.next_token();
+        output.persist_ops.push(PersistOp::AppendEntries {
+            prev_index: entry_index.prev().unwrap_or(LogIndex::from_raw(0)),
+            entries: vec![entry.clone()],
+            token,
+        });
+        self.queue_pending_action(token, PendingAction::LeaderPersisted { entry_index });
+        self.note_config_appended(&entry);
+        sometimes!(output.sometimes_hits, "raft.config.leave.auto");
+        output
+            .membership_events
+            .push(MembershipEvent::AutoLeave { index: entry_index });
+
+        self.broadcast_append_entries(output);
+    }
+
+    /// Steps a removed leader down after `LeaveJoint` commits, handing
+    /// leadership to a remaining voter first.
+    fn step_down_if_removed(&mut self, output: &mut Output) {
+        if self.role != Role::Leader || self.is_effective_voter(self.config.node_id) {
+            return;
+        }
+        sometimes!(output.sometimes_hits, "raft.config.stepdown.removed");
+        if let Some(&heir) = self
+            .voters
+            .iter()
+            .find(|voter| **voter != self.config.node_id)
+        {
+            output.messages.push(OutboundMessage {
+                to: heir,
+                message: Message::TimeoutNow {
+                    term: self.term,
+                    leader_id: self.config.node_id,
+                },
+            });
+        }
+        self.transition_to_follower(self.term, output);
+        output
+            .membership_events
+            .push(MembershipEvent::RemovedSteppedDown);
+    }
+
     fn send_append_entries(&mut self, peer: NodeId, output: &mut Output) {
         if let Some(progress) = self.progress.get_mut(&peer) {
             if !progress.can_send() {
@@ -657,34 +1345,15 @@ impl RaftCore {
         }
     }
 
-    /// Copies peer ids into a stack buffer without allocating.
-    fn peer_array(&self, peers: &mut [NodeId; 16]) -> usize {
-        let mut peer_len = 0usize;
-        for &peer in &self.config.peers {
-            if peer_len < peers.len() {
-                peers[peer_len] = peer;
-                peer_len += 1;
-            }
-        }
-        peer_len
-    }
-
     fn broadcast_append_entries(&mut self, output: &mut Output) {
         if self.role != Role::Leader {
             return;
         }
 
-        if self.config.peers.len() < 16 {
-            let mut peers = [NodeId::from_nonzero(core::num::NonZeroU64::MIN); 16];
-            let peer_len = self.peer_array(&mut peers);
-            for &peer in &peers[..peer_len] {
-                self.replicate_to(peer, output);
-            }
-        } else {
-            let peers: Vec<NodeId> = self.config.peers.iter().copied().collect();
-            for peer in peers {
-                self.replicate_to(peer, output);
-            }
+        let mut replicas = [NodeId::from_nonzero(core::num::NonZeroU64::MIN); 32];
+        let replica_len = self.replica_array(&mut replicas);
+        for &peer in &replicas[..replica_len] {
+            self.replicate_to(peer, output);
         }
     }
 
@@ -871,7 +1540,7 @@ impl RaftCore {
                 message: Message::AppendEntriesResponse {
                     term: self.term,
                     success: false,
-                    match_index: self.log.last_index(),
+                    match_index: self.report_match(self.log.last_index()),
                     conflict_term: None,
                     conflict_index: None,
                     from: self.config.node_id,
@@ -921,7 +1590,7 @@ impl RaftCore {
                 message: Message::AppendEntriesResponse {
                     term: self.term,
                     success: false,
-                    match_index: self.log.last_index(),
+                    match_index: self.report_match(self.log.last_index()),
                     conflict_term,
                     conflict_index,
                     from: self.config.node_id,
@@ -947,7 +1616,7 @@ impl RaftCore {
                     message: Message::AppendEntriesResponse {
                         term: self.term,
                         success: false,
-                        match_index: self.log.last_index(),
+                        match_index: self.report_match(self.log.last_index()),
                         conflict_term: None,
                         conflict_index: Some(hint),
                         from: self.config.node_id,
@@ -990,6 +1659,11 @@ impl RaftCore {
             self.log
                 .truncate_and_append(trunc_idx, entries_to_append.clone());
             new_match = self.log.last_index();
+            // A truncated joint entry never took effect on this follower.
+            self.rollback_config_for_truncate(trunc_idx);
+            for entry in &entries_to_append {
+                self.note_config_appended(entry);
+            }
 
             let token = self.next_token();
             output.persist_ops.push(PersistOp::TruncateAndAppend {
@@ -1004,7 +1678,7 @@ impl RaftCore {
                 message: Message::AppendEntriesResponse {
                     term: self.term,
                     success: true,
-                    match_index: new_match,
+                    match_index: self.report_match(new_match),
                     conflict_term: None,
                     conflict_index: None,
                     from: self.config.node_id,
@@ -1018,6 +1692,9 @@ impl RaftCore {
                 self.log.append(entry.clone());
             }
             new_match = self.log.last_index();
+            for entry in &entries_to_append {
+                self.note_config_appended(entry);
+            }
 
             let token = self.next_token();
             output.persist_ops.push(PersistOp::AppendEntries {
@@ -1031,7 +1708,7 @@ impl RaftCore {
                 message: Message::AppendEntriesResponse {
                     term: self.term,
                     success: true,
-                    match_index: new_match,
+                    match_index: self.report_match(new_match),
                     conflict_term: None,
                     conflict_index: None,
                     from: self.config.node_id,
@@ -1044,7 +1721,7 @@ impl RaftCore {
                 message: Message::AppendEntriesResponse {
                     term: self.term,
                     success: true,
-                    match_index: new_match,
+                    match_index: self.report_match(new_match),
                     conflict_term: None,
                     conflict_index: None,
                     from: self.config.node_id,
@@ -1057,7 +1734,7 @@ impl RaftCore {
                 message: Message::AppendEntriesResponse {
                     term: self.term,
                     success: true,
-                    match_index: new_match,
+                    match_index: self.report_match(new_match),
                     conflict_term: None,
                     conflict_index: None,
                     from: self.config.node_id,
@@ -1131,56 +1808,23 @@ impl RaftCore {
             return;
         }
 
-        if self.progress.len() < 16 {
-            // Fixed-size stack buffer avoiding heap allocation for cluster sizes <= 16
-            let mut matches = [LogIndex::from_raw(0); 16];
-            let mut match_len = 0usize;
-
-            for peer_progress in self.progress.values() {
-                if match_len < matches.len() {
-                    matches[match_len] = peer_progress.match_index;
-                    match_len += 1;
-                }
-            }
-            if match_len < matches.len() {
-                matches[match_len] = self.leader_persisted_index;
-                match_len += 1;
-            }
-
-            let active_matches = &mut matches[..match_len];
-            active_matches.sort_unstable();
-            self.commit_from_sorted_matches(active_matches, output);
-        } else {
-            let mut matches: Vec<LogIndex> = self
-                .progress
-                .values()
-                .map(|peer| peer.match_index)
-                .collect();
-            matches.push(self.leader_persisted_index);
-            matches.sort_unstable();
-            self.commit_from_sorted_matches(&mut matches, output);
+        let candidate = self.effective_commit();
+        if candidate <= self.commit_index {
+            return;
         }
-    }
-
-    fn commit_from_sorted_matches(&mut self, active_matches: &mut [LogIndex], output: &mut Output) {
-        let quorum = self.config.quorum_size();
-        let match_total = active_matches.len();
-        if match_total >= quorum {
-            let median_pos = match_total - quorum;
-            let median_commit = active_matches[median_pos];
-
-            if median_commit > self.commit_index {
-                // Raft Section 5.4.2 rule: leader only commits entries from its CURRENT term
-                if self.log.term_at(median_commit) == Some(self.term) {
-                    self.commit_to(median_commit, output);
-                }
-            }
+        // Raft Section 5.4.2 rule: leader only commits entries from its CURRENT term
+        if self.log.term_at(candidate) != Some(self.term) {
+            return;
         }
+        self.commit_to(candidate, output);
+        self.committed_current_term = true;
+        self.after_commit_membership(output);
     }
 
     fn commit_to(&mut self, new_commit: LogIndex, output: &mut Output) {
         let start_idx = self.commit_index.next().unwrap_or(self.commit_index);
         self.commit_index = new_commit;
+        self.resolve_committed_configs(new_commit);
 
         let raw_start = start_idx.as_u64();
         let raw_end = new_commit.as_u64();
@@ -1191,14 +1835,35 @@ impl RaftCore {
         }
     }
 
+    /// Membership work after the leader advances the commit index: leave the
+    /// joint config automatically once it commits, and step down when this
+    /// leader was removed by the committed `LeaveJoint`.
+    fn after_commit_membership(&mut self, output: &mut Output) {
+        if self.joint.is_some() && self.leave_index.is_none() {
+            let enter = self
+                .joint
+                .as_ref()
+                .map_or(LogIndex::from_raw(0), |joint| joint.enter_index);
+            if self.commit_index >= enter {
+                self.append_leave_joint(output);
+            }
+        }
+        if self.joint.is_none() {
+            self.step_down_if_removed(output);
+        }
+    }
+
     fn broadcast_heartbeat(&mut self, output: &mut Output) {
-        for &peer in &self.config.peers {
+        let term = self.term;
+        let leader_id = self.config.node_id;
+        let commit_index = self.commit_index;
+        for &peer in self.progress.keys() {
             output.messages.push(OutboundMessage {
                 to: peer,
                 message: Message::HeartbeatRequest {
-                    term: self.term,
-                    leader_id: self.config.node_id,
-                    commit_index: self.commit_index,
+                    term,
+                    leader_id,
+                    commit_index,
                     read_context: None,
                 },
             });
@@ -1289,23 +1954,23 @@ impl RaftCore {
         }
 
         if let Some(ctx) = read_context {
-            let mut ready = 0usize;
             for pending in &mut self.pending_reads {
                 if pending.context == ctx {
                     pending.acks.insert(from);
-                    if pending.acks.len() >= self.config.quorum_size() {
-                        output.completed_reads.push(ReadIndexResult {
-                            context: pending.context.clone(),
-                            read_index: pending.read_index,
-                        });
-                        ready += 1;
-                    }
                 }
             }
-            if ready > 0 {
-                let quorum = self.config.quorum_size();
-                self.pending_reads
-                    .retain(|pending| pending.context != ctx || pending.acks.len() < quorum);
+            let mut i = 0;
+            while i < self.pending_reads.len() {
+                let is_ctx = self.pending_reads[i].context == ctx;
+                if is_ctx && self.effective_quorum_met(&self.pending_reads[i].acks, true) {
+                    let completed = self.pending_reads.swap_remove(i);
+                    output.completed_reads.push(ReadIndexResult {
+                        context: completed.context,
+                        read_index: completed.read_index,
+                    });
+                } else {
+                    i += 1;
+                }
             }
         }
     }
@@ -1315,7 +1980,7 @@ impl RaftCore {
             return;
         }
 
-        if self.config.peers.is_empty() {
+        if self.membership_voters().len() <= 1 {
             output.completed_reads.push(ReadIndexResult {
                 context,
                 read_index: self.commit_index,
@@ -1333,7 +1998,7 @@ impl RaftCore {
         });
 
         // Broadcast heartbeat probing quorum connectivity
-        for &peer in &self.config.peers {
+        for peer in self.election_targets() {
             output.messages.push(OutboundMessage {
                 to: peer,
                 message: Message::HeartbeatRequest {
@@ -1393,9 +2058,10 @@ impl RaftCore {
             snapshot_digest,
             chunks,
         });
-        let peers: Vec<NodeId> = self.config.peers.iter().copied().collect();
-        for peer in peers {
-            self.replicate_to(peer, output);
+        let mut replicas = [NodeId::from_nonzero(core::num::NonZeroU64::MIN); 32];
+        let replica_len = self.replica_array(&mut replicas);
+        for peer in &replicas[..replica_len] {
+            self.replicate_to(*peer, output);
         }
     }
 
@@ -1566,6 +2232,7 @@ impl RaftCore {
                 }
                 self.log
                     .install_snapshot(last_included_index, last_included_term);
+                self.installed_base = Some(last_included_index);
                 sometimes!(output.sometimes_hits, "raft.snapshot.install.complete");
                 if last_included_index > self.commit_index {
                     self.commit_index = last_included_index;
@@ -1715,6 +2382,10 @@ impl RaftCore {
         if self.role != Role::Leader || to == self.config.node_id {
             return;
         }
+        // Leadership transfers only to voters. Learners can never lead.
+        if !self.is_effective_voter(to) {
+            return;
+        }
         if !self.progress.contains_key(&to) {
             return;
         }
@@ -1746,6 +2417,10 @@ impl RaftCore {
         }
         if term > self.term {
             let _ = self.transition_to_follower(term, output);
+        }
+        // Learners and removed nodes never campaign, even when told to.
+        if !self.can_campaign() {
+            return;
         }
         self.start_election(output);
     }
@@ -1784,6 +2459,14 @@ impl RaftCore {
 
     #[allow(clippy::too_many_lines)]
     fn handle_message(&mut self, from: NodeId, message: Message, output: &mut Output) {
+        // Removed servers and strangers cannot disrupt the cluster: only
+        // voters and learners in the effective config get a hearing. The
+        // sole exception is replication from a leader this node does not
+        // know yet.
+        if !self.accepts_sender(from, &message) {
+            sometimes!(output.sometimes_hits, "raft.unknown.sender");
+            return;
+        }
         match message {
             Message::PreVoteRequest {
                 term,
@@ -1932,6 +2615,7 @@ impl RaftCore {
             self.term = term;
             self.voted_for = None;
         }
+        self.committed_current_term = false;
         if self.lead_transferee.is_some() {
             sometimes!(output.sometimes_hits, "raft.transfer.aborted");
         }

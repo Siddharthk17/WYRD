@@ -4,6 +4,7 @@
 //! `anvil-types`: Identifiers, log entries, and zero-copy binary codec.
 
 pub mod codec;
+pub mod config;
 pub mod entry;
 pub mod ids;
 
@@ -12,6 +13,10 @@ pub use codec::{
     decode_u16_le, decode_u32_le, decode_u64_le, decode_varint_i64, decode_varint_u64,
     decode_varint_u64_slice, encode_u16_le, encode_u32_le, encode_u64_le, encode_varint_i64,
     encode_varint_u64,
+};
+pub use config::{
+    ClusterConfig, JointSnapshot, MAX_LEARNERS, MAX_VOTERS, MembershipError, MembershipSnapshot,
+    bootstrap_config_entry, config_entry, decode_config_entry, ensure_cluster,
 };
 pub use entry::{Entry, EntryKind};
 pub use ids::{ClusterId, GroupId, LogIndex, NodeId, SeqNo, SessionId, Term, ZeroNodeIdError};
